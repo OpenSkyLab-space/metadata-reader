@@ -246,7 +246,11 @@ footer li{margin:2px 0}
 /* steps (images, flight log, OpenSkyLab check), secondary views, why-block, callouts */
 .why{margin:0 0 20px}
 .why h2{margin:0 0 10px}
-.why ul{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.why ul{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+/* four cards: one row, two by two, or one column; never three plus a lone fourth */
+@media (max-width:1000px){.why ul{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:560px){.why ul{grid-template-columns:1fr}}
+header [data-i="toolMeta"] a{white-space:nowrap}
 .why li{background:var(--panel);border:1px solid var(--line);border-top:3px solid var(--accent);border-radius:8px;padding:12px 14px;font-size:14px;line-height:1.45;color:var(--muted)}
 .why li b{display:block;font:700 16px/1.25 var(--f-display);color:var(--fg);margin-bottom:4px}
 .steps{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;counter-reset:st}

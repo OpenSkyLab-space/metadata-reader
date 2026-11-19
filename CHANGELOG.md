@@ -7,6 +7,7 @@ Each entry names the versions of the parser (OSLMeta), the flight log module (OS
 ## [Unreleased]
 
 - The "Why it matters" paragraph under the title is folded behind a button with a light-bulb icon; it opens on click (native `<details>`, no script, keyboard accessible). The header is shorter.
+- The four cards under the title ("What sets this reader apart") sit in one row, two by two or one column, never three plus a lone fourth; the links under the tool header do not break inside.
 
 ## [1.4.0] - 2026-11-19
 
