@@ -7,6 +7,7 @@ Each entry names the versions of the parser (OSLMeta), the flight log module (OS
 ## [Unreleased]
 
 - The "Why it matters" paragraph under the title is folded behind a button with a light-bulb icon; it opens on click (native `<details>`, no script, keyboard accessible). The header is shorter.
+- On the website frame, "How to cite" is quieter: no panel, small muted text, and "Copy citation" as a text link.
 
 ## [1.4.0] - 2026-11-19
 
