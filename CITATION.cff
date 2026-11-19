@@ -11,6 +11,14 @@ authors:
     affiliation: "Czech University of Life Sciences Prague"
 version: "1.4.0"
 date-released: "2026-11-19"
+doi: "10.5281/zenodo.24373002"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.24373002"
+    description: "Concept DOI: all versions"
+  - type: doi
+    value: "10.5281/zenodo.24373003"
+    description: "Version 1.4.0"
 url: "https://openskylab.space/reader"
 repository-code: "https://github.com/OpenSkyLab-space/metadata-reader"
 license: MIT
