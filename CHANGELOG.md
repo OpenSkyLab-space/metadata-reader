@@ -4,6 +4,10 @@ All notable changes are recorded here. The format follows [Keep a Changelog](htt
 The reader has its own version numbers (SemVer); a release `vX.Y.Z` is the reader version `X.Y.Z`.
 Each entry names the versions of the parser (OSLMeta), the flight log module (OSLFlight) and the OpenSkyLab metadata specification it checks against.
 
+## [Unreleased]
+
+- The "Why it matters" paragraph under the title is folded behind a button with a light-bulb icon; it opens on click (native `<details>`, no script, keyboard accessible). The header is shorter.
+
 ## [1.4.0] - 2026-11-19
 
 First release in this repository. Parser OSLMeta 1.0.0, flight log module OSLFlight 0.3.0, checks against the OpenSkyLab metadata specification v0.3.

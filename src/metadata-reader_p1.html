@@ -37,7 +37,20 @@ header{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:flex-end;justify-co
 h1{font:700 clamp(30px,4.6vw,46px)/1.05 var(--f-display);margin:8px 0 10px;text-wrap:balance;letter-spacing:-.01em}
 .tagline{font:600 clamp(17px,2vw,20px)/1.35 var(--f-display);max-width:70ch;margin:0 0 8px;color:var(--fg);text-wrap:balance}
 .lead{max-width:110ch;color:var(--muted);margin:0}
-.sig{max-width:110ch;margin:12px 0 0;font-size:15px;line-height:1.5;border-left:3px solid var(--accent);padding-left:12px}
+/* "Why it matters": a pill with a light-bulb icon that opens the paragraph */
+.sig{margin:12px 0 0}
+.sig>summary{display:inline-flex;align-items:center;gap:8px;cursor:pointer;list-style:none;font:600 14px/1.2 var(--f-body);color:var(--fg);background:var(--accent-soft);border:1px solid var(--accent);border-radius:999px;padding:6px 14px 6px 10px;user-select:none}
+.sig>summary::-webkit-details-marker{display:none}
+.sig>summary:hover{filter:brightness(1.04)}
+.sig>summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.sig-ic{color:var(--accent);flex:none}
+.sig-ray{animation:sigGlow 2.4s ease-in-out infinite}
+@keyframes sigGlow{0%,100%{opacity:.25}50%{opacity:1}}
+.sig[open] .sig-ray{animation:none;opacity:1}
+.sig-chev{width:7px;height:7px;border-right:2px solid currentColor;border-bottom:2px solid currentColor;transform:rotate(45deg) translate(-2px,-2px);transition:transform .15s;margin-left:2px}
+.sig[open] .sig-chev{transform:rotate(-135deg) translate(-2px,-2px)}
+.sig>p{max-width:110ch;margin:10px 0 0;font-size:15px;line-height:1.5;border-left:3px solid var(--accent);padding-left:12px}
+@media (prefers-reduced-motion:reduce){.sig-ray{animation:none;opacity:1}.sig-chev{transition:none}}
 /* the header, "About the tool", "How to cite" and the footer share one frame: the width and left edge of the bench
    (ids win over the shared site rules for .osl-extra and .osl-cite, which come later in the page) */
 header{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 20px}
@@ -259,7 +272,10 @@ footer li{margin:2px 0}
     <h1 data-i="title">Čtečka metadat snímků</h1>
     <p class="tagline" data-i="tagline"></p>
     <p class="lead" data-i="lead"></p>
-    <p class="sig" data-i="sig"></p>
+    <details class="sig">
+      <summary><svg class="sig-ic" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.6 10.8c.7.5 1.1 1.3 1.1 2.2h5c0-.9.4-1.7 1.1-2.2A6 6 0 0 0 12 3z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path class="sig-ray" d="M12 0.6v1M3.2 4.2l.8.7M20.8 4.2l-.8.7M1 11.5h1M22 11.5h1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg><span data-i="sigH"></span><span class="sig-chev" aria-hidden="true"></span></summary>
+      <p data-i="sig"></p>
+    </details>
   </div>
   <div class="lang" role="group" aria-label="Jazyk / Language">
     <button id="lang-cs" aria-pressed="true">CZ</button><button id="lang-en" aria-pressed="false">EN</button>
