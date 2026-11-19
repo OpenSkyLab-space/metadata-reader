@@ -1,0 +1,41 @@
+cff-version: 1.2.0
+message: >-
+  If you use the reader, please cite the version you used.
+  Every release has its own DOI on Zenodo; the concept DOI cites all versions.
+title: "OpenSkyLab metadata reader: drone image and flight log metadata in the browser"
+type: software
+authors:
+  - family-names: Komárek
+    given-names: Jan
+    orcid: "https://orcid.org/0000-0002-3505-6755"
+    affiliation: "Czech University of Life Sciences Prague"
+version: "1.4.0"
+date-released: "2026-11-19"  # set on release
+url: "https://openskylab.space/reader"
+repository-code: "https://github.com/OpenSkyLab-space/metadata-reader"
+license: MIT
+abstract: >-
+  An in-browser reader of drone (UAV) image metadata and the flight and GNSS logs
+  that belong to the images. It reads EXIF, XMP, DJI MakerNotes, GeoTIFF, ICC, IPTC
+  and C2PA, joins images with flight logs (DJI, senseFly, PX4, ArduPilot, RINEX,
+  MRK and others) with an auditable matching, checks the result against the
+  OpenSkyLab metadata specification and exports metadata.json, image_log.csv,
+  provenance.json, camera positions for photogrammetry software and a flight
+  report. Files are read only in the browser.
+keywords:
+  - drone
+  - UAV
+  - metadata
+  - EXIF
+  - XMP
+  - flight log
+  - provenance
+  - photogrammetry
+  - FAIR
+references:
+  - type: standard
+    title: "OpenSkyLab drone data metadata specification"
+    version: "0.3"
+    url: "https://openskylab.space/metadata.html"
+    authors:
+      - name: OpenSkyLab

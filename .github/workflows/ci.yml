@@ -1,0 +1,36 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Versions agree
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then python tools/check_versions.py --tag "${GITHUB_REF#refs/tags/}"; else python tools/check_versions.py; fi
+      - name: Reader builds and dist is up to date
+        run: |
+          node src/metadata-reader_build.js /tmp/dist en
+          diff -q /tmp/dist/metadata-reader.html dist/metadata-reader.html
+          diff -q /tmp/dist/metadata-reader_tool.html dist/metadata-reader_tool.html
+      - name: Samples parse
+        run: node test/samples_test.js --out /tmp/samples
+      - name: Field-data regressions (synthetic files)
+        run: node test/field_regressions_test.js
+      - name: Flight reader (synthetic logs)
+        run: node test/flight_test.js
+      - name: Fuzz tests
+        run: |
+          node test/metadata-reader_fuzz.js /tmp/samples/*
+          node test/metadata-reader_fuzz_c2pa.js /tmp/samples/sample6_c2pa_synthetic.jpg
