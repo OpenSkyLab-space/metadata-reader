@@ -4,11 +4,10 @@ All notable changes are recorded here. The format follows [Keep a Changelog](htt
 The reader has its own version numbers (SemVer); a release `vX.Y.Z` is the reader version `X.Y.Z`.
 Each entry names the versions of the parser (OSLMeta), the flight log module (OSLFlight) and the OpenSkyLab metadata specification it checks against.
 
-## [1.4.0] - not yet released
+## [1.4.0] - 2026-11-19
 
 First release in this repository. Parser OSLMeta 1.0.0, flight log module OSLFlight 0.3.0, checks against the OpenSkyLab metadata specification v0.3.
 Versions 1.2 and 1.3 were published on openskylab.space only, before the reader had its own repository; they are listed below so that the history is complete.
-The date is set when the release is tagged.
 
 - Export of `provenance.json` next to `metadata.json`: the SHA-256 of every loaded image and log (computed in the browser), the reader and its component versions, the extraction activity with the SHA-256 of the `metadata.json` and `image_log.csv` it generated, the origin of every filled value (image tag, derivation, flight log; for log values the image's own value and whether it agrees) and, per column of `image_log.csv`, how many rows come from the image or the log. `metadata.json` names the record in a new top-level field `provenance` (draft for 0.4; the 0.3 schema accepts it).
 - The draft `metadata.json` no longer carries values of the wrong type: empty slots only for free text ("") and lists ([]); numbers, enumerations and objects are left out until known; `oblique_images` is written as `{included, gimbal_pitch_deg}` as the schema requires; one empty product to fill in. Against the 0.3 schema the draft now fails only on the fields that must be filled after processing (product level and GSD).
