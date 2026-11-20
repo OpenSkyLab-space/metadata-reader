@@ -114,6 +114,7 @@ function sniff(name, h) {
   if (/^\[\["\d{4}-\d\d-\d\d \d\d:\d\d:\d\d","[^"]*","/.test(s)) return "dji-events";
   if (/^\uFEFF?CUSTOM\.dateTime,OSD\.flyTime,OSD\.latitude,/.test(s)) return "dji-fr-csv";
   if (/\.(csv|txt)$/.test(low) && !/[\x00-\x08]/.test(s.slice(0, 512)) && csvHeader(s)) return "csv-geotags";
+  if (/\.csv$/.test(low) && !/[\x00-\x08]/.test(s.slice(0, 512)) && csvColumns(s)) return "csv-columns";
   if (/^\d{4}-\d\d-\d\d-\d\d-\d\d-\d\d\.\d+ [A-Z]{2,4}: /.test(s)) return "lidar-service";
   if (/(^|\n)[^\n$]{0,40}\$(G[PNLABQ]|BD)(GGA|RMC|GSA|GSV|VTG|ZDA|GLL|GST),/.test(s.slice(0, 2048)) && !/[\x00-\x08\x0e-\x1f]/.test(s.slice(0, 512))) return "nmea";
   if (/(^|\/)(diag|hostlog|sequoia_diag)\.dat$/.test(low) || /_em\.bb3$/.test(low)) return "encrypted";
@@ -129,16 +130,18 @@ async function parse(src, name, o) {
   let h = await slice(src, 0, 65536), gz = false;
   // gzip (.gz, as RINEX from IGS/EUREF/CZEPOS is distributed): unpacked in memory, then recognised by its content
   if (h[0] === 0x1f && h[1] === 0x8b && sizeOf(src) <= 200 * 1048576) { try { src = await gunzip(await slice(src, 0, sizeOf(src))); h = src.subarray(0, 65536); gz = true; } catch (e) { /* not readable as gzip */ } }
-  const kind = sniff(gz ? String(name).replace(/\.gz$/i, "") : name, h), size = sizeOf(src);
+  let kind = sniff(gz ? String(name).replace(/\.gz$/i, "") : name, h); const size = sizeOf(src);
+  if (kind === "csv-columns" && o.csvMap) kind = "csv-geotags";   // columns assigned by the user
   const P = PARSERS[kind];
   if (!P) return null;
   const L = newLog(kind, name, size); if (gz) L.notes.push("gzip");
   try { await P(src, L, h, o); } catch (e) { L.notes.push("parse-error"); L.error = String(e && e.message || e); }
   sanity(L, o.now);
+  atExposure(L);
   L.trajectory = thin(L.trajectory);
   L.verify = verify(L);
   if (L.verify.state === "new") L.notes.push("unverified");
-  if (!L.error && !L.encrypted && !L.listOnly && L.size && L.startMs == null && !L.exposures.length && !L.trajectory.length && !L.raw && !L.panels && !L.notes.some(n => /encrypted|undocumented|empty|no-positions|plan|processing|project-pointer/.test(n)) && !L.facts.some(f => /^(fBase|fFiles|fMessages|fPackets|fTopics|fParams|fPlacemarks|fPoints)/.test(f[0]) && f[1])) L.notes.push("nothing-read");
+  if (!L.error && !L.encrypted && !L.listOnly && L.size && L.startMs == null && !L.exposures.length && !L.trajectory.length && !L.raw && !L.panels && !L.notes.some(n => /encrypted|undocumented|empty|no-positions|plan|processing|project-pointer|unmapped/.test(n)) && !L.facts.some(f => /^(fBase|fFiles|fMessages|fPackets|fTopics|fParams|fPlacemarks|fPoints)/.test(f[0]) && f[1])) L.notes.push("nothing-read");
   return L;
 }
 
@@ -170,6 +173,47 @@ function sanity(L, now) {
   if (bad.noFix) fact(L, "fNoFix", bad.noFix);
   const real = Object.entries(bad).filter(x => x[0] !== "noFix");
   if (real.length) { L.notes.push("implausible"); fact(L, "fImplausible", real.map(([k, v]) => k + ": " + v).join(", ")); }
+}
+
+/* ---------------------------------------------------------------- flight state at each exposure
+   Parsers that know it leave L._aux = { gq: GNSS quality [{t, sv, hdop | eph, fix}], vib: [{t, imu, v (largest axis, m/s²), clip (cumulative)}],
+   modes: mode changes [{t, name, auto}], ev: messages of severity warning or worse [{t, lvl (0–7, RFC 5424), msg}] }, all in UTC ms.
+   Each timed exposure gets the GNSS record nearest in time (within 2 s), the largest vibration within ±0.5 s and the mode in force.
+   An exposure with a time but no position gets one interpolated linearly between the two trajectory points around it
+   when they are at most 2 s apart; it is marked interp and stays an estimate. e._tc is the exposure time on the clock of the
+   trajectory and of _aux (tlog: receive time; ULog: boot time), used when the exposure's own time comes from another clock. */
+const AT_GAP = 2000, AT_VIB = 500;
+function atExposure(L) {
+  const A = L._aux || {}; delete L._aux;
+  const ex = L.listOnly ? [] : L.exposures.filter(e => (e._tc != null ? e._tc : e.t) != null), tc = e => e._tc != null ? e._tc : e.t;
+  const byT = a => (a || []).filter(x => x.t != null && isFinite(x.t)).sort((x, y) => x.t - y.t);
+  const after = (a, t) => { let lo = 0, hi = a.length; while (lo < hi) { const m = (lo + hi) >> 1; if (a[m].t <= t) lo = m + 1; else hi = m; } return lo; };   // first index with a[i].t > t
+  // 4 positions interpolated to the exposure time
+  const tr = byT(L.trajectory.filter(p => p.lat != null)); let interp = 0;
+  if (tr.length > 1) for (const e of ex) { if (e.lat != null) continue; const t = tc(e), i = after(tr, t), a = tr[i - 1]; let b = tr[i];
+    if (a && a.t === t) b = a; if (!a || !b || b.t - a.t > AT_GAP) continue;
+    const f = b === a ? 0 : (t - a.t) / (b.t - a.t);
+    e.lat = a.lat + f * (b.lat - a.lat); e.lon = a.lon + f * (b.lon - a.lon); if (e.h == null && a.h != null && b.h != null) e.h = a.h + f * (b.h - a.h); e.interp = true; interp++; }
+  const gq = byT(A.gq), vib = byT(A.vib), modes = byT(A.modes), evs = byT(A.ev);
+  if (!ex.length || !(gq.length || vib.length || modes.length || evs.length || interp)) { for (const e of L.exposures) delete e._tc; return; }
+  for (const e of ex) { const t = tc(e);
+    if (gq.length) { const g = nearest(gq, t); if (Math.abs(g.t - t) <= AT_GAP) { e.sv = g.sv; if (g.hdop != null) e.hdop = +(+g.hdop).toFixed(2); if (g.eph != null) e.eph = +(+g.eph).toFixed(2); e.fix = g.fix; } }
+    if (vib.length) { let v = null; for (let i = Math.max(0, after(vib, t - AT_VIB - 1)); i < vib.length && vib[i].t <= t + AT_VIB; i++) if (vib[i].t >= t - AT_VIB && isFinite(vib[i].v)) v = Math.max(v == null ? 0 : v, vib[i].v); if (v != null) e.vib = +v.toFixed(1); }
+    if (modes.length) { const i = after(modes, t); if (i > 0) { e.mode = modes[i - 1].name; e.auto = modes[i - 1].auto; } } }
+  // summary for the check: imaging window = first to last exposure
+  const ts = ex.map(tc), t0 = Math.min(...ts), t1 = Math.max(...ts), S = { n: ex.length, interp };
+  const G = ex.filter(e => e.fix != null || e.sv != null);
+  if (G.length) S.gnss = { n: G.length, svMed: median(G.map(e => e.sv)), svMin: G.some(e => e.sv != null) ? Math.min(...G.filter(e => e.sv != null).map(e => e.sv)) : null,
+    hdopMax: G.some(e => e.hdop != null) ? Math.max(...G.filter(e => e.hdop != null).map(e => e.hdop)) : null, ephMax: G.some(e => e.eph != null) ? Math.max(...G.filter(e => e.eph != null).map(e => e.eph)) : null,
+    low: G.filter(e => e.fix != null && e.fix < 3).length, none: ex.length - G.length };
+  const V = ex.filter(e => e.vib != null);
+  if (V.length) { const clip = {}; for (const v of vib) if (v.t >= t0 - AT_VIB && v.t <= t1 + AT_VIB && isFinite(v.clip)) { const c = clip[v.imu] || (clip[v.imu] = [v.clip, v.clip]); c[0] = Math.min(c[0], v.clip); c[1] = Math.max(c[1], v.clip); }
+    S.vib = { n: V.length, max: Math.max(...V.map(e => e.vib)), over30: V.filter(e => e.vib > 30).length, over60: V.filter(e => e.vib > 60).length, clip: Object.values(clip).reduce((s, c) => s + c[1] - c[0], 0) }; }
+  const M = ex.filter(e => e.mode != null);
+  if (M.length) S.modes = { n: M.length, names: [...new Set(M.map(e => e.mode))], out: M.filter(e => e.auto === false).length, outNames: [...new Set(M.filter(e => e.auto === false).map(e => e.mode))], unknown: M.every(e => e.auto == null) };
+  const W = evs.filter(x => x.t >= t0 && x.t <= t1); if (W.length) S.ev = { n: W.length, err: W.filter(x => x.lvl <= 3).length, first: W.slice(0, 3).map(x => x.msg) };
+  L.atExp = S;
+  for (const e of L.exposures) delete e._tc;
 }
 
 /* ---------------------------------------------------------------- versions checked against real files
@@ -205,6 +249,7 @@ const VERIFIED = [
   { kind: "nmea", re: /(?!)/, ver: "", src: "synthetic", standard: true },
   { kind: "gpx", re: /(?!)/, ver: "", src: "synthetic", standard: true },
   { kind: "csv-geotags", re: /(?!)/, ver: "", src: "synthetic", standard: true },
+  { kind: "csv-columns", re: /(?!)/, ver: "", src: "synthetic", standard: true },
   { kind: "dji-fr-csv", re: /IOS 4\.(9[5-9]|10[0-7])\./, ver: "iOS app 4.95–4.107 (FlightRecord v14, decoded with dji-log-parser 0.5.7)", src: "internal + synthetic" },
   { kind: "dji-fr-csv", re: /DJIFly (10\.1\.8|46\.0\.0)$/, ver: "Mavic 3 Enterprise series, app platform 6 (10.1.8, 46.0.0; 2026): summary and track, exposures not in the CSV", src: "internal" },
   { kind: "emotion-transcript", re: /./, ver: "eMotion 2 console transcript (eBee Classic, 2017)", src: "internal" },
@@ -240,6 +285,7 @@ function versionKey(L) {
     case "novatel": return "NovAtel";
     case "ardupilot-bin": case "ardupilot-log": case "tlog": return d.fw || fm;
     case "nmea": case "gpx": case "csv-geotags": return fm;
+    case "csv-columns": return "";   // nothing read yet: the version check follows the columns assigned by hand
     case "emotion-transcript": return fm;
     case "ebeex-afpu": case "pix4dcapture-log": case "pix4dcapture-mission": case "bbx": return d.fw || "";
     case "thermotiff-log": case "thermotiff-record": return L.proc && L.proc.software[0].version ? "ThermoTIFF " + L.proc.software[0].version : "ThermoTIFF";
@@ -400,7 +446,7 @@ async function pULog(src, L, h) {
     }
     out._size = off; return (lay[name] = out);
   }
-  const gps = [], att = [];
+  const gps = [], att = [], navs = [];
   while (p + 3 <= b.length) {
     const ty = String.fromCharCode(b[p + pre + 2]);
     if (!decided && p > 16) { if (T.includes(String.fromCharCode(b[p + 2]))) pre = 0; else if (T.includes(String.fromCharCode(b[p + 4]))) pre = 2; decided = true; continue; }
@@ -423,6 +469,7 @@ async function pULog(src, L, h) {
         const alt = Lf.altitude_ellipsoid_m ? g("altitude_ellipsoid_m") : g("alt_ellipsoid", 1e-3);
         gps.push({ topic: s.name, ts, utc: g("time_utc_usec"), lat, lon, h: alt, fix: g("fix_type"), eph: g("eph"), epv: g("epv"), sv: g("satellites_used") });
       }
+      if (s && s.name === "vehicle_status" && !s.multi) { const Lf = layout(s.name); if (Lf.nav_state) { const v = rd(dvOf(m.subarray(2)), Lf.nav_state.t, Lf.nav_state.o); if (!navs.length || navs[navs.length - 1].v !== v) navs.push({ ts, v }); } }
       if (s && s.name === "camera_capture") { const Lf = layout(s.name), body = dvOf(m.subarray(2)), g = (k, sc) => Lf[k] ? rd(body, Lf[k].t, Lf[k].o) * (sc || 1) : null; att.push({ ts, utc: g("timestamp_utc"), seq: g("seq"), lat: g("lat"), lon: g("lon"), h: g("alt"), ok: g("result") }); }
     } else if (ty === "L") { logs.push({ ts: rd(md, "uint64_t", 1), lvl: m[0], msg: asc(m, 9, sz - 9) }); }
     else if (ty === "C") { logs.push({ ts: rd(md, "uint64_t", 3), lvl: m[0], msg: asc(m, 11, sz - 11) }); }
@@ -435,7 +482,10 @@ async function pULog(src, L, h) {
   const sync = use.filter(g => g.utc > 1e15).map(g => g.utc / 1000 - g.ts / 1000), off = median(sync);
   const toUtc = ts => off == null ? null : ts / 1000 + off;
   L.trajectory = use.filter(g => g.fix >= 2 && g.lat).map(g => ({ t: toUtc(g.ts), lat: g.lat, lon: g.lon, h: g.h, q: fixName(g.fix) }));
-  L.exposures = att.map((c, k) => ({ n: c.seq != null ? c.seq : k, t: c.utc > 1e15 ? c.utc / 1000 : toUtc(c.ts), lat: c.lat, lon: c.lon, h: c.h, q: "log" }));
+  L.exposures = att.map((c, k) => ({ n: c.seq != null ? c.seq : k, t: c.utc > 1e15 ? c.utc / 1000 : toUtc(c.ts), _tc: toUtc(c.ts), lat: c.lat, lon: c.lon, h: c.h, q: "log" }));
+  // state at the exposures (atExposure): GNSS quality, navigation state, logged messages of level warning or worse (levels are ASCII digits 0–7)
+  L._aux = { gq: use.map(g => ({ t: toUtc(g.ts), sv: g.sv, eph: g.eph, fix: g.fix })), modes: navs.map(x => ({ t: toUtc(x.ts), name: PX4_NAV[x.v] || "nav_state " + x.v, auto: x.v === 3 })),
+    ev: logs.map(x => ({ t: toUtc(x.ts), lvl: x.lvl >= 48 ? x.lvl - 48 : x.lvl, msg: x.msg })).filter(x => x.lvl <= 4) };
   if (tmin != null && off != null) { L.startMs = toUtc(tmin); L.endMs = toUtc(tmax); L.timeSource = "boot time + GPS time_utc_usec"; }
   const sysName = info.sys_name || info.vehicle_name || ""; L.device.make = /wingtra/i.test(sysName + JSON.stringify(info)) ? "Wingtra" : "PX4";
   L.device.model = info.vehicle_name || info.sys_name || null; L.device.fw = info.ver_sw_release_wingtra != null ? relVer(info.ver_sw_release_wingtra) : info.ver_sw_release ? relVer(info.ver_sw_release) : info.ver_sw || null;
@@ -454,6 +504,8 @@ async function pULog(src, L, h) {
   if (badMsg) { fact(L, "fBadMessages", badMsg); L.notes.push("corrupt-messages"); }
   L.gnss = { fix: countBy(use, g => fixName(g.fix)) };
 }
+// vehicle_status.nav_state (PX4 msg/VehicleStatus.msg); only AUTO_MISSION counts as the automatic mission
+const PX4_NAV = { 0: "MANUAL", 1: "ALTCTL", 2: "POSCTL", 3: "AUTO_MISSION", 4: "AUTO_LOITER", 5: "AUTO_RTL", 6: "POSITION_SLOW", 10: "ACRO", 12: "DESCEND", 13: "TERMINATION", 14: "OFFBOARD", 15: "STAB", 17: "AUTO_TAKEOFF", 18: "AUTO_LAND", 19: "AUTO_FOLLOW_TARGET", 20: "AUTO_PRECLAND", 21: "ORBIT", 22: "AUTO_VTOL_TAKEOFF" };
 const fixName = f => ({ 0: "none", 1: "none", 2: "2D", 3: "single", 4: "dgnss", 5: "float", 6: "fixed", 8: "fixed" }[f] || "fix " + f);
 const relVer = v => typeof v === "number" ? [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255].join(".") : v;
 
@@ -858,10 +910,19 @@ async function pEncrypted(src, L, h) {
    between versions (GMS/GWk since 3.x, TimeMS/Week before), so fields are looked up by name, not by position. */
 const DF_T = { b: [1, "getInt8"], B: [1, "getUint8"], M: [1, "getUint8"], h: [2, "getInt16"], H: [2, "getUint16"], i: [4, "getInt32"], I: [4, "getUint32"], f: [4, "getFloat32"], d: [8, "getFloat64"],
   c: [2, "getInt16", 0.01], C: [2, "getUint16", 0.01], e: [4, "getInt32", 0.01], E: [4, "getUint32", 0.01], L: [4, "getInt32", 1e-7], q: [8, "i64"], Q: [8, "u64"], n: [4, "s"], N: [16, "s"], Z: [64, "s"], a: [64, "x"] };
-const AP_WANT = /^(GPS|GPS2|GPA|CAM|TRIG|MSG|VER|PARM)$/;
+const AP_WANT = /^(GPS|GPS2|GPA|CAM|TRIG|MSG|VER|PARM|VIBE|MODE|ERR)$/;
+// flight modes by vehicle (ArduCopter/ArduPlane/Rover mode.h); AUTO is the mission mode. ERR subsystems: AP_Logger.h LogErrorSubsystem
+const AP_MODES = {
+  copter: { 0: "STABILIZE", 1: "ACRO", 2: "ALT_HOLD", 3: "AUTO", 4: "GUIDED", 5: "LOITER", 6: "RTL", 7: "CIRCLE", 9: "LAND", 11: "DRIFT", 13: "SPORT", 14: "FLIP", 15: "AUTOTUNE", 16: "POSHOLD", 17: "BRAKE", 18: "THROW", 19: "AVOID_ADSB", 20: "GUIDED_NOGPS", 21: "SMART_RTL", 22: "FLOWHOLD", 23: "FOLLOW", 24: "ZIGZAG", 25: "SYSTEMID", 26: "AUTOROTATE", 27: "AUTO_RTL", 28: "TURTLE" },
+  plane: { 0: "MANUAL", 1: "CIRCLE", 2: "STABILIZE", 3: "TRAINING", 4: "ACRO", 5: "FBWA", 6: "FBWB", 7: "CRUISE", 8: "AUTOTUNE", 10: "AUTO", 11: "RTL", 12: "LOITER", 13: "TAKEOFF", 14: "AVOID_ADSB", 15: "GUIDED", 16: "INITIALISING", 17: "QSTABILIZE", 18: "QHOVER", 19: "QLOITER", 20: "QLAND", 21: "QRTL", 22: "QAUTOTUNE", 23: "QACRO", 24: "THERMAL", 25: "LOITER_ALT_QLAND", 26: "AUTOLAND", 27: "GLIDE" },
+  rover: { 0: "MANUAL", 1: "ACRO", 3: "STEERING", 4: "HOLD", 5: "LOITER", 6: "FOLLOW", 7: "SIMPLE", 8: "DOCK", 9: "CIRCLE", 10: "AUTO", 11: "RTL", 12: "SMART_RTL", 15: "GUIDED", 16: "INITIALISING" } };
+const AP_AUTO = { copter: 3, plane: 10, rover: 10 };
+const AP_ERR = { 1: "main", 2: "radio", 3: "compass", 5: "radio failsafe", 6: "battery failsafe", 7: "GPS failsafe", 8: "GCS failsafe", 9: "fence failsafe", 10: "flight mode", 11: "GPS", 12: "crash check", 15: "parachute", 16: "EKF check", 17: "EKF failsafe", 18: "baro", 19: "CPU", 20: "ADS-B failsafe", 21: "terrain", 22: "navigation", 23: "terrain failsafe", 24: "EKF primary", 25: "thrust loss", 26: "sensors failsafe", 27: "leak failsafe", 28: "pilot input", 29: "vibration failsafe", 30: "internal error", 31: "dead reckoning failsafe" };
+const apFamily = v => /Copter|Heli/i.test(v || "") ? "copter" : /Plane/i.test(v || "") ? "plane" : /Rover|Boat/i.test(v || "") ? "rover" : null;
+const apMode = (fam, num, name) => ({ name: name || (fam && AP_MODES[fam][num]) || "mode " + num, auto: fam ? num === AP_AUTO[fam] : null });
 const AP_Q = { 0: "none", 1: "none", 2: "2D", 3: "single", 4: "dgnss", 5: "float", 6: "fixed" };
 function apState() {
-  const S = { gps: [], cam: [], trig: [], fw: null, vehicle: null, parm: 0, types: {}, hacc: null, status: null, sync: [], noWeek: 0 };
+  const S = { gps: [], cam: [], trig: [], fw: null, vehicle: null, parm: 0, types: {}, hacc: null, status: null, sync: [], noWeek: 0, gq: [], vib: [], modes: [], ev: [] };
   S.rec = (name, r) => {
     S.types[name] = (S.types[name] || 0) + 1;
     const us = r.TimeUS != null ? r.TimeUS : r.TimeMS != null && r.Week == null ? r.TimeMS * 1000 : null;
@@ -870,12 +931,17 @@ function apState() {
       S.status = st; let lat = r.Lat, lon = r.Lng; if (lat != null && Math.abs(lat) > 180) { lat *= 1e-7; lon *= 1e-7; }
       const t = wk > 0 && tow != null ? gpsToUtc(wk, tow) : null; if (t != null && us != null) S.sync.push(t - us / 1000); if (st >= 3 && !(wk > 0)) S.noWeek++;
       if (st >= 2 && lat) S.gps.push({ us, t, lat, lon, h: r.Alt, q: AP_Q[st] || "fix " + st, sH: S.hacc });
+      S.gq.push({ us, t, sv: r.NSats != null ? r.NSats : r.NSat, hdop: r.HDop, fix: st });
     } else if (name === "GPA" && (r.I == null || r.I === 0)) S.hacc = r.HAcc != null ? r.HAcc : null;
     else if (name === "CAM" || name === "TRIG") {
       let lat = r.Lat, lon = r.Lng; if (lat != null && Math.abs(lat) > 180) { lat *= 1e-7; lon *= 1e-7; }
       const t = r.GPSWeek > 0 && r.GPSTime != null ? gpsToUtc(r.GPSWeek, r.GPSTime) : null;
       (name === "CAM" ? S.cam : S.trig).push({ n: r.Img != null ? r.Img : (name === "CAM" ? S.cam : S.trig).length + 1, us, t, lat, lon, h: r.GPSAlt != null ? r.GPSAlt : r.Alt, hRel: r.RelAlt, q: AP_Q[S.status] || null, sH: S.hacc, roll: r.R != null ? r.R : r.Roll, pitch: r.P != null ? r.P : r.Pitch, yaw: r.Y != null ? r.Y : r.Yaw });
-    } else if (name === "MSG" && !S.fw) { const m = /^(Ardu\w+|Blimp|AP_Periph|PX4)\s+V?(\d+\.\d+(?:\.\d+)?\S*)/.exec(String(r.Message || "").trim()); if (m) { S.vehicle = m[1]; S.fw = m[1] + " " + m[2]; } }
+    } else if (name === "MSG") { const msg = String(r.Message || "").trim(), m = !S.fw && /^(Ardu\w+|Blimp|AP_Periph|PX4)\s+V?(\d+\.\d+(?:\.\d+)?\S*)/.exec(msg); if (m) { S.vehicle = m[1]; S.fw = m[1] + " " + m[2]; }
+      if (/failsafe|crash|glitch|error|lost/i.test(msg)) S.ev.push({ us, lvl: 4, msg }); }
+    else if (name === "VIBE") S.vib.push({ us, imu: r.IMU || 0, v: Math.max(r.VibeX, r.VibeY, r.VibeZ), clip: r.Clip != null ? r.Clip : (r.Clip0 || 0) + (r.Clip1 || 0) + (r.Clip2 || 0) });
+    else if (name === "MODE") S.modes.push({ us, num: r.ModeNum != null ? +r.ModeNum : +r.Mode, name: typeof r.Mode === "string" && !isFinite(+r.Mode) ? r.Mode : null });
+    else if (name === "ERR" && r.ECode) S.ev.push({ us, lvl: 3, msg: "ERR " + (AP_ERR[r.Subsys] || "subsystem " + r.Subsys) + ", code " + r.ECode });
     else if (name === "VER" && !S.fw && r.FWS) { const m = /^(Ardu\w+|Blimp)\s+V?(\S+)/.exec(String(r.FWS).trim()); if (m) { S.vehicle = m[1]; S.fw = m[1] + " " + m[2]; } }
     else if (name === "PARM") S.parm++;
   };
@@ -888,6 +954,9 @@ function apResult(S, L, fmtName) {
   L.exposures = ex.map(e => ({ n: e.n, t: e.t != null ? e.t : toUtc(e.us), lat: e.lat || null, lon: e.lon || null, h: e.h, sH: e.sH, q: e.q || "log", roll: e.roll, pitch: e.pitch, yaw: e.yaw }));
   for (const p of L.trajectory) span(L, p.t); for (const e of L.exposures) span(L, e.t);
   L.timeSource = off != null ? "GPS week + ms of week (GWk/GMS) − leap seconds; other messages via boot time" : null;
+  const fam = apFamily(S.vehicle);
+  L._aux = { gq: S.gq.map(g => ({ t: g.t != null ? g.t : toUtc(g.us), sv: g.sv, hdop: g.hdop, fix: g.fix })), vib: S.vib.map(v => ({ t: toUtc(v.us), imu: v.imu, v: v.v, clip: v.clip })),
+    modes: S.modes.map(m => Object.assign({ t: toUtc(m.us) }, apMode(fam, m.num, m.name))), ev: S.ev.map(e => ({ t: toUtc(e.us), lvl: e.lvl, msg: e.msg })) };
   L.device.make = "ArduPilot"; L.device.model = S.vehicle; L.device.fw = S.fw;
   fact(L, "fFormat", fmtName); fact(L, "fFirmware", S.fw);
   fact(L, "fExposures", ex.length ? ex.length + (S.cam.length ? " (CAM)" : " (TRIG)") : null);
@@ -934,11 +1003,16 @@ async function pAPText(src, L, h, o) {
 }
 
 /* ---------------------------------------------------------------- MAVLink telemetry log (.tlog): <u64 BE Unix µs><MAVLink 1 or 2 packet> ...
-   Read: GPS_RAW_INT (24), CAMERA_FEEDBACK (180), CAMERA_TRIGGER (112), HEARTBEAT (0), AUTOPILOT_VERSION (148), STATUSTEXT (253).
+   Read: GPS_RAW_INT (24), CAMERA_FEEDBACK (180), CAMERA_TRIGGER (112), HEARTBEAT (0, autopilot and flight mode), AUTOPILOT_VERSION (148),
+   STATUSTEXT (253, firmware and messages of severity warning or worse), VIBRATION (241).
    Packets are not CRC-checked (that needs the per-message CRC_EXTRA table); the timestamp and header are checked instead. */
+// PX4 custom_mode in HEARTBEAT: main mode in bits 16–23, sub mode in bits 24–31 (px4_custom_mode.h); AUTO (4) + MISSION (4) is the mission
+const PX4_MAIN = { 1: "MANUAL", 2: "ALTCTL", 3: "POSCTL", 4: "AUTO", 5: "ACRO", 6: "OFFBOARD", 7: "STABILIZED", 8: "RATTITUDE" }, PX4_SUB = { 1: "READY", 2: "TAKEOFF", 3: "LOITER", 4: "MISSION", 5: "RTL", 6: "LAND", 8: "FOLLOW_TARGET", 9: "PRECLAND" };
+// MAV_TYPE of an ArduPilot heartbeat → vehicle (for the mode names)
+const mavFamily = ty => ty === 1 || (ty >= 19 && ty <= 25) ? "plane" : ty === 10 || ty === 11 ? "rover" : [2, 3, 4, 13, 14, 15].includes(ty) ? "copter" : null;
 const MAV_AP = { 3: "ArduPilot", 12: "PX4" }, MAV_FIX = { 0: "none", 1: "none", 2: "2D", 3: "single", 4: "dgnss", 5: "float", 6: "fixed", 7: "static", 8: "ppp" };
 async function pTlog(src, L, h, o) {
-  const gps = [], cam = [], trig = [], cnt = {}; let ap = null, fw = null, text = null;
+  const gps = [], cam = [], trig = [], cnt = {}, gq = [], vib = [], modes = [], ev = []; let ap = null, fw = null, text = null, lastMode = null;
   const okTs = (b, j) => { const hi = (b[j] << 24 | b[j + 1] << 16 | b[j + 2] << 8 | b[j + 3]) >>> 0; const us = hi * 4294967296 + ((b[j + 4] << 24 | b[j + 5] << 16 | b[j + 6] << 8 | b[j + 7]) >>> 0); return us > 3.2e14 && us < 4.1e15 ? us : 0; };
   await scan(src, (b, fin) => {
     let j = 0;
@@ -947,28 +1021,34 @@ async function pTlog(src, L, h, o) {
       const len = b[j + 9], v2 = m === 0xfd, hl = v2 ? 10 : 6, sig = v2 && (b[j + 10] & 1) ? 13 : 0, tot = 8 + hl + len + 2 + sig;
       if (j + tot > b.length) return fin ? b.length : j;
       const sys = v2 ? b[j + 13] : b[j + 11], id = v2 ? b[j + 15] | b[j + 16] << 8 | b[j + 17] << 16 : b[j + 13];
-      const raw = b.subarray(j + 8 + hl, j + 8 + hl + len), need = { 0: 9, 24: 50, 180: 47, 112: 12, 148: 60, 253: 51 }[id];
+      const raw = b.subarray(j + 8 + hl, j + 8 + hl + len), need = { 0: 9, 24: 50, 180: 47, 112: 12, 148: 60, 241: 32, 253: 51 }[id];
       if (sys !== 255 && need) { const p = new Uint8Array(Math.max(need, raw.length)); p.set(raw); const dv = dvOf(p), t = us / 1000;
-        if (id === 0) { if (ap == null && MAV_AP[p[5]]) ap = MAV_AP[p[5]]; }
-        else if (id === 24) { const ft = p[28], lat = dv.getInt32(8, true) * 1e-7, lon = dv.getInt32(12, true) * 1e-7, he = dv.getInt32(30, true), hacc = dv.getUint32(34, true);
+        if (id === 0) { if (ap == null && MAV_AP[p[5]]) ap = MAV_AP[p[5]];
+          if (MAV_AP[p[5]]) { const cm = dv.getUint32(0, true), key = p[5] + ":" + p[4] + ":" + cm; if (key !== lastMode) { lastMode = key;
+            if (p[5] === 12) { const mm = (cm >>> 16) & 255, sm = cm >>> 24; modes.push({ t, name: mm === 4 ? "AUTO_" + (PX4_SUB[sm] || sm) : PX4_MAIN[mm] || "mode " + mm, auto: mm === 4 && sm === 4 }); }
+            else modes.push(Object.assign({ t }, apMode(mavFamily(p[4]), cm))); } } }
+        else if (id === 24) { const ft = p[28], eph = dv.getUint16(20, true); gq.push({ t, sv: p[29] === 255 ? null : p[29], hdop: eph === 65535 ? null : eph / 100, fix: ft }); const lat = dv.getInt32(8, true) * 1e-7, lon = dv.getInt32(12, true) * 1e-7, he = dv.getInt32(30, true), hacc = dv.getUint32(34, true);
           if (ft >= 2 && lat) gps.push({ t, lat, lon, h: he ? he / 1000 : dv.getInt32(16, true) / 1000, ell: !!he, q: MAV_FIX[ft] || "fix " + ft, sH: hacc ? hacc / 1000 : null }); }
-        else if (id === 180) { const tu = rd(dv, "uint64_t", 0); cam.push({ n: dv.getUint16(40, true), t: tu > 1e15 && tu < 4.1e15 ? tu / 1000 : t, lat: dv.getInt32(8, true) * 1e-7, lon: dv.getInt32(12, true) * 1e-7, h: dv.getFloat32(16, true), roll: dv.getFloat32(24, true), pitch: dv.getFloat32(28, true), yaw: dv.getFloat32(32, true) }); }
-        else if (id === 112) { const tu = rd(dv, "uint64_t", 0); trig.push({ n: dv.getUint32(8, true), t: tu > 1e15 && tu < 4.1e15 ? tu / 1000 : t }); }
+        else if (id === 180) { const tu = rd(dv, "uint64_t", 0); cam.push({ n: dv.getUint16(40, true), t: tu > 1e15 && tu < 4.1e15 ? tu / 1000 : t, _tc: t, lat: dv.getInt32(8, true) * 1e-7, lon: dv.getInt32(12, true) * 1e-7, h: dv.getFloat32(16, true), roll: dv.getFloat32(24, true), pitch: dv.getFloat32(28, true), yaw: dv.getFloat32(32, true) }); }
+        else if (id === 112) { const tu = rd(dv, "uint64_t", 0); trig.push({ n: dv.getUint32(8, true), t: tu > 1e15 && tu < 4.1e15 ? tu / 1000 : t, _tc: t }); }
+        else if (id === 241) vib.push({ t, imu: 0, v: Math.max(dv.getFloat32(8, true), dv.getFloat32(12, true), dv.getFloat32(16, true)), clip: dv.getUint32(20, true) + dv.getUint32(24, true) + dv.getUint32(28, true) });
         else if (id === 148 && !fw) { const v = dv.getUint32(16, true); if (v) fw = relVer(v); }
-        else if (id === 253 && !text) { const s = asc(p, 1, 50); if (/^(Ardu\w+|PX4)\s+v?\d/i.test(s)) text = s; } }
+        else if (id === 253) { const s = asc(p, 1, 50); if (!text && /^(Ardu\w+|PX4)\s+v?\d/i.test(s)) text = s; if (p[0] <= 4) ev.push({ t, lvl: p[0], msg: s }); } }
       cnt[id] = (cnt[id] || 0) + 1; j += tot;
     }
     return fin ? b.length : j;
   }, o);
   L.trajectory = gps.map(g => ({ t: g.t, lat: g.lat, lon: g.lon, h: g.h, q: g.q }));
   const ex = cam.length ? cam : trig, last = t => { let q = null; for (const g of gps) { if (g.t > t) break; q = g; } return q; };
-  L.exposures = ex.map(e => { const g = last(e.t); return { n: e.n, t: e.t, lat: e.lat || null, lon: e.lon || null, h: e.h, q: g ? g.q : "log", sH: g ? g.sH : null, roll: e.roll, pitch: e.pitch, yaw: e.yaw }; });
+  L.exposures = ex.map(e => { const g = last(e._tc); return { n: e.n, t: e.t, _tc: e._tc, lat: e.lat || null, lon: e.lon || null, h: e.h, q: g ? g.q : "log", sH: g ? g.sH : null, roll: e.roll, pitch: e.pitch, yaw: e.yaw }; });
+  L._aux = { gq, vib, modes, ev };
   for (const p of L.trajectory) span(L, p.t); for (const e of L.exposures) span(L, e.t);
   L.timeSource = "tlog receive time (ground station clock); CAMERA_FEEDBACK time_usec when set";
   L.device.make = ap; L.device.fw = text ? text.split(/\s+/).slice(0, 2).join(" ") : fw ? (ap || "") + " " + fw : null;
   fact(L, "fFormat", "MAVLink telemetry log (.tlog)"); fact(L, "fFirmware", L.device.fw);
   fact(L, "fExposures", ex.length ? ex.length + (cam.length ? " (CAMERA_FEEDBACK)" : " (CAMERA_TRIGGER)") : null);
   if (cam.length) { fact(L, "fHeight", "CAMERA_FEEDBACK alt_msl: above mean sea level"); L.notes.push("height-amsl"); }
+  else if (trig.length && gps.length) { const ell = gps.every(g => g.ell); fact(L, "fHeight", ell ? "ellipsoid (GPS_RAW_INT alt_ellipsoid, interpolated to CAMERA_TRIGGER)" : "GPS_RAW_INT alt: above mean sea level (interpolated to CAMERA_TRIGGER)"); if (!ell) L.notes.push("height-amsl"); }
   if (gps.length) fact(L, "fGnssFix", Object.entries(countBy(gps, g => g.q)).map(([k, v]) => k + ": " + v).join(", "));
   fact(L, "fMessages", Object.entries(cnt).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([k, v]) => ({ 0: "HEARTBEAT", 1: "SYS_STATUS", 2: "SYSTEM_TIME", 24: "GPS_RAW_INT", 27: "RAW_IMU", 29: "SCALED_PRESSURE", 30: "ATTITUDE", 33: "GLOBAL_POSITION_INT", 42: "MISSION_CURRENT", 62: "NAV_CONTROLLER_OUTPUT", 65: "RC_CHANNELS", 74: "VFR_HUD", 112: "CAMERA_TRIGGER", 136: "TERRAIN_REPORT", 147: "BATTERY_STATUS", 148: "AUTOPILOT_VERSION", 152: "MEMINFO", 178: "AHRS2", 180: "CAMERA_FEEDBACK", 193: "EKF_STATUS_REPORT", 241: "VIBRATION", 253: "STATUSTEXT" }[k] || "#" + k) + ": " + v).join(", "));
 }
@@ -1034,17 +1114,35 @@ const CSV_COL = {
   q: /^(solution|quality|q|fix|status|rtk ?status|solution ?status)$/
 };
 function csvSplit(line, d) { const out = []; let cur = "", q = false; for (let i = 0; i < line.length; i++) { const c = line[i]; if (q) { if (c === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; } else if (c === '"') q = true; else if (c === d) { out.push(cur); cur = ""; } else cur += c; } out.push(cur); return out.map(x => x.trim()); }
-function csvHeader(s) {
+const csvDelim = l => [",", ";", "\t"].sort((a, b) => l.split(b).length - l.split(a).length)[0];
+const csvCols = (l, d) => csvSplit(l, d).map(c => c.toLowerCase().replace(/\s*\[[^\]]*\]\s*/g, "").replace(/\s+/g, " ").trim());
+// map: { lat, lon, name?, t?, h? } column names assigned by the user; without it columns are found by name
+function csvHeader(s, map) {
   const lines = s.split(/\r?\n/).slice(0, 30);
   for (let i = 0; i < lines.length; i++) { const l = lines[i].replace(/^\uFEFF/, "").replace(/^#\s*(?=label|name|image)/i, ""); if (!l.trim() || /^#/.test(l)) continue;
-    const d = [",", ";", "\t"].sort((a, b) => l.split(b).length - l.split(a).length)[0], cols = csvSplit(l, d).map(c => c.toLowerCase().replace(/\s*\[[^\]]*\]\s*/g, "").replace(/\s+/g, " ").trim());
-    const idx = {}; for (const k in CSV_COL) idx[k] = cols.findIndex(c => CSV_COL[k].test(c));
+    const d = csvDelim(l), cols = csvCols(l, d);
+    const idx = {}; for (const k in CSV_COL) idx[k] = map ? (map[k] != null ? cols.indexOf(map[k]) : -1) : cols.findIndex(c => CSV_COL[k].test(c));
     if (idx.lat >= 0 && idx.lon >= 0) return { line: i, d, idx, cols };
     return null; }
   return null;
 }
-async function pCSV(src, L) {
-  const s = await text(src), H = csvHeader(s); if (!H) return; const { d, idx } = H; let proj = 0, row = 0;
+// a CSV whose column names are not recognised, but whose first data row has at least two values that look like degrees (5+ decimals):
+// its columns are offered for assignment by hand (guess: the first two such columns as latitude and longitude)
+function csvColumns(s) {
+  const lines = s.split(/\r?\n/).slice(0, 30); let H = null;
+  for (let i = 0; i < lines.length; i++) { const l = lines[i].replace(/^\uFEFF/, ""); if (!l.trim() || /^#/.test(l)) continue;
+    if (!H) { const d = csvDelim(l), cols = csvCols(l, d); if (cols.length < 2) return null; H = { line: i, d, cols }; continue; }
+    const deg = csvSplit(l, H.d).map((v, k) => /^-?\d{1,3}[.,]\d{5,}$/.test(v) ? k : -1).filter(k => k >= 0);
+    if (deg.length < 2) return null; H.guess = { lat: deg[0], lon: deg[1] }; return H; }
+  return null;
+}
+async function pCSVCols(src, L) {
+  const H = csvColumns(await text(src)); if (!H) return;
+  L.csv = { cols: H.cols, guess: H.guess }; L.notes.push("csv-unmapped");
+  fact(L, "fFormat", "CSV, coordinate columns not recognised by name"); fact(L, "fColumns", H.cols.join(", "));
+}
+async function pCSV(src, L, h, o) {
+  const map = o && o.csvMap, s = await text(src), H = csvHeader(s, map); if (!H) return; if (map) L.notes.push("csv-mapped"); const { d, idx } = H; let proj = 0, row = 0;
   const num = v => { if (v == null || v === "") return null; const x = +String(v).replace(d === ";" ? "," : /(?!)/, "."); return isFinite(x) ? x : null; };
   s.split(/\r?\n/).slice(H.line + 1).forEach(l => { if (!l.trim() || /^#/.test(l)) return; const p = csvSplit(l, d); row++;
     const lat = num(p[idx.lat]), lon = num(p[idx.lon]); if (lat == null || lon == null) return; if (Math.abs(lat) > 90 || Math.abs(lon) > 180) { proj++; return; }
@@ -1053,7 +1151,7 @@ async function pCSV(src, L) {
       q: /fix/.test(tq) ? "fixed" : /float/.test(tq) ? "float" : /single|autonom|3d/.test(tq) ? "single" : /ppk/.test(tq) ? "ppk" : "log" }); });
   for (const e of L.exposures) span(L, e.t); if (L.startMs != null) L.timeSource = "time column (read as UTC)";
   if (proj) L.notes.push("csv-projected");
-  fact(L, "fFormat", "CSV geotags (" + ({ ",": "comma", ";": "semicolon", "\t": "tab" })[d] + ")"); fact(L, "fColumns", Object.entries(idx).filter(x => x[1] >= 0).map(([k, v]) => k + " = " + H.cols[v]).join(", "));
+  fact(L, "fFormat", "CSV geotags (" + ({ ",": "comma", ";": "semicolon", "\t": "tab" })[d] + ")"); fact(L, "fColumns", Object.entries(idx).filter(x => x[1] >= 0).map(([k, v]) => k + " = " + H.cols[v]).join(", ") + (map ? " (assigned by hand)" : ""));
   fact(L, "fImages", L.exposures.length); fact(L, "fProjected", proj || null);
   fact(L, "fHeight", idx.h >= 0 ? "column " + H.cols[idx.h] + ": datum not stated in the file" : null);
 }
@@ -1778,7 +1876,7 @@ async function pMetashape(src, L, h) {
 const PARSERS = { "dji-mrk": pMRK, rinex: pRINEX, rtcm3: pRTCM, ulog: pULog, sbf: pSBF, bb3: pBB3, "sf-geoinfo": pGeoinfo, kml: pKML, jxl: pJXL,
   "wingtra-geotaglog": pWGeotaglog, "wingtra-json": pWJson, "wingtra-ini": pWIni, "wingtra-geotags": pWGeotags, "mica-paramlog": pParamlog, "mica-gpslog": pGpslog,
   tlmb: pTLMB, ubx: pUBX, novatel: pNovatel, "lidar-service": pService, pcmp: pPcmp, encrypted: pEncrypted,
-  "ardupilot-bin": pDataFlash, "ardupilot-log": pAPText, tlog: pTlog, nmea: pNMEA, gpx: pGPX, "csv-geotags": pCSV, "dji-fr-csv": pDjiCsv, "thermotiff-log": pThermoLog, "thermotiff-record": pThermoRecord, "dji-fr": pDjiFR, "emotion-transcript": pEmTranscript, "ebeex-afpu": pAfpu, "pix4dcapture-log": pP4dCaptureLog, bbz: pBBZ, "pix4dcapture-mission": pP4dMission, bbx: pBBX, "dji-events": pDjiEvents, "dji-dat": pDjiDat, jeti: pJeti, efl: pEfl, "pix4d-project": pP4D, metashape: pMetashape };
+  "ardupilot-bin": pDataFlash, "ardupilot-log": pAPText, tlog: pTlog, nmea: pNMEA, gpx: pGPX, "csv-geotags": pCSV, "csv-columns": pCSVCols, "dji-fr-csv": pDjiCsv, "thermotiff-log": pThermoLog, "thermotiff-record": pThermoRecord, "dji-fr": pDjiFR, "emotion-transcript": pEmTranscript, "ebeex-afpu": pAfpu, "pix4dcapture-log": pP4dCaptureLog, bbz: pBBZ, "pix4dcapture-mission": pP4dMission, bbx: pBBX, "dji-events": pDjiEvents, "dji-dat": pDjiDat, jeti: pJeti, efl: pEfl, "pix4d-project": pP4D, metashape: pMetashape };
 
 /* ---------------------------------------------------------------- joining images with logs, checks */
 /* images: [{ name, S (reader summary), captureId, c2pa }] */
@@ -1888,6 +1986,15 @@ function combine(logs, images, solar) {
     add(good === n ? "ok" : good > 0.95 * n ? "info" : "warn", "cSolution", Object.entries(c).map(([k, v]) => k + ": " + v).join(", "), good / n);
     const sH = median(main.exposures.map(e => e.sH != null ? e.sH : e.sN != null ? Math.max(e.sN, e.sE) : null)); if (sH != null) add(sH <= 0.05 ? "ok" : sH <= 0.5 ? "info" : "warn", "cSigma", sH.toFixed(3) + " m", sH);
   }
+  // 4b flight state at the exposures (atExposure), from the main log or else the first log of this flight that records it
+  const ax = [main].concat(src).find(l => l && !l._other && l.atExp);
+  if (ax) { const S = ax.atExp, parts = [], sts = [], P = (state, txt) => { sts.push(state); parts.push(txt); };
+    if (S.gnss) { const g = S.gnss; P(g.low ? "warn" : "ok", "GNSS " + [g.svMed != null ? g.svMed + " satellites (min " + g.svMin + ")" : null, g.hdopMax != null ? "HDOP max " + g.hdopMax : null, g.ephMax != null ? "eph max " + g.ephMax + " m" : null, "below 3D fix: " + g.low].filter(Boolean).join(", ")); }
+    if (S.vib) { const v = S.vib; P(v.over60 || v.clip >= 100 ? "warn" : v.over30 || v.clip ? "info" : "ok", "vibration max " + v.max + " m/s² (over 30: " + v.over30 + ", over 60: " + v.over60 + "), clipping +" + v.clip); }
+    if (S.modes) { const m = S.modes; P(m.out ? "warn" : m.unknown ? "info" : "ok", m.out ? "outside the automatic mission: " + m.out + " (" + m.outNames.join(", ") + ")" : "mode " + m.names.join(", ")); }
+    if (S.ev) P(S.ev.err ? "warn" : "info", "autopilot errors and warnings: " + S.ev.n + " (" + S.ev.first.join("; ") + (S.ev.n > 3 ? "; …" : "") + ")");
+    if (S.interp) P("info", "interpolated positions: " + S.interp);
+    const R = { ok: 0, info: 1, warn: 2, bad: 3 }; if (parts.length) add(sts.reduce((a, b) => R[b] > R[a] ? b : a, "ok"), "cAtExposure", ax.name + ": " + parts.join(" · ")); }
   const ini = logs.find(l => l.kind === "wingtra-ini"); if (ini && ini.rtkFix != null) add(ini.rtkFix >= 95 ? "ok" : "warn", "cPpkFix", ini.rtkFix + " %");
   // flight window: logs of this flight that overlap the images (other flights and base stations left out)
   const imT = images.map(i => i.S && i.S.utcMs).filter(x => x != null);
@@ -1931,6 +2038,7 @@ function combine(logs, images, solar) {
     if (v.state === "new") add(v.standard ? "info" : "warn", "cUnverified", l.name + ": " + (v.key || "?") + (v.known ? " · ✓ " + v.known : ""));
     if (l.notes.includes("implausible")) add("warn", "cImplausible", l.name + ": " + factOf(l, "fImplausible"));
     if (l.notes.includes("nothing-read")) add("warn", "cNothingRead", l.name);
+    if (l.notes.includes("csv-unmapped")) add("warn", "cCsvMap", l.name + ": " + l.csv.cols.join(", "));
     if (l.encrypted) add("info", l.device && (l.device.serial || l.device.model) || l.startMs != null ? "cEncryptedSum" : "cEncrypted", l.name); if (l.error) add("bad", "cParseError", l.name + ": " + l.error); if (l.notes.includes("clock-jump")) add("info", "cClockJump", l.name); if (l.notes.includes("kml-geoid")) add("info", "cKmlGeoid", l.name); }
   return F;
 }
@@ -2074,8 +2182,9 @@ function oslFromFlight(logs, F) {
   for (const m of F.matches || []) {
     const e = exposureOf(logs, m); if (!e) continue; const l = logs.find(x => x.name === m.log), ell = /^ellipsoid/.test(factOf(l, "fHeight"));
     const r = {}, put = (col, val, note) => { if (val != null && val !== "" && !(typeof val === "number" && !isFinite(val))) r[col] = { val, src: l.name + " #" + e.n, note: note || "" }; };
-    put("timestamp_utc", iso(e.t)); put("lat_deg", e.lat != null ? +e.lat.toFixed(9) : null); put("lon_deg", e.lon != null ? +e.lon.toFixed(9) : null);
-    if (e.h != null) { if (ell) put("alt_ellipsoid_m", +(+e.h).toFixed(3)); else r._hNote = factOf(l, "fHeight"); }
+    const ip = e.interp ? "nInterp" : "";   // interpolated from the trajectory: an estimate
+    put("timestamp_utc", iso(e.t)); put("lat_deg", e.lat != null ? +e.lat.toFixed(9) : null, ip); put("lon_deg", e.lon != null ? +e.lon.toFixed(9) : null, ip);
+    if (e.h != null) { if (ell) put("alt_ellipsoid_m", +(+e.h).toFixed(3), ip); else r._hNote = factOf(l, "fHeight"); }
     if (e.q && /^(fixed|int|float|single|ppk)$/.test(e.q)) put("rtk_flag", e.q);
     const sx = e.sE != null ? e.sE : e.sH, sy = e.sN != null ? e.sN : e.sH; put("sigma_x_m", sx); put("sigma_y_m", sy); put("sigma_z_m", e.sV);
     out.images[m.image] = { log: m.log, n: e.n, how: m.how, status: m.status, candidates: m.candidates, dt: m.dt, dxy: m.dxy, dz: ell ? m.dz : null, cols: r };
@@ -2094,12 +2203,13 @@ function agree(col, imgVal, logVal, match) {
 }
 
 /* ---------------------------------------------------------------- exports */
-const EXP_COLS = ["source", "n", "name", "capture_id", "time_utc", "lat", "lon", "h_m", "sigma_h_m", "sigma_v_m", "solution", "image", "match", "dt_s", "dxy_m"];
+const EXP_COLS = ["source", "n", "name", "capture_id", "time_utc", "lat", "lon", "h_m", "sigma_h_m", "sigma_v_m", "solution", "image", "match", "dt_s", "dxy_m", "position", "satellites", "hdop", "eph_m", "vibration_m_s2", "flight_mode"];
 function csvCell(v) { const s = v == null ? "" : String(v); return /[",\n\r;]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }
 function exposuresCSV(logs, F) {
   const lines = [EXP_COLS.join(",")], byLog = new Map(); for (const m of (F && F.matches) || []) if (m.log) byLog.set(m.log + "#" + m.n, m);
   for (const l of logs) { if (l.listOnly) continue; for (const e of l.exposures) { const m = byLog.get(l.name + "#" + e.n) || {};
-    lines.push([l.name, e.n, e.name || "", e.captureId || "", iso(e.t) || "", e.lat != null ? e.lat.toFixed(9) : "", e.lon != null ? e.lon.toFixed(9) : "", e.h != null ? (+e.h).toFixed(3) : "", e.sH != null ? e.sH : e.sN != null ? Math.max(e.sN, e.sE) : "", e.sV != null ? e.sV : "", e.q || "", m.image || "", m.how || "", m.dt != null ? m.dt.toFixed(3) : "", m.dxy != null ? m.dxy.toFixed(3) : ""].map(csvCell).join(",")); } }
+    lines.push([l.name, e.n, e.name || "", e.captureId || "", iso(e.t) || "", e.lat != null ? e.lat.toFixed(9) : "", e.lon != null ? e.lon.toFixed(9) : "", e.h != null ? (+e.h).toFixed(3) : "", e.sH != null ? e.sH : e.sN != null ? Math.max(e.sN, e.sE) : "", e.sV != null ? e.sV : "", e.q || "", m.image || "", m.how || "", m.dt != null ? m.dt.toFixed(3) : "", m.dxy != null ? m.dxy.toFixed(3) : "",
+      e.interp ? "interpolated" : e.lat != null ? "log" : "", e.sv != null ? e.sv : "", e.hdop != null ? e.hdop : "", e.eph != null ? e.eph : "", e.vib != null ? e.vib : "", e.mode || ""].map(csvCell).join(",")); } }
   return lines.join("\r\n") + "\r\n";
 }
 function flightJSON(logs, F) {

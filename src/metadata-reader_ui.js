@@ -38,7 +38,8 @@ const chip = (cls, icon, txt) => '<span class="chip ' + cls + '"><i aria-hidden=
 const ST_ICON = { file: "✓", derived: "ƒ", log: "⇄", missing: "!", na: "–", notapp: "·" };
 const stChip = s => chip("s-" + s, ST_ICON[s], t("st_" + s));
 // derived values that rest on an assumption (flat ground at take-off height, nadir view, one image for a batch, a guess from tags) are shown as estimates
-const EST_NOTE = /^(nAgl|nDist|nGsd|nGeo|nOneImage|nGnssMode|nSensorType|nWx)$/, isEst = r => r.st === "derived" && EST_NOTE.test(r.note || "");
+// a position from the log interpolated to the exposure time (nInterp) is an estimate as well
+const EST_NOTE = /^(nAgl|nDist|nGsd|nGeo|nOneImage|nGnssMode|nSensorType|nWx|nInterp)$/, isEst = r => (r.st === "derived" || r.st === "log") && EST_NOTE.test(r.note || "");
 const stChipR = r => isEst(r) ? chip("s-derived", "≈", t("st_estimate")) : stChip(r.st);
 const cssv = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
@@ -747,7 +748,7 @@ function mergeFlight(e, rows) {
     if (x) { r.img = have(r) ? r.val : null; r.imgSrc = r.img != null ? r.src : null; r.cmp = r.img != null ? OSLFlight.agree(r.field, r.val, x.val, im) : null;
       // heights: a difference is only judged when the image says its height is ellipsoidal; otherwise the number is shown, not a verdict
       if (r.cmp && r.field === "alt_ellipsoid_m" && r.note !== "ellipsoid-sensefly") { r.cmpDiff = +r.img - +x.val; r.cmp = "not_comparable"; }
-      r.st = "log"; r.val = typeof x.val === "number" ? String(x.val) : x.val; r.src = x.src; r.note = ""; continue; }
+      r.st = "log"; r.val = typeof x.val === "number" ? String(x.val) : x.val; r.src = x.src; r.note = x.note || ""; continue; }
     if (r.block === "image_log" && im && r.field === "alt_ellipsoid_m" && im.cols._hNote) r.logNote = im.cols._hNote;
     if (m && (!have(r) || LOG_FIRST.test(key))) { r.img = have(r) ? r.val : null; r.imgSrc = r.img != null ? r.src : null; r.cmp = r.img != null && key === "mission.gnss_mode" ? (String(r.img) === String(m.val) ? "same" : "differ") : null; r.st = "log"; r.val = m.val; r.src = m.src; r.note = m.note; if (m.log) r.log = m.log; continue; }
     if (geo[key] != null && !have(r) && !(m && m.note && /^nPlan/.test(m.note))) { r.st = "derived"; r.val = geo[key]; r.src = gsrc; r.note = "nGeo"; }
@@ -911,7 +912,7 @@ function download(name, text, mime) {
 function ilRow(f) {
   const row = {}; for (const x of M.imageLog(f.res)) row[x.column] = x.value;
   const im = flightState().O.images[f.name];
-  if (im) { for (const [c, x] of Object.entries(im.cols)) if (c[0] !== "_") row[c] = String(x.val); row.aux = [row.aux, "timestamp, position, RTK and sigma from " + im.log + " #" + im.n].filter(Boolean).join("; "); row._log = im.log; }
+  if (im) { for (const [c, x] of Object.entries(im.cols)) if (c[0] !== "_") row[c] = String(x.val); row.aux = [row.aux, "timestamp, position, RTK and sigma from " + im.log + " #" + im.n + (im.cols.lat_deg && im.cols.lat_deg.note === "nInterp" ? " (position interpolated from the trajectory, an estimate)" : "")].filter(Boolean).join("; "); row._log = im.log; }
   return row;
 }
 function imageLogCSV(F) { const cols = M.IMAGE_LOG_COLUMNS, lines = [cols.join(",")]; for (const f of F) { const row = ilRow(f); lines.push(cols.map(c => M.csvCell(row[c] == null ? "" : row[c])).join(",")); } return lines.join("\r\n") + "\r\n"; }
@@ -1036,14 +1037,14 @@ async function provenanceJSON(F) {
     const im = FS.O.images[f.name];
     for (const x of M.imageLog(f.res)) {
       if (x.column === "aux") continue;
-      const c = cols[x.column] || (cols[x.column] = { image: 0, derived: 0, flight_log: 0, empty: 0, sources: new Set() });
-      if (im && im.cols[x.column]) { c.flight_log++; c.sources.add(im.log); }
+      const c = cols[x.column] || (cols[x.column] = { image: 0, derived: 0, flight_log: 0, flight_log_interpolated: 0, empty: 0, sources: new Set() });
+      if (im && im.cols[x.column]) { c.flight_log++; if (im.cols[x.column].note === "nInterp") c.flight_log_interpolated++; c.sources.add(im.log); }
       else if (x.status === "file") { c.image++; if (x.source) c.sources.add(x.source); }
       else if (x.status === "derived") { c.derived++; if (x.source) c.sources.add(x.source); }
       else c.empty++;
     }
   }
-  const ilCols = Object.fromEntries(Object.entries(cols).map(([k, c]) => [k, Object.assign(Object.fromEntries(["image", "derived", "flight_log", "empty"].filter(n => c[n]).map(n => [n, c[n]])), c.sources.size ? { sources: [...c.sources] } : {})]));
+  const ilCols = Object.fromEntries(Object.entries(cols).map(([k, c]) => [k, Object.assign(Object.fromEntries(["image", "derived", "flight_log", "flight_log_interpolated", "empty"].filter(n => c[n]).map(n => [n, c[n]])), c.sources.size ? { sources: [...c.sources] } : {})]));
   const mj = metadataJSON(F), il = imageLogCSV(F), now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const reads = inputs.map(x => x.read_utc).filter(Boolean).sort();
   const collections = [];

@@ -234,19 +234,31 @@ const gpsMs = utc => utc + 18000; // after 2017
     const str = (x, n) => { const b = new Uint8Array(n); b.set(u8(x).subarray(0, n)); return b; };
     const fmt = (type, len, name, f, cols) => { const b = new Uint8Array(89), dv = new DataView(b.buffer); b.set([0xa3, 0x95, 0x80, type, len]); b.set(str(name, 4), 5); b.set(str(f, 16), 9); b.set(str(cols, 64), 25); return b; };
     parts.push(fmt(128, 89, "FMT", "BBnNZ", "Type,Length,Name,Format,Columns"), fmt(130, 33, "GPS", "QBIHBcLLf", "TimeUS,Status,GMS,GWk,NSats,HDop,Lat,Lng,Alt"),
-      fmt(131, 46, "CAM", "QBHIHLLeeeccC", "TimeUS,I,Img,GPSTime,GPSWeek,Lat,Lng,Alt,RelAlt,GPSAlt,R,P,Y"), fmt(132, 75, "MSG", "QZ", "TimeUS,Message"), fmt(133, 12, "XKF1", "QB", "TimeUS,C"));
+      fmt(131, 46, "CAM", "QBHIHLLeeeccC", "TimeUS,I,Img,GPSTime,GPSWeek,Lat,Lng,Alt,RelAlt,GPSAlt,R,P,Y"), fmt(132, 75, "MSG", "QZ", "TimeUS,Message"), fmt(133, 12, "XKF1", "QB", "TimeUS,C"),
+      fmt(134, 28, "VIBE", "QBfffI", "TimeUS,IMU,VibeX,VibeY,VibeZ,Clip"), fmt(135, 14, "MODE", "QMBB", "TimeUS,Mode,ModeNum,Rsn"), fmt(136, 13, "ERR", "QBB", "TimeUS,Subsys,ECode"));
     const msg = (type, len, fill) => { const b = new Uint8Array(len), dv = new DataView(b.buffer); b.set([0xa3, 0x95, type]); fill(dv, b); return b; };
     const q64 = (dv, o, v) => { dv.setUint32(o, v % 4294967296, true); dv.setUint32(o + 4, Math.floor(v / 4294967296), true); };
     parts.push(msg(132, 75, (dv, b) => { q64(dv, 3, 1000); b.set(u8("ArduPlane V4.5.7 (abc123)"), 11); }));
-    for (let i = 0; i < 10; i++) parts.push(msg(130, 33, dv => { q64(dv, 3, 5e6 + i * 2e5); dv.setUint8(11, i < 5 ? 3 : 6); dv.setUint32(12, tow + i * 200, true); dv.setUint16(16, wk, true); dv.setUint8(18, 14); dv.setInt32(21, Math.round((49 + i * 1e-5) * 1e7), true); dv.setInt32(25, 14e7, true); dv.setFloat32(29, 400, true); }));
+    for (let i = 0; i < 10; i++) parts.push(msg(130, 33, dv => { q64(dv, 3, 5e6 + i * 2e5); dv.setUint8(11, i < 5 ? 3 : 6); dv.setUint32(12, tow + i * 200, true); dv.setUint16(16, wk, true); dv.setUint8(18, 14); dv.setInt16(19, 120, true); dv.setInt32(21, Math.round((49 + i * 1e-5) * 1e7), true); dv.setInt32(25, 14e7, true); dv.setFloat32(29, 400, true); }));
     parts.push(msg(133, 12, () => {}));
+    // flight state: AUTO (ArduPlane 10) until 6.0 s boot time, then FBWA (5); vibration 65 m/s² at exposure 1; clipping rises by 3; a GPS error
+    parts.push(msg(135, 14, (dv, b) => { q64(dv, 3, 4e6); b[11] = 10; b[12] = 10; b[13] = 1; }), msg(135, 14, (dv, b) => { q64(dv, 3, 6e6); b[11] = 5; b[12] = 5; b[13] = 1; }));
+    for (let i = 0; i <= 14; i++) parts.push(msg(134, 28, dv => { q64(dv, 3, 5e6 + i * 1e5); const v = i === 2 ? 65 : 20; dv.setFloat32(12, v, true); dv.setFloat32(16, v / 2, true); dv.setFloat32(20, v / 3, true); dv.setUint32(24, i < 10 ? 0 : 3, true); }));
+    parts.push(msg(136, 13, (dv, b) => { q64(dv, 3, 5.6e6); b[11] = 11; b[12] = 2; }));
     for (let i = 1; i <= 3; i++) parts.push(msg(131, 46, dv => { q64(dv, 3, 5e6 + i * 4e5); dv.setUint16(12, i, true); dv.setUint32(14, tow + i * 400, true); dv.setUint16(18, wk, true); dv.setInt32(20, Math.round((49 + i * 2e-5) * 1e7), true); dv.setInt32(24, 14e7, true); dv.setInt32(28, 40000, true); dv.setInt32(36, 40100, true); }));
     const L = await F.parse(cat(...parts), "00000042.BIN");
     const bf = await F.parse(cat(parts[0], fmt(140, 10, "GPS", "QQQ", "TimeUS,A,B"), new Uint8Array([0xa3, 0x95, 140, 1, 2, 3, 4, 5, 6, 7])), "bad.bin"); ok(bf && !bf.error && bf.notes.includes("df-bad-fmt"), "ardupilot: FMT longer than its message is skipped, not a crash");
     ok(L && L.kind === "ardupilot-bin", "ardupilot bin kind"); ok(L.device.fw === "ArduPlane 4.5.7", "ardupilot firmware from MSG");
     ok(L.trajectory.length === 10 && L.trajectory[0].t === utc && L.trajectory[9].q === "fixed", "ardupilot GPS: GWk/GMS → UTC, status 6 = fixed");
     ok(L.exposures.length === 3 && L.exposures[0].t === utc + 400 && near(L.exposures[1].lat, 49.00004, 1e-9) && near(L.exposures[0].h, 401, 1e-9), "ardupilot CAM exposures (time, position, GPSAlt)");
-    ok(L.notes.includes("height-amsl") && L.verify.state === "new", "ardupilot: height above sea level noted, version not verified"); }
+    ok(L.notes.includes("height-amsl") && L.verify.state === "new", "ardupilot: height above sea level noted, version not verified");
+    const [e1, , e3] = L.exposures;
+    ok(e1.sv === 14 && e1.hdop === 1.2 && e1.fix === 3 && e3.fix === 6, "ardupilot at exposure: satellites, HDOP, fix of the nearest GPS record");
+    ok(e1.vib === 65 && L.exposures[1].vib === 20 && e1.mode === "AUTO" && e1.auto === true && e3.mode === "FBWA" && e3.auto === false, "ardupilot at exposure: vibration within ±0.5 s, ArduPlane mode names");
+    const A = L.atExp; ok(A.vib.over60 === 1 && A.vib.clip === 3 && A.modes.out === 1 && A.ev.err === 1 && /ERR GPS, code 2/.test(A.ev.first[0]) && A.interp === 0, "ardupilot summary: vibration, clipping, mode, ERR in the imaging window");
+    const R = F.combine([L], []), c = R.checks.find(x => x.key === "cAtExposure");
+    ok(c && c.state === "warn" && /outside the automatic mission: 1 \(FBWA\)/.test(c.det) && /vibration max 65/.test(c.det) && /HDOP max 1\.2/.test(c.det), "check: flight state at the exposures in one row");
+    const csv = F.exposuresCSV([L], R).split("\r\n"); ok(/,position,satellites,hdop,eph_m,vibration_m_s2,flight_mode$/.test(csv[0]) && /,log,14,1\.2,,65,AUTO$/.test(csv[1]), "exposures CSV: state columns"); }
   /* ArduPilot text log, older column names (TimeMS + Week as GPS time) */
   { const utc = Date.UTC(2015, 4, 14, 10, 0, 0), g = utc + 16000 - GPS0, wk = Math.floor(g / WEEK), tow = g % WEEK;
     const txt = ["FMT, 128, 89, FMT, BBnNZ, Type,Length,Name,Format,Columns", "FMT, 130, 45, GPS, BIHBcLLeeEefI, Status,TimeMS,Week,NSats,HDop,Lat,Lng,RelAlt,Alt,Spd,GCrs,VZ,T",
@@ -267,6 +279,44 @@ const gpsMs = utc => utc + 18000; // after 2017
     ok(L && L.kind === "tlog" && L.device.make === "ArduPilot", "tlog kind, autopilot from HEARTBEAT");
     ok(L.trajectory.length === 5 && L.trajectory[0].t === t0 / 1000 && near(L.trajectory[0].h, 445, 1e-9) && L.trajectory[4].q === "fixed", "tlog GPS_RAW_INT (MAVLink 2 truncated, ellipsoid height)");
     ok(L.exposures.length === 1 && L.exposures[0].n === 7 && L.exposures[0].q === "fixed" && near(L.exposures[0].sH, 0.015, 1e-9), "tlog CAMERA_FEEDBACK with solution of the last GPS fix"); }
+  /* MAVLink .tlog, PX4: CAMERA_TRIGGER without position (interpolated), mode from HEARTBEAT custom_mode, STATUSTEXT, VIBRATION */
+  { const t0 = Date.UTC(2026, 4, 14, 10, 0, 0) * 1000, parts = [];
+    const ts = us => { const b = new Uint8Array(8), dv = new DataView(b.buffer); dv.setUint32(0, Math.floor(us / 4294967296)); dv.setUint32(4, us % 4294967296); return b; };
+    const v1 = (us, id, p) => cat(ts(us), new Uint8Array([0xfe, p.length, 0, 1, 1, id]), p, new Uint8Array(2));
+    const hb = (us, cm) => { const p = new Uint8Array(9), dv = new DataView(p.buffer); dv.setUint32(0, cm, true); p[4] = 2; p[5] = 12; return v1(us, 0, p); };
+    parts.push(hb(t0, (4 << 16) | (4 << 24)));
+    for (let i = 0; i < 10; i++) { const p = new Uint8Array(52), dv = new DataView(p.buffer); dv.setInt32(8, Math.round((49 + i * 1e-5) * 1e7), true); dv.setInt32(12, 14e7, true); dv.setInt32(16, 400000, true); dv.setUint16(20, 90, true); p[28] = 3; p[29] = 15; dv.setInt32(30, 445000 + i * 1000, true); parts.push(v1(t0 + i * 2e5, 24, p)); }
+    { const p = new Uint8Array(32), dv = new DataView(p.buffer); dv.setFloat32(8, 12, true); dv.setFloat32(12, 13, true); dv.setFloat32(16, 14, true); parts.push(v1(t0 + 5e5, 241, p)); }
+    { const p = new Uint8Array(12), dv = new DataView(p.buffer); dv.setUint32(8, 1, true); parts.push(v1(t0 + 5e5, 112, p)); }
+    { const p = new Uint8Array(51); p[0] = 4; p.set(u8("Synthetic warning"), 1); parts.push(v1(t0 + 1e6, 253, p)); }
+    parts.push(hb(t0 + 1.1e6, 3 << 16));
+    { const p = new Uint8Array(12), dv = new DataView(p.buffer); dv.setUint32(8, 2, true); parts.push(v1(t0 + 1.3e6, 112, p)); }
+    const L = await F.parse(cat(...parts), "px4.tlog"), [e1, e2] = L.exposures;
+    ok(L.device.make === "PX4" && e1.interp && near(e1.lat, 49.000025, 1e-9) && near(e1.h, 447.5, 1e-6) && near(e2.lat, 49.000065, 1e-9), "tlog CAMERA_TRIGGER: position interpolated from GPS_RAW_INT");
+    ok(e1.sv === 15 && e1.hdop === 0.9 && e1.vib === 14 && e1.mode === "AUTO_MISSION" && e1.auto && e2.mode === "POSCTL" && e2.auto === false, "tlog at exposure: satellites, HDOP, vibration, PX4 mode");
+    ok(/^ellipsoid .*CAMERA_TRIGGER/.test((L.facts.find(f => f[0] === "fHeight") || [])[1]) && L.atExp.interp === 2 && L.atExp.ev.n === 1 && !L.atExp.ev.err, "tlog: height source of interpolated exposures, STATUSTEXT warning in the window");
+    const R = F.combine([L], [{ name: "IMG_1.JPG", S: { utcMs: t0 / 1000 + 500, lat: 49.000025, lon: 14 } }]), c = R.checks.find(x => x.key === "cAtExposure"), O = F.oslFromFlight([L], R);
+    ok(c && c.state === "warn" && /interpolated positions: 2/.test(c.det) && /autopilot errors and warnings: 1 \(Synthetic warning\)/.test(c.det), "check: interpolated positions and messages reported");
+    ok(O.images["IMG_1.JPG"] && O.images["IMG_1.JPG"].cols.lat_deg.note === "nInterp" && O.images["IMG_1.JPG"].cols.alt_ellipsoid_m.note === "nInterp", "provenance: interpolated position marked as an estimate");
+    ok(/,interpolated,15,0\.9,,14,AUTO_MISSION$/.test(F.exposuresCSV([L], R).split("\r\n")[1]), "exposures CSV: interpolated position"); }
+  /* ULog: GNSS quality, nav_state and a logged error at the exposures; camera_capture without a fix (0, 0) gets an interpolated position */
+  { const msg = (t, body) => { const b = new Uint8Array(3 + body.length), d = new DataView(b.buffer); d.setUint16(0, body.length, true); b[2] = t.charCodeAt(0); b.set(body, 3); return b; };
+    const hdr = new Uint8Array(16); hdr.set([0x55, 0x4c, 0x6f, 0x67, 0x01, 0x12, 0x35, 1]);
+    const B = new Uint8Array(3 + 40); new DataView(B.buffer).setUint16(0, 40, true); B[2] = 0x42;
+    const u64 = (d, o, v) => { d.setUint32(o, v % 2 ** 32, true); d.setUint32(o + 4, Math.floor(v / 2 ** 32), true); };
+    const T0 = Date.UTC(2026, 4, 14, 10, 0, 0), parts = [hdr, B,
+      msg("F", u8("vehicle_gps_position:uint64_t timestamp;uint64_t time_utc_usec;int32_t lat;int32_t lon;int32_t alt_ellipsoid;float eph;float epv;uint8_t fix_type;uint8_t satellites_used")),
+      msg("F", u8("vehicle_status:uint64_t timestamp;uint8_t nav_state")),
+      msg("F", u8("camera_capture:uint64_t timestamp;uint64_t timestamp_utc;uint32_t seq;double lat;double lon;float alt;int8_t result")),
+      msg("A", cat(new Uint8Array([0, 1, 0]), u8("vehicle_gps_position"))), msg("A", cat(new Uint8Array([0, 2, 0]), u8("vehicle_status"))), msg("A", cat(new Uint8Array([0, 3, 0]), u8("camera_capture")))];
+    const D = (id, n, fill) => { const b = new Uint8Array(2 + n), d = new DataView(b.buffer); d.setUint16(0, id, true); fill(d); return msg("D", b); };
+    const nav = (us, v) => D(2, 9, d => { u64(d, 2, us); d.setUint8(10, v); }), cap = (us, seq) => D(3, 41, d => { u64(d, 2, us); d.setUint32(18, seq, true); d.setInt8(42, 1); });
+    parts.push(nav(4e6, 3));
+    for (let k = 0; k < 10; k++) parts.push(D(1, 38, d => { u64(d, 2, 5e6 + k * 2e5); u64(d, 10, (T0 + k * 200) * 1000); d.setInt32(18, Math.round((49 + k * 1e-5) * 1e7), true); d.setInt32(22, 14e7, true); d.setInt32(26, 500000, true); d.setFloat32(30, k === 6 ? 2.5 : 0.75, true); d.setFloat32(34, 1.2, true); d.setUint8(38, 3); d.setUint8(39, k === 6 ? 7 : 16); }));
+    parts.push(cap(5.5e6, 1), msg("L", cat(new Uint8Array([51]), (() => { const b = new Uint8Array(8); u64(new DataView(b.buffer), 0, 6e6); return b; })(), u8("Synthetic error"))), nav(6.1e6, 2), cap(6.25e6, 2));
+    const L = await F.parse(cat(...parts), "state.ulg"), [e1, e2] = L.exposures;
+    ok(e1.interp && near(e1.lat, 49.000025, 1e-9) && e1.sv === 16 && e1.eph === 0.75 && e1.mode === "AUTO_MISSION" && e1.auto, "ulog at exposure: interpolated position, GNSS quality, nav_state");
+    ok(e2.sv === 7 && e2.eph === 2.5 && e2.mode === "POSCTL" && e2.auto === false && L.atExp.ev.err === 1 && L.atExp.gnss.svMin === 7 && L.atExp.gnss.ephMax === 2.5 && !L.atExp.vib, "ulog summary: minimum satellites, maximum eph, logged error, no vibration rating"); }
 
   /* NMEA 0183: date from RMC, GGA position, quality and height, GST σ, midnight rollover, bad checksum */
   { const cs = x => { let c = 0; for (const ch of x) c ^= ch.charCodeAt(0); return "$" + x + "*" + c.toString(16).toUpperCase().padStart(2, "0"); };
@@ -293,7 +343,13 @@ const gpsMs = utc => utc + 18000; // after 2017
     const c = await F.parse(u8("Name;Latitude;Longitude;Ellipsoidal height;Time;Solution status\nP1;49,5;14,25;300,1;2026-05-14 10:00:00;FIX\n"), "events.csv");
     ok(c && c.exposures[0].lat === 49.5 && c.exposures[0].h === 300.1 && c.exposures[0].t === Date.UTC(2026, 4, 14, 10) && c.exposures[0].q === "fixed", "csv semicolon, decimal comma, time, status");
     const d = await F.parse(u8("name,lat,lon,h\nA,5540000.1,-750000.2,300\n"), "sjtsk.csv"); ok(d && d.notes.includes("csv-projected") && !d.exposures.length, "csv projected coordinates recognised, not converted");
-    ok(F.sniff("notes.csv", u8("a,b,c\n1,2,3\n")) === null, "csv without coordinate columns is not a log"); }
+    ok(F.sniff("notes.csv", u8("a,b,c\n1,2,3\n")) === null, "csv without coordinate columns is not a log");
+    const raw = u8("Snimek;Sirka;Delka;Vyska\nIMG_1.JPG;49,1234567;14,7654321;300,5\nIMG_2.JPG;49,1234667;14,7654321;300,6\n");
+    const u = await F.parse(raw, "export.csv"), R0 = F.combine([u], []);
+    ok(u && u.kind === "csv-columns" && u.csv.cols.join() === "snimek,sirka,delka,vyska" && u.csv.guess.lat === 1 && u.csv.guess.lon === 2 && u.notes.includes("csv-unmapped") && !u.notes.includes("nothing-read"), "csv with unknown column names: columns offered, first two degree-like guessed");
+    ok(R0.checks.some(x => x.key === "cCsvMap" && x.state === "warn"), "check: unknown CSV columns to assign");
+    const m = await F.parse(raw, "export.csv", { csvMap: { lat: "sirka", lon: "delka", h: "vyska", name: "snimek" } });
+    ok(m.kind === "csv-geotags" && m.exposures.length === 2 && m.exposures[0].lat === 49.1234567 && m.exposures[1].h === 300.6 && m.exposures[0].name === "IMG_1.JPG" && m.notes.includes("csv-mapped") && /assigned by hand/.test((m.facts.find(f => f[0] === "fColumns") || [])[1]), "csv columns assigned by hand"); }
 
   { const L = await F.parse(u8('<?xml version="1.0"?><kml><Document><name>Plan KML</name><Placemark><name>0 </name><Point><coordinates>14.0,49.0,300</coordinates></Point></Placemark><Placemark><name>IMG_0001.JPG</name><Point><coordinates>14.0,49.0,301</coordinates></Point></Placemark></Document></kml>'), "plan.kml");
     ok(L.exposures.length === 1 && L.exposures[0].name === "IMG_0001.JPG" && L.facts.some(f => f[0] === "fPlacemarks" && f[1] === 1), "kml: mission waypoints are not exposures"); }

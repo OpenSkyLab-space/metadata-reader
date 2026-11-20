@@ -21,7 +21,15 @@ Each entry names the versions of the parser (OSLMeta), the flight log module (OS
   - its `conversion_log.csv` and `processing_record.json` are read as a processing record (one workflow when both are loaded), with ThermoTIFF, the DJI Thermal SDK API and ExifTool as software agents in `provenance.json` and the conversion as an activity that used the loaded R-JPEGs and generated the loaded TIFFs;
   - folder paths in these files are not copied.
   - Checked on synthetic files built from the ThermoTIFF 0.1.0 source; no field file yet.
-- Component versions to set at the release: parser OSLMeta and flight log module OSLFlight both changed (new decoded groups `APP4:DJI`, `APP7:DJI`, `APP1:FLIR`; new kinds `thermotiff-log`, `thermotiff-record`).
+- Flight logs: the state of the flight at each exposure, reported in one check row ("Flight state at the exposures") and in new columns of the exposures CSV (`position`, `satellites`, `hdop`, `eph_m`, `vibration_m_s2`, `flight_mode`).
+  - GNSS quality from the record nearest in time (within 2 s): satellites, HDOP (ArduPilot GPS, MAVLink GPS_RAW_INT) or eph (PX4 ULog), fix type. Exposures with a fix below 3D are flagged.
+  - Vibration, ArduPilot only (DataFlash VIBE, MAVLink VIBRATION): the largest axis within ±0.5 s and the rise of the clipping counters during imaging, rated with the limits in the ArduPilot documentation (30 and 60 m/s²). These limits concern flight control, so they are only indicative for image blur. PX4 is not rated: its documentation gives no limit.
+  - Flight mode in force at each exposure (ArduPilot MODE with Copter, Plane and Rover mode names; PX4 `vehicle_status.nav_state`; MAVLink HEARTBEAT custom mode). Exposures outside the automatic mission are flagged.
+  - Autopilot errors and warnings between the first and last exposure: ArduPilot ERR (subsystem names from AP_Logger) and MSG lines about failsafe, crash, glitch, error or loss; ULog logged messages and MAVLink STATUSTEXT of severity warning or worse.
+  - An exposure with a time but no position (MAVLink CAMERA_TRIGGER, PX4 camera_capture without a fix) gets a position interpolated linearly from the trajectory, when the two points around it are at most 2 s apart. It is marked with "≈" in the table, as `interpolated` in the CSV and as an estimate (`nInterp`) in `metadata.json` and `provenance.json`.
+- A CSV whose coordinate columns have unknown names, but whose first data row holds values that look like degrees, is listed with its columns. The user assigns latitude and longitude (and optionally time, height and image name) in the Flight tab; the file is read again with that assignment, which is recorded as manual.
+- Checked on synthetic ArduPilot, MAVLink and ULog files built from the message definitions (ArduPilot LogStructure and mode.h, MAVLink common.xml, PX4 VehicleStatus.msg); not yet on field logs with these messages.
+- Component versions to set at the release: parser OSLMeta and flight log module OSLFlight both changed (new decoded groups `APP4:DJI`, `APP7:DJI`, `APP1:FLIR`; new kinds `thermotiff-log`, `thermotiff-record`, `csv-columns`; flight state at the exposures).
 
 ## [1.4.0] - 2026-11-19
 
