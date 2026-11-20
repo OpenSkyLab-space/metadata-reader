@@ -62,7 +62,7 @@ The OpenSkyLab metadata reader exports `provenance.json` next to `metadata.json`
 - the reader as a software agent with the versions of its parser, flight-log module and specification table;
 - one `metadata_extraction` activity that used all inputs and generated `metadata.json` and `image_log.csv` (with their SHA-256, so the record proves which export it belongs to);
 - `fields[]` for every value it filled: origin, source tag or log, the input it came from, the rule note for derived values, and for values from a log the image's own value with `same` / `differ` (default tolerances of the reader: 1 m position and height, 0.5 s time), or `not_comparable` with the difference when the two values may refer to different references (a height whose datum the image does not state);
-- `image_log_columns`: per column of `image_log.csv`, how many rows come from the image, the log or are empty.
+- `image_log_columns`: per column of `image_log.csv`, how many rows come from the image, the log or are empty; `flight_log_interpolated` counts the log values that are positions interpolated to the exposure time (estimates).
 - `matching[]` when logs are loaded: per image the match status (`unique`, `ambiguous`, `conflict`, `unmatched`), the method (file name, DJI index, MicaSense CaptureId or time), the log record, the time offset and distance, how many records fitted, the alternatives and the records rejected with the reason. Two records that fit about equally are not resolved by guessing: the image stays unmatched with status `ambiguous`.
 
 When a processing project is loaded (Pix4Dmapper `.p4d`; Agisoft Metashape `doc.xml`, `chunk.zip` or `.psz`), the reader also writes:

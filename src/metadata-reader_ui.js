@@ -38,7 +38,8 @@ const chip = (cls, icon, txt) => '<span class="chip ' + cls + '"><i aria-hidden=
 const ST_ICON = { file: "✓", derived: "ƒ", log: "⇄", missing: "!", na: "–", notapp: "·" };
 const stChip = s => chip("s-" + s, ST_ICON[s], t("st_" + s));
 // derived values that rest on an assumption (flat ground at take-off height, nadir view, one image for a batch, a guess from tags) are shown as estimates
-const EST_NOTE = /^(nAgl|nDist|nGsd|nGeo|nOneImage|nGnssMode|nSensorType|nWx)$/, isEst = r => r.st === "derived" && EST_NOTE.test(r.note || "");
+// a position from the log interpolated to the exposure time (nInterp) is an estimate as well
+const EST_NOTE = /^(nAgl|nDist|nGsd|nGeo|nOneImage|nGnssMode|nSensorType|nWx|nInterp)$/, isEst = r => (r.st === "derived" || r.st === "log") && EST_NOTE.test(r.note || "");
 const stChipR = r => isEst(r) ? chip("s-derived", "≈", t("st_estimate")) : stChip(r.st);
 const cssv = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
@@ -617,7 +618,7 @@ function oslRules(e, B) {
   if (S.software) F("sensor.firmware", S.software, "EXIF:IFD0:Software", "nFirmware");
   if (S.make || S.model) F("sensor.sensor_model", [S.make, S.model].filter(Boolean).join(" "), "EXIF:IFD0:Make, Model");
   if (S.serial) F("sensor.sensor_serial", S.serial, S.serialSrc);
-  if (S.sensorType) D("sensor.sensor_type", S.sensorType, S.thermal ? "JPEG APP3–APP5" : S.band ? S.band.src : "File:FileType, ColorComponents", "nSensorType");
+  if (S.sensorType) D("sensor.sensor_type", S.sensorType, S.thermal ? ({ "DJI R-JPEG": "JPEG APP3–APP5 (DJI)", "FLIR radiometric JPEG": "JPEG APP1 FLIR (FFF)", ThermoTIFF: "EXIF:IFD0:Software, ImageDescription (ThermoTIFF)" })[S.thermal.kind] || S.thermal.kind : S.band ? S.band.src : "File:FileType, ColorComponents", "nSensorType");
   if (S.sensorPxW) F("sensor.image_size", [S.sensorPxW, S.sensorPxH], tv(e, "ExifImageWidth") != null ? "EXIF:ExifIFD:ExifImageWidth, ExifImageHeight" : "ImageWidth, ImageHeight");
   if (S.bitDepth) F("sensor.bit_depth", S.bitDepth, "BitsPerSample");
   if (S.hfov) D("sensor.field_of_view", [+S.hfov.toFixed(2), +S.vfov.toFixed(2)], "Derived:FieldOfView", "nFov");
@@ -651,7 +652,24 @@ function oslRules(e, B) {
     if (S.dlsAttitude) (/rad/.test(S.dlsAttitude.src) ? D : F)("multispectral.dls_attitude", [S.dlsAttitude.roll, S.dlsAttitude.pitch, S.dlsAttitude.yaw].map(x => +x.toFixed(2)), S.dlsAttitude.src);
     const em = tv(e, "ExposureMode", /^EXIF:/); if (em != null && isFinite(+em)) F("multispectral.exposure_mode", +em === 1 ? "fixed" : "auto", "EXIF:ExifIFD:ExposureMode", "nExpMode");
   }
-  if (th) { X("thermal.fpa_temperature", "", "nSdk"); X("thermal.capture_measurement_params", "", "nApp4"); }
+  if (th) {
+    const T0 = S.thermal || {}, P0 = T0.params, TT = T0.thermotiff;
+    if (S.sensorTemp != null) F("thermal.fpa_temperature", S.sensorTemp, "XMP:Camera:SensorTemperature", "nFpaXmp"); else X("thermal.fpa_temperature", "", /^DJI|^ThermoTIFF/.test(T0.kind || "") ? "nFpaDji" : "nSdk");
+    if (P0) {
+      const p = {}; for (const [k, v] of Object.entries(P0)) if (k !== "src" && v != null) p[k] = v;
+      F("thermal.capture_measurement_params", p, P0.src, "nCamSet");
+      if (P0.emissivity != null) D("reference.emissivity_setting", P0.emissivity, P0.src, "nEmisCam");
+    } else X("thermal.capture_measurement_params", "", TT ? "nTtCap" : "nApp4");
+    if (T0.encoding) D("thermal.image_encoding", T0.encoding, T0.encodingSrc, TT ? "nEncTt" : "nEnc");
+    if (T0.planck) { const q = T0.planck; F("thermal.planck_constants", { R1: q.R1, B: q.B, F: q.F, O: q.O, R2: q.R2 }, q.src + ": PlanckR1, B, F, O, R2", "nPlanck"); }
+    if (S.band && S.band.wl > 3000 && S.band.fwhm) D("thermal.spectral_range", [+((S.band.wl - S.band.fwhm / 2) / 1000).toFixed(2), +((S.band.wl + S.band.fwhm / 2) / 1000).toFixed(2)], "XMP:Camera:CentralWavelength, WavelengthFWHM", "nSpecRange");
+    if (TT) {
+      const p = {}; for (const [k, v] of Object.entries(TT.params)) if (v != null) p[k] = v;
+      F("processing.thermal_settings", Object.assign({ method: "DJI Thermal SDK, raw values to temperature (degrees Celsius)" }, p, TT.source ? { source_image: TT.source } : {}), "EXIF:IFD0:ImageDescription", "nTtSet");
+      F("processing.atmospheric_model", "DJI Thermal SDK built-in correction (method not published; inputs: object distance, relative humidity, ambient and reflected temperature)", "EXIF:IFD0:ImageDescription", "nTtAtm");
+      F("processing.software", [{ name: "ThermoTIFF", version: TT.version || "" }, { name: "DJI Thermal SDK", version: TT.sdk_api ? "API " + TT.sdk_api : "" }], "EXIF:IFD0:Software, ImageDescription", "nTtSw");
+    }
+  }
   /* mission (from all loaded files) */
   const multi = B.n > 1 ? "nBatch" : "";
   if (B.t0) { D("mission.start_utc", B.t0, multi ? t("srcBatch", B.n) : S.utcSrc, multi); D("mission.end_utc", B.t1, multi ? t("srcBatch", B.n) : S.utcSrc, multi || "nOneImage"); }
@@ -666,7 +684,8 @@ function oslRules(e, B) {
   if (B.oblique != null) D("mission.oblique_images", B.oblique ? [true, +B.tiltMax.toFixed(1)] : false, "XMP:drone-dji:GimbalPitchDegree", multi ? "nOblique" : "nOneImage");
   /* environment */
   if (S.sun) { D("environment.solar_zenith", +(90 - S.sun.elevation).toFixed(2), "Derived:SunElevation (NOAA)", "nSun"); D("environment.solar_azimuth", +S.sun.azimuth.toFixed(2), "Derived:SunAzimuth (NOAA)", "nSun"); }
-  if (S.altRel != null && S.gimbal && S.gimbal.pitch != null && S.gimbal.pitch < -80) D("environment.sensor_target_distance", S.altRel, "XMP:drone-dji:RelativeAltitude", "nDist");
+  if (S.lrf && S.lrf.measured) F("environment.sensor_target_distance", +S.lrf.distance.toFixed(3), "XMP:drone-dji:LRFTargetDistance", "nLrf");
+  else if (S.altRel != null && S.gimbal && S.gimbal.pitch != null && S.gimbal.pitch < -80) D("environment.sensor_target_distance", S.altRel, "XMP:drone-dji:RelativeAltitude", S.lrf ? "nDistNoLrf" : "nDist");
   const amb = [["AmbientTemperature", "environment.air_temperature"], ["Humidity", "environment.relative_humidity"], ["Pressure", "environment.air_pressure"]];
   for (const [tg, k] of amb) { const v = tv(e, tg, /^EXIF:/); if (v != null) F(k, num(v), "EXIF:ExifIFD:" + tg, "nAmb"); }
   const W = wxFor(); if (W) { for (const [k, v] of Object.entries(W.vals)) if (v != null && !R["environment." + k]) D("environment." + k, v, k === "cloud_cover" ? W.src + ", in %" : W.src, "nWx"); if (!R["environment.weather_source"]) D("environment.weather_source", W.srcLong, W.src, "nWx"); }
@@ -729,7 +748,7 @@ function mergeFlight(e, rows) {
     if (x) { r.img = have(r) ? r.val : null; r.imgSrc = r.img != null ? r.src : null; r.cmp = r.img != null ? OSLFlight.agree(r.field, r.val, x.val, im) : null;
       // heights: a difference is only judged when the image says its height is ellipsoidal; otherwise the number is shown, not a verdict
       if (r.cmp && r.field === "alt_ellipsoid_m" && r.note !== "ellipsoid-sensefly") { r.cmpDiff = +r.img - +x.val; r.cmp = "not_comparable"; }
-      r.st = "log"; r.val = typeof x.val === "number" ? String(x.val) : x.val; r.src = x.src; r.note = ""; continue; }
+      r.st = "log"; r.val = typeof x.val === "number" ? String(x.val) : x.val; r.src = x.src; r.note = x.note || ""; continue; }
     if (r.block === "image_log" && im && r.field === "alt_ellipsoid_m" && im.cols._hNote) r.logNote = im.cols._hNote;
     if (m && (!have(r) || LOG_FIRST.test(key))) { r.img = have(r) ? r.val : null; r.imgSrc = r.img != null ? r.src : null; r.cmp = r.img != null && key === "mission.gnss_mode" ? (String(r.img) === String(m.val) ? "same" : "differ") : null; r.st = "log"; r.val = m.val; r.src = m.src; r.note = m.note; if (m.log) r.log = m.log; continue; }
     if (geo[key] != null && !have(r) && !(m && m.note && /^nPlan/.test(m.note))) { r.st = "derived"; r.val = geo[key]; r.src = gsrc; r.note = "nGeo"; }
@@ -893,7 +912,7 @@ function download(name, text, mime) {
 function ilRow(f) {
   const row = {}; for (const x of M.imageLog(f.res)) row[x.column] = x.value;
   const im = flightState().O.images[f.name];
-  if (im) { for (const [c, x] of Object.entries(im.cols)) if (c[0] !== "_") row[c] = String(x.val); row.aux = [row.aux, "timestamp, position, RTK and sigma from " + im.log + " #" + im.n].filter(Boolean).join("; "); row._log = im.log; }
+  if (im) { for (const [c, x] of Object.entries(im.cols)) if (c[0] !== "_") row[c] = String(x.val); row.aux = [row.aux, "timestamp, position, RTK and sigma from " + im.log + " #" + im.n + (im.cols.lat_deg && im.cols.lat_deg.note === "nInterp" ? " (position interpolated from the trajectory, an estimate)" : "")].filter(Boolean).join("; "); row._log = im.log; }
   return row;
 }
 function imageLogCSV(F) { const cols = M.IMAGE_LOG_COLUMNS, lines = [cols.join(",")]; for (const f of F) { const row = ilRow(f); lines.push(cols.map(c => M.csvCell(row[c] == null ? "" : row[c])).join(",")); } return lines.join("\r\n") + "\r\n"; }
@@ -961,6 +980,7 @@ function metaBuild(F) {
   const PR = OSLFlight.procRecord((st.logs || []).filter(l => l.L).map(l => l.L));
   if (PR.length) {
     const SRCS = { p4d: { software: "software/projectVersion", steps: "options: steps switched on and their settings", photogrammetry_settings: "options/initial, cameras/rig", adjustment_quality: "inputs: images (enabled, accuracyXY/Z), gcps; options/ortho/meanResolution", output_crs: "inputs/coordinateSystems/output" },
+      thermotiff: { software: "software (processing_record.json) or dji_api_version (conversion_log.csv)", steps: "the conversion run: parameters, image counts", thermal_settings: "parameters of the conversion (distance, humidity, emissivity, reflection, ambient) and their source", atmospheric_model: "DJI Thermal SDK, the converter ThermoTIFF uses", photogrammetry_settings: "not applicable", adjustment_quality: "not applicable" },
       metashape: { software: "meta Info/LastSavedSoftwareVersion", steps: "meta <Step>/… of the chunk", photogrammetry_settings: "settings accuracy_*, meta AlignCameras, OptimizeCameras", adjustment_quality: "cameras (transform), markers (reference enabled, frame projections), meta OptimizeCameras/sigma0", output_crs: "chunk reference" } };
     out.processing = PR.map((r, i) => { for (const k of Object.keys(r.processing)) fields.push({ path: "processing[" + i + "]." + k, pr: { log: r.log, source: r.log + ": " + (k === "workflow_id" ? "assigned by the reader, one per project" : (SRCS[r.source] || {})[k] || k) } }); return r.processing; });
     const prods = PR.flatMap(r => r.products.map(p => ({ p, log: r.log })));
@@ -1017,14 +1037,14 @@ async function provenanceJSON(F) {
     const im = FS.O.images[f.name];
     for (const x of M.imageLog(f.res)) {
       if (x.column === "aux") continue;
-      const c = cols[x.column] || (cols[x.column] = { image: 0, derived: 0, flight_log: 0, empty: 0, sources: new Set() });
-      if (im && im.cols[x.column]) { c.flight_log++; c.sources.add(im.log); }
+      const c = cols[x.column] || (cols[x.column] = { image: 0, derived: 0, flight_log: 0, flight_log_interpolated: 0, empty: 0, sources: new Set() });
+      if (im && im.cols[x.column]) { c.flight_log++; if (im.cols[x.column].note === "nInterp") c.flight_log_interpolated++; c.sources.add(im.log); }
       else if (x.status === "file") { c.image++; if (x.source) c.sources.add(x.source); }
       else if (x.status === "derived") { c.derived++; if (x.source) c.sources.add(x.source); }
       else c.empty++;
     }
   }
-  const ilCols = Object.fromEntries(Object.entries(cols).map(([k, c]) => [k, Object.assign(Object.fromEntries(["image", "derived", "flight_log", "empty"].filter(n => c[n]).map(n => [n, c[n]])), c.sources.size ? { sources: [...c.sources] } : {})]));
+  const ilCols = Object.fromEntries(Object.entries(cols).map(([k, c]) => [k, Object.assign(Object.fromEntries(["image", "derived", "flight_log", "flight_log_interpolated", "empty"].filter(n => c[n]).map(n => [n, c[n]])), c.sources.size ? { sources: [...c.sources] } : {})]));
   const mj = metadataJSON(F), il = imageLogCSV(F), now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const reads = inputs.map(x => x.read_utc).filter(Boolean).sort();
   const collections = [];
@@ -1038,11 +1058,14 @@ async function provenanceJSON(F) {
       if (!agents.some(a => a.id === id)) agents.push({ id, type: "software", name: sw.name, version: sw.version || "unknown" }); return id; });
     const base = prodIx; prodIx += r.products.length;
     // the loaded images the project lists (by file name); the step used them, not necessarily only them
-    const inProj = new Set(r.images), mine = F.filter(f => inProj.has(f.name.replace(/\.[^.]*$/, "").toLowerCase())), used = mine.length && mine.length === F.length && allImg === "images" ? ["images"] : mine.map(f => imgId.get(f));
+    // ThermoTIFF: the loaded TIFFs are the outputs of the conversion, the R-JPEGs its inputs (same file name, other extension)
+    const outImg = f => r.source === "thermotiff" && /\.tiff?$/i.test(f.name);
+    const inProj = new Set(r.images), mineAll = F.filter(f => inProj.has(f.name.replace(/\.[^.]*$/, "").toLowerCase())), mine = mineAll.filter(f => !outImg(f)), made = mineAll.filter(outImg).map(f => imgId.get(f));
+    const used = mine.length && mine.length === F.length && allImg === "images" ? ["images"] : mine.map(f => imgId.get(f));
     for (const s of r.steps) {
       const gen = r.made.map((o, k) => o === s.order ? "metadata.json#products[" + (base + k) + "]" : null).filter(Boolean);
       const a = { id: "activity:" + r.wf.toLowerCase() + "-" + s.order, type: "processing", order: s.order, name: s.name, agent: swAgents.length === 1 ? swAgents[0] : swAgents, workflow_id: r.wf,
-        used, generated: gen, recorded_in: logId.get(r.log),
+        used, generated: s.order === 1 ? gen.concat(made) : gen, recorded_in: r.logs.length > 1 ? r.logs.map(n => logId.get(n)) : logId.get(r.log),
         parameters: Object.assign({}, s.parameters, s.duration_s != null ? { duration_s: s.duration_s } : {}, s.memory_bytes != null ? { memory_bytes: s.memory_bytes } : {}, s.software_version ? { software_version: s.software_version } : {}) };
       acts.push(a);
     }

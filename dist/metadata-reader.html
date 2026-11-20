@@ -189,6 +189,7 @@ details.grp>summary::before{content:"▸";color:var(--muted);width:1em;flex:none
 details.grp[open]>summary::before{content:"▾"}
 details.grp>summary small{font:400 12px var(--f-body);color:var(--muted)}
 .toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.csvmap{margin:6px 0 12px}.csvmap label{display:inline-flex;gap:4px;align-items:center;font-size:13px}.csvmap select{font:13px var(--f-body);padding:4px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);max-width:12em}
 .toolbar input[type=search]{flex:1 1 200px;min-width:0;font:14px var(--f-body);padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
 .count{font-size:13px;color:var(--muted)}
 /* OSL */
@@ -1211,6 +1212,8 @@ async function parseJPEG(ctx) {
     for (const c of iccChunks) { buf.set(c.data, p); p += c.data.length; }
     parseICC(ctx, buf, iccChunks[0].offset);
   }
+  /* FLIR FFF in APP1 */
+  if (ctx.flirChunks) { try { flirFFF(ctx); } catch (e) { ctx.warn("flir", "FFF: " + ((e && e.message) || e), null); } }
   /* JUMBF / C2PA in APP11 */
   if (ctx.jpJUMBF) { try { await jpegJUMBF(ctx); } catch (e) { ctx.warn("jumbf", "APP11: " + ((e && e.message) || e), null); } }
   /* Extended XMP */
@@ -1276,7 +1279,14 @@ async function jpegSegment(ctx, m, d, dOff, iccChunks, seen) {
       ctx.extXMP.get(guid).parts.push({ off, data: d.subarray(o + 40), offset: dOff + o + 40 });
       return { label: "APP1 ExtendedXMP", kind: "xmp", note: "GUID " + guid.slice(0, 8) + "…, offset " + off };
     }
-    if (s16.startsWith("FLIR\0")) { ctx.info.flir = (ctx.info.flir || 0) + 1; return { label: "APP1 FLIR", kind: "thermal", note: "FLIR FFF radiometric data (not decoded)" }; }
+    if (s16.startsWith("FLIR\0") && d.length >= 8) {
+      ctx.info.flir = (ctx.info.flir || 0) + 1;
+      const k = d[6], tot = d[7] + 1; /* chunk number and count - 1 (ExifTool) */
+      if (!ctx.flirChunks) ctx.flirChunks = { total: tot, parts: [] };
+      if (ctx.flirChunks.total === tot && k < tot && !ctx.flirChunks.parts[k]) ctx.flirChunks.parts[k] = { data: d.subarray(8), offset: dOff + 8 };
+      else ctx.warn("flir", "FLIR chunk " + (k + 1) + " of " + tot + " ignored (duplicate or inconsistent count)", dOff - 4);
+      return { label: "APP1 FLIR", kind: "thermal", note: "FFF chunk " + (k + 1) + "/" + tot };
+    }
     return { label: "APP1 " + s16.slice(0, 12).replace(/[\0-\x1f].*/, ""), note: "not decoded" };
   }
   if (m === 0xe2) {
@@ -1322,11 +1332,11 @@ async function jpegSegment(ctx, m, d, dOff, iccChunks, seen) {
     const n = m - 0xe0;
     seen.app[n] = (seen.app[n] || 0) + 1;
     if (n === 3 && dji) { ctx.info.djiThermal = Object.assign(ctx.info.djiThermal || {}, { app3: ((ctx.info.djiThermal || {}).app3 || 0) + d.length }); return { label: "APP3 ThermalData", kind: "thermal", note: "DJI raw thermal data (not decoded)" }; }
-    if (n === 4 && dji) { ctx.info.djiThermal = Object.assign(ctx.info.djiThermal || {}, { app4: d.length }); return { label: "APP4 ThermalParams", kind: "thermal", note: "DJI thermal parameters (not decoded)" }; }
-    if (n === 5 && dji) { ctx.info.djiThermal = Object.assign(ctx.info.djiThermal || {}, { app5: d.length }); return { label: "APP5 ThermalCalibration", kind: "thermal", note: "DJI (not decoded)" }; }
+    if (n === 4 && dji) { const P = djiThermalParams(ctx, d, dOff); ctx.info.djiThermal = Object.assign(ctx.info.djiThermal || {}, { app4: d.length, params: P }); return { label: "APP4 " + (P.variant || "ThermalParams"), kind: "thermal", note: P.variant ? "DJI measurement parameters" + (P.prefix ? ", prefix \"" + P.prefix + "\"" : "") : "DJI, layout not recognised (not decoded)" }; }
+    if (n === 5 && dji) { ctx.info.djiThermal = Object.assign(ctx.info.djiThermal || {}, { app5: d.length }); return { label: "APP5 ThermalCalibration", kind: "thermal", note: "DJI calibration (not decoded; used by the DJI Thermal SDK)" }; }
     if (n === 6 && s16.startsWith("DJI_DTAT")) return { label: "APP6 DJI_DTAT", kind: "thermal", note: "DJI (not decoded)" };
     if (n === 6 && s16.startsWith("GoPro")) return { label: "APP6 GoPro", note: "GoPro GPMF (not decoded)" };
-    if (n === 7 && s16.startsWith("DJI-DBG")) return { label: "APP7 DJI-DBG", note: "DJI debug info (not decoded)" };
+    if (n === 7 && s16.startsWith("DJI-DBG")) { const k = djiDebugInfo(ctx, d, dOff); return { label: "APP7 DJI-DBG", note: "DJI debug info, " + k + " entries" }; }
     return { label: "APP" + n + " " + s16.slice(0, 8).replace(/[\0-\x1f].*/, ""), note: "not decoded" };
   }
   if (m === 0xeb && d.length >= 8 && d[0] === 0x4a && d[1] === 0x50) { /* JPEG-XT box (ISO/IEC 18477-3): CI "JP", En, Z, then box data */
@@ -1362,6 +1372,104 @@ async function jpegSegment(ctx, m, d, dOff, iccChunks, seen) {
     return { label: mName(m), kind: "header", note: wid + "x" + hgt };
   }
   return { label: mName(m), kind: "header" };
+}
+
+/* ---------------------------------------------------------------- thermal: DJI R-JPEG APP4 / APP7, FLIR FFF in APP1 */
+/* DJI APP4 holds the measurement parameters set in the camera. Three layouts, told apart as ExifTool does (DJI.pm, ExifTool.pm):
+   "ThermalParams" (ZH20T, magic aa551206, int16u values, scale not documented), "ThermalParams2" (M3T and others: floats, after an optional 32-byte prefix,
+   recognised by 2c 01 20 00 at +32), "ThermalParams3" (magic aa553800 after a 32-byte prefix, int16u scaled by 10 or 100). */
+function djiThermalParams(ctx, d, dOff) {
+  const g = "APP4:DJI", dv = DV(d), L = d.length;
+  const f32 = o => o + 4 <= L ? dv.getFloat32(o, true) : null, u16 = o => o + 2 <= L ? dv.getUint16(o, true) : null;
+  const put = (name, o, value, display, type) => { if (value != null) ctx.add(g, { name, id: hex(o, 2), value, display: display == null ? undefined : display, type, offset: dOff + o }); };
+  const at = (o, s) => s.every((x, k) => d[o + k] === x);
+  const P = { variant: null, emissivity: null, distance: null, rh: null, reflected: null, ambient: null, prefix: null };
+  const prefix = b => { if (b !== 32) return; const s = latin1(d, 4, 4); if (/^[a-z]{4}$/.test(s)) { P.prefix = s; ctx.add(g, { name: "ThermalParamsPrefix", id: "0x00", value: s, display: hexstr(d, 4) + ' "' + s + '"', type: "undef", count: 32, offset: dOff, note: "32-byte prefix before the parameters; meaning not documented" }); } };
+  if (L >= 0x4e && at(0, [0xaa, 0x55, 0x12, 0x06])) {
+    P.variant = "ThermalParams";
+    for (const [o, n] of [[0x24, "K1"], [0x28, "K2"], [0x2c, "K3"], [0x30, "K4"], [0x34, "KF"], [0x38, "B1"], [0x3c, "B2"]]) put(n, o, f32(o), null, "float");
+    for (const [o, n] of [[0x44, "ObjectDistance"], [0x46, "RelativeHumidity"], [0x48, "Emissivity"], [0x4a, "Reflection"], [0x4c, "AmbientTemperature"]]) put(n, o, u16(o), null, "int16u");
+    P.raw = true; /* scale of these int16u values is not documented: shown, not used */
+  } else if ((L >= 68 && at(64, [0x2c, 0x01, 0x20, 0x00])) || (L >= 36 && at(32, [0x2c, 0x01, 0x20, 0x00]))) {
+    const b = L >= 68 && at(64, [0x2c, 0x01, 0x20, 0x00]) ? 32 : 0; P.variant = "ThermalParams2"; prefix(b);
+    P.ambient = f32(b); P.distance = f32(b + 4); P.emissivity = f32(b + 8); const rh = f32(b + 12); P.rh = rh != null ? rh * 100 : null; P.reflected = f32(b + 16);
+    put("AmbientTemperature", b, P.ambient, P.ambient != null ? P.ambient.toFixed(1) + " C" : null, "float");
+    put("ObjectDistance", b + 4, P.distance, P.distance != null ? P.distance.toFixed(1) + " m" : null, "float");
+    put("Emissivity", b + 8, P.emissivity, P.emissivity != null ? P.emissivity.toFixed(2) : null, "float");
+    put("RelativeHumidity", b + 12, rh, rh != null ? num(rnd(rh * 100, 4)) + " %" : null, "float");
+    put("ReflectedTemperature", b + 16, P.reflected, P.reflected != null ? P.reflected.toFixed(1) + " C" : null, "float");
+    if (b + 0x65 + 16 <= L) { const s = cstr(d.subarray(b + 0x65, b + 0x65 + 16)); if (s) put("IDString", b + 0x65, s, s, "string"); }
+  } else if (L >= 44 && at(32, [0xaa, 0x55, 0x38, 0x00])) {
+    const b = 32; P.variant = "ThermalParams3"; prefix(b);
+    P.rh = u16(b + 4); P.distance = u16(b + 6) / 10; P.emissivity = u16(b + 8) / 100; P.reflected = u16(b + 10) / 10;
+    put("RelativeHumidity", b + 4, P.rh, P.rh + " %", "int16u"); put("ObjectDistance", b + 6, P.distance, num(P.distance) + " m", "int16u");
+    put("Emissivity", b + 8, P.emissivity, P.emissivity.toFixed(2), "int16u"); put("ReflectedTemperature", b + 10, P.reflected, P.reflected.toFixed(1) + " C", "int16u");
+  }
+  for (const k of ["emissivity", "distance", "rh", "reflected", "ambient"]) if (P[k] != null && !isFinite(P[k])) P[k] = null;
+  return P;
+}
+/* DJI APP7 "DJI-DBG\0" followed by [key:value] pairs (the M3T writes only sensor_id) */
+function djiDebugInfo(ctx, d, dOff) {
+  const s = latin1(d, 8), re = /\[([^:\]]{1,64}):([^\]]*)\]/g, NAMES = { sensor_id: "SensorID" }; let m, n = 0;
+  while ((m = re.exec(s)) && n++ < 64) {
+    const raw = m[2], v = raw.replace(/\0+$/, ""), printable = /^[\x20-\x7e]*$/.test(v);
+    ctx.add("APP7:DJI", { name: NAMES[m[1]] || m[1].replace(/[^A-Za-z0-9]/g, "_"), id: m[1], value: printable ? v : null, display: printable ? v : "(binary, " + raw.length + " bytes)", type: "string", offset: dOff + 8 + m.index + m[1].length + 2 });
+  }
+  return n;
+}
+/* FLIR FFF: the APP1 "FLIR\0" chunks are joined in chunk order, then the FFF header, the record directory and the RawData and CameraInfo records are read
+   (layout as in ExifTool FLIR.pm). Temperatures are not computed; the Planck constants and measurement parameters are the inputs for that. */
+function flirFFF(ctx) {
+  const F = ctx.flirChunks; if (!F || !F.parts.length) return;
+  let have = 0; for (let i = 0; i < F.total; i++) if (F.parts[i]) have++;
+  if (have !== F.total) { ctx.warn("flir", "FLIR chunks " + have + " of " + F.total + ": FFF not read", (F.parts.find(Boolean) || {}).offset); return; }
+  const len = F.parts.reduce((a, p) => a + p.data.length, 0), b = new Uint8Array(len); let p0 = 0;
+  for (const p of F.parts) { p.start = p0; b.set(p.data, p0); p0 += p.data.length; }
+  const fileOff = o => { for (const p of F.parts) if (o >= p.start && o < p.start + p.data.length) return p.offset + (o - p.start); return null; };
+  const g = "APP1:FLIR";
+  if (len < 0x40 || !/^[AF]FF\0/.test(latin1(b, 0, 4))) { ctx.warn("flir", "FLIR data without FFF header", F.parts[0].offset); return; }
+  const dv = DV(b); let le = false;
+  const ver = dv.getUint32(0x14, false); if (!(ver >= 100 && ver < 200)) { le = true; const v2 = dv.getUint32(0x14, true); if (!(v2 >= 100 && v2 < 200)) { ctx.warn("flir", "unsupported FFF version", F.parts[0].offset); return; } }
+  const creator = cstr(b.subarray(4, 20)); if (creator) ctx.add(g, { name: "CreatorSoftware", id: "4", value: creator, type: "string", offset: fileOff(4) });
+  const dirOff = dv.getUint32(0x18, le), nRec = dv.getUint32(0x1c, le);
+  if (nRec > 1024 || dirOff + nRec * 32 > len) { ctx.warn("flir", "FFF record directory out of range", fileOff(0x18)); return; }
+  const out = { creator, records: [] };
+  for (let i = 0; i < nRec; i++) {
+    const e = dirOff + i * 32, type = dv.getUint16(e, le); if (!type) continue;
+    const ro = dv.getUint32(e + 12, le), rl = dv.getUint32(e + 16, le); out.records.push(type);
+    if (ro + rl > len) { ctx.warn("flir", "FFF record " + hex(type, 2) + " out of range", fileOff(e)); continue; }
+    const r = b.subarray(ro, ro + rl), rv = DV(r);
+    if (type === 0x01 && rl >= 32) { /* RawData */
+      const rle = rv.getUint16(0, true) < 0x100, w = rv.getUint16(2, rle), h = rv.getUint16(4, rle), data = r.subarray(32);
+      const kind = latin1(data, 0, 8) === "\x89PNG\r\n\x1a\n" ? "PNG" : data[0] === 0xff && data[1] === 0xd8 ? "JPG" : data.length === w * h * 2 ? (rle ? "TIFF" : "raw big-endian") : "DAT";
+      ctx.add(g, { name: "RawThermalImageWidth", id: "RawData.1", value: w, type: "int16u", offset: fileOff(ro + 2) });
+      ctx.add(g, { name: "RawThermalImageHeight", id: "RawData.2", value: h, type: "int16u", offset: fileOff(ro + 4) });
+      ctx.add(g, { name: "RawThermalImageType", id: "RawData.16", value: kind, display: kind === "TIFF" ? "TIFF (16-bit raw, little-endian; ExifTool adds a TIFF header)" : kind, type: "undef" });
+      ctx.add(g, { name: "RawThermalImage", id: "RawData.16.1", value: null, display: "(binary, " + data.length + " bytes)", type: "undef", count: data.length, offset: fileOff(ro + 32) });
+      out.raw = { w, h, kind, bytes: data.length };
+    } else if (type === 0x20 && rl >= 0x100) { /* CameraInfo */
+      const cle = rv.getUint16(0, true) < 0x100, has = (o, n) => o + n <= rl;
+      const fl = o => has(o, 4) ? rv.getFloat32(o, cle) : null, K = o => { const v = fl(o); return v == null ? null : v - 273.15; };
+      const C = {}, put = (name, o, value, display, type) => { if (value == null || (typeof value === "number" && !isFinite(value))) return; C[name] = value; ctx.add(g, { name, id: "CameraInfo." + hex(o, 3), value, display: display == null ? undefined : display, type, offset: fileOff(ro + o) }); };
+      const kel = (n, o) => { const v = K(o); put(n, o, v, v != null ? v.toFixed(1) + " C" : null, "float"); };
+      put("Emissivity", 0x20, fl(0x20), fl(0x20) != null ? fl(0x20).toFixed(2) : null, "float");
+      put("ObjectDistance", 0x24, fl(0x24), fl(0x24) != null ? fl(0x24).toFixed(2) + " m" : null, "float");
+      kel("ReflectedApparentTemperature", 0x28); kel("AtmosphericTemperature", 0x2c); kel("IRWindowTemperature", 0x30);
+      put("IRWindowTransmission", 0x34, fl(0x34), fl(0x34) != null ? fl(0x34).toFixed(2) : null, "float");
+      { let rh = fl(0x3c); if (rh != null && rh > 2) rh /= 100; put("RelativeHumidity", 0x3c, rh, rh != null ? (rh * 100).toFixed(1) + " %" : null, "float"); }
+      for (const [o, n] of [[0x58, "PlanckR1"], [0x5c, "PlanckB"], [0x60, "PlanckF"]]) put(n, o, fl(o), fl(o) != null ? num(fl(o), 8) : null, "float");
+      for (const [o, n] of [[0x70, "AtmosphericTransAlpha1"], [0x74, "AtmosphericTransAlpha2"], [0x78, "AtmosphericTransBeta1"], [0x7c, "AtmosphericTransBeta2"], [0x80, "AtmosphericTransX"]]) put(n, o, fl(o), fl(o) != null ? fl(o).toFixed(6) : null, "float");
+      kel("CameraTemperatureRangeMax", 0x90); kel("CameraTemperatureRangeMin", 0x94);
+      for (const [o, n, k] of [[0xd4, "CameraModel", 32], [0xf4, "CameraPartNumber", 16], [0x104, "CameraSerialNumber", 16], [0x114, "CameraSoftware", 16], [0x170, "LensModel", 32]]) if (has(o, k)) { const s = cstr(r.subarray(o, o + k)); if (s) put(n, o, s, s, "string"); }
+      if (has(0x1b4, 4) && fl(0x1b4)) put("FieldOfView", 0x1b4, fl(0x1b4), fl(0x1b4).toFixed(1) + " deg", "float");
+      if (has(0x308, 4)) put("PlanckO", 0x308, rv.getInt32(0x308, cle), null, "int32s");
+      if (has(0x30c, 4)) put("PlanckR2", 0x30c, fl(0x30c), num(fl(0x30c), 8), "float");
+      if (has(0x33c, 2)) { put("RawValueMedian", 0x338, rv.getUint16(0x338, cle), null, "int16u"); put("RawValueRange", 0x33c, rv.getUint16(0x33c, cle), null, "int16u"); }
+      if (has(0x464, 2)) put("FrameRate", 0x464, rv.getUint16(0x464, cle), null, "int16u");
+      out.cam = C;
+    }
+  }
+  ctx.info.flirFFF = out;
 }
 
 /* ---------------------------------------------------------------- zlib inflate via DecompressionStream */
@@ -2354,7 +2462,7 @@ function derive(result, opts, pending) {
   if (typeof irl === "string" && irl.trim()) { const sq = sequoiaIrradiance(irl.trim()); if (sq) { S.sunshine = sq; D("SunshineSamples", sq.n, sq.n + " samples, " + num(rnd(sq.span, 2)) + " s; CH0 mean " + num(rnd(sq.ch0, 1)) + ", gain " + sq.gains.join("/") + ", integration " + sq.times.join("/") + " ms", ["XMP:Camera:IrradianceList"], "Parrot Sequoia sunshine sensor, 28-byte records: timestamp us, CH0, CH1, gain index, integration ms, yaw, pitch, roll");
     if (!S.irradiance) S.irradiance = { value: rnd(sq.rel, 6), raw: sq.rel, unit: null, src: "XMP:Camera:IrradianceList", note: "relative: mean CH0 / (gain index x integration time [ms]); not calibrated" }; } }
   const cpic = toNum(V("CalibrationPicture", CAM)); if (cpic === 1) { S.panel = { src: "XMP:Camera:CalibrationPicture" }; D("CalibrationImage", true, "yes (camera flags this image as a calibration picture)", ["XMP:Camera:CalibrationPicture"]); }
-  const stc = toNum(V("SensorTemperature", CAM)); if (isNum(stc) && stc >= 6553) { S.sensorTempInvalid = true; D("SensorTemperatureCheck", "invalid", num(stc) + " = no measurement (0xFFFF / 10)", ["XMP:Camera:SensorTemperature"]); }
+  const stc = toNum(V("SensorTemperature", CAM)); S.sensorTemp = isNum(stc) && stc < 6553 ? stc : null; if (isNum(stc) && stc >= 6553) { S.sensorTempInvalid = true; D("SensorTemperatureCheck", "invalid", num(stc) + " = no measurement (0xFFFF / 10)", ["XMP:Camera:SensorTemperature"]); }
   if (!S.band && /^mapir$/i.test(S.make)) { const fm = /_(RGN|OCN|NGB|NIR|RE|RGB)$/i.exec(S.model); const MB = { RGN: ["Red,Green,NIR", "660/550/850"], OCN: ["Orange,Cyan,NIR", "615/490/808"], NGB: ["NIR,Green,Blue", "850/550/475"], NIR: ["NIR", 850], RE: ["Red edge", 725] };
     if (fm && MB[fm[1].toUpperCase()]) { const b = MB[fm[1].toUpperCase()]; S.band = { name: b[0], src: "EXIF:IFD0:Model (MAPIR filter suffix)", wl: typeof b[1] === "number" ? b[1] : null, fwhm: null, wlSrc: typeof b[1] === "number" ? "MAPIR filter table" : null }; D("Band", b[0], b[0] + " " + b[1] + " nm", ["EXIF:IFD0:Model"], "MAPIR Survey3: band from the filter code in the model name (vendor filter table)"); } }
   const sg = toNum(V("SensorGain", DJI)); const isoMS = toNum(V("ISOSpeed", EX));
@@ -2369,9 +2477,51 @@ function derive(result, opts, pending) {
   /* sensor type */
   const info = result.info || {};
   S.thermal = null;
-  if (info.djiThermal) S.thermal = { kind: "DJI R-JPEG", parts: info.djiThermal };
-  else if (info.flir) S.thermal = { kind: "FLIR radiometric JPEG", parts: { flir: info.flir } };
-  if (S.thermal) D("RadiometricJPEG", S.thermal.kind, S.thermal.kind + " (temperatures not decoded; use the vendor SDK)", ["JPEG APP segments"]);
+  const r6 = x => x == null ? null : rnd(x, 6), r2 = x => x == null ? null : rnd(x, 2); /* float32 Kelvin - 273.15 carries noise below 0.01 K */
+  if (info.djiThermal) {
+    const P = info.djiThermal.params, a3 = info.djiThermal.app3;
+    S.thermal = { kind: "DJI R-JPEG", parts: info.djiThermal, encoding: "radiometric JPEG (DJI R-JPEG): 16-bit raw values in APP3" + (a3 && S.width && S.height && a3 === S.width * S.height * 2 ? " (" + S.width + " x " + S.height + ")" : "") + ", converted to temperature only by the DJI Thermal SDK", encodingSrc: "JPEG APP3 ThermalData, APP4 " + ((P && P.variant) || "ThermalParams") };
+    if (P && P.variant && !P.raw) S.thermal.params = { emissivity: r6(P.emissivity), object_distance_m: r6(P.distance), relative_humidity_pct: P.rh == null ? null : rnd(P.rh, 3), reflected_temperature_c: r2(P.reflected), ambient_temperature_c: r2(P.ambient), src: "APP4:DJI (" + P.variant + ")" };
+    const sid = V("SensorID", /^APP7:DJI$/); if (sid) S.thermal.sensorId = sid;
+  } else if (info.flirFFF && info.flirFFF.cam) {
+    const C = info.flirFFF.cam, R = info.flirFFF.raw;
+    S.thermal = { kind: "FLIR radiometric JPEG", parts: { flir: info.flir }, encoding: "radiometric JPEG (FLIR FFF in APP1): " + (R ? (R.kind === "TIFF" ? "16-bit raw" : R.kind) + " thermal image " + R.w + " x " + R.h : "raw thermal image") + ", converted to temperature with the Planck constants of the record", encodingSrc: "APP1:FLIR RawData, CameraInfo",
+      params: { emissivity: r6(C.Emissivity), object_distance_m: r6(C.ObjectDistance), relative_humidity_pct: C.RelativeHumidity != null ? rnd(C.RelativeHumidity * 100, 3) : null, reflected_temperature_c: r2(C.ReflectedApparentTemperature), atmospheric_temperature_c: r2(C.AtmosphericTemperature), ir_window_temperature_c: r2(C.IRWindowTemperature), ir_window_transmission: r6(C.IRWindowTransmission), src: "APP1:FLIR CameraInfo" } };
+    if (C.PlanckR1 != null && C.PlanckB != null) S.thermal.planck = { R1: +num(C.PlanckR1, 8), B: +num(C.PlanckB, 8), F: +num(C.PlanckF, 8), O: C.PlanckO, R2: +num(C.PlanckR2, 8), src: "APP1:FLIR CameraInfo" };
+    if (C.CameraTemperatureRangeMin != null) S.thermal.range = [rnd(C.CameraTemperatureRangeMin, 2), rnd(C.CameraTemperatureRangeMax, 2)];
+    if (C.PlanckB) D("PeakSpectralSensitivity", rnd(14387.6515 / C.PlanckB, 3), (14387.6515 / C.PlanckB).toFixed(1) + " um", ["APP1:FLIR:PlanckB"], "14387.6515 / PlanckB (ExifTool composite)");
+  } else if (info.flir) S.thermal = { kind: "FLIR radiometric JPEG", parts: { flir: info.flir } };
+  /* temperature TIFF written by ThermoTIFF (J. Rous): Software "ThermoTIFF x", float32 degC, conversion parameters in ImageDescription */
+  const sw0 = String(V("Software", /^EXIF:IFD0$/) || ""), desc0 = String(V("ImageDescription", /^EXIF:IFD0$/) || ""), gdm = String(V("GDALMetadata", /^EXIF:IFD0$/) || "");
+  if (!S.thermal && /^(TIFF|BigTIFF)$/.test(result.file.type) && (/^ThermoTIFF\b/.test(sw0) || / by ThermoTIFF \S+ using DJI Thermal SDK/.test(desc0))) {
+    const m = /Converted from (.+?) by ThermoTIFF (\S+) using DJI Thermal SDK API (\S+?)\.\s/.exec(desc0) || [], pv = k => { const x = new RegExp("(?:^|[;.]\\s*)" + k + "=([-+]?[\\d.]+(?:[eE][-+]?\\d+)?)").exec(desc0); return x ? +x[1] : null; };
+    S.thermal = { kind: "ThermoTIFF", encoding: "TIFF float32, degrees Celsius" + (/UNITTYPE[^>]*>\s*degC/.test(gdm) ? " (GDAL_METADATA UNITTYPE degC)" : "") + ", converted from a DJI R-JPEG by ThermoTIFF" + (m[2] ? " " + m[2] : "") + " with the DJI Thermal SDK" + (m[3] ? " (API " + m[3] + ")" : ""), encodingSrc: "EXIF:IFD0:ImageDescription, Software, GDALMetadata",
+      thermotiff: { version: m[2] || (/^ThermoTIFF\s+(\S+)/.exec(sw0) || [])[1] || null, sdk_api: m[3] || null, source: m[1] || null,
+        params: { emissivity: pv("emissivity"), object_distance_m: pv("distance"), relative_humidity_pct: pv("humidity"), reflected_temperature_c: pv("reflection"), ambient_temperature_c: pv("ambient") } } };
+    S.thermal.params = null; /* the TIFF holds the parameters used in the conversion, not those set at capture */
+    D("TemperatureTIFF", "ThermoTIFF", "degrees Celsius, float32; ThermoTIFF " + (S.thermal.thermotiff.version || "?") + ", DJI Thermal SDK API " + (S.thermal.thermotiff.sdk_api || "?"), ["EXIF:IFD0:Software", "EXIF:IFD0:ImageDescription"]);
+  }
+  if (S.thermal && S.thermal.kind !== "ThermoTIFF") D("RadiometricJPEG", S.thermal.kind, S.thermal.kind + (S.thermal.params ? " (measurement parameters read; temperatures not computed)" : " (temperatures not computed; use the vendor SDK)"), ["JPEG APP segments"]);
+  /* laser rangefinder (DJI XMP): status Normal with distance 0 = no measurement */
+  const lrfS = V("LRFStatus", DJI), lrfD = toNum(V("LRFTargetDistance", DJI));
+  if (lrfS != null || isNum(lrfD)) {
+    S.lrf = { status: lrfS != null ? String(lrfS) : null, distance: isNum(lrfD) ? lrfD : null, lat: n2("LRFTargetLat", DJI), lon: n2("LRFTargetLon", DJI), alt: n2("LRFTargetAlt", DJI), absAlt: n2("LRFTargetAbsAlt", DJI) };
+    S.lrf.measured = /^normal$/i.test(S.lrf.status || "") && S.lrf.distance > 0;
+    D("LaserRangefinder", S.lrf.measured ? rnd(S.lrf.distance, 3) : null, S.lrf.measured ? num(rnd(S.lrf.distance, 3)) + " m" : "not measured (status " + (S.lrf.status || "?") + ", distance " + (S.lrf.distance != null ? num(S.lrf.distance) : "?") + ")", ["XMP:drone-dji:LRFStatus", "XMP:drone-dji:LRFTargetDistance"], "a zero distance or a status other than Normal means no measurement");
+  }
+  /* measurement parameters: limits and agreement with the flight */
+  const TP = S.thermal && (S.thermal.params || (S.thermal.thermotiff && S.thermal.thermotiff.params));
+  if (TP) {
+    const chk = [], e = TP.emissivity, dd = TP.object_distance_m, rh = TP.relative_humidity_pct, dji = /^DJI|ThermoTIFF/.test(S.thermal.kind);
+    if (e != null && !(e > 0 && e <= 1)) chk.push(["emissivity", "outside 0-1"]);
+    else if (e === 1) chk.push(["emissivity", "1.00: blackbody (brightness) temperature, no emissivity correction"]);
+    if (dd != null && dji && (dd < 1 || dd > 25)) chk.push(["object_distance_m", "outside 1-25 m (DJI Thermal SDK; ThermoTIFF does not trust the correction above 25 m)"]);
+    if (rh != null && !(rh >= 0 && rh <= 100)) chk.push(["relative_humidity_pct", "outside 0-100 %"]);
+    const hRef = S.lrf && S.lrf.measured ? S.lrf.distance : S.altRel != null && S.altRel > 0 ? S.altRel : null;
+    if (dd != null && hRef != null && S.thermal.kind !== "ThermoTIFF") { const want = dji ? Math.min(hRef, 25) : hRef; if (Math.abs(dd - want) > Math.max(2, 0.2 * want)) chk.push(["object_distance_m", num(dd) + " m set in the camera; " + (S.lrf && S.lrf.measured ? "laser rangefinder " : "height above take-off ") + num(rnd(hRef, 1)) + " m" + (dji && hRef > 25 ? " (SDK limit 25 m)" : "")]); }
+    S.thermal.checks = chk;
+    D("ThermalParamsCheck", chk.length ? chk.length : 0, chk.length ? chk.map(c => c[0] + ": " + c[1]).join("; ") : "within limits", [TP === S.thermal.params ? S.thermal.params.src : "EXIF:IFD0:ImageDescription"], "emissivity 0-1, DJI distance 1-25 m, humidity 0-100 %, distance compared with the laser rangefinder or the height above take-off");
+  }
   S.sensorType = S.thermal ? "thermal_LWIR" : S.band ? "multispectral" : (S.channels === 3 || result.file.type === "JPEG" || result.file.type === "HEIC") ? "RGB" : null;
   /* JPEG quality */
   if (info.dqt && info.dqt[0]) { const q = jpegQuality(info.dqt[0]); if (q) { S.jpegQuality = q; D("JPEGQualityEstimate", q.quality, String(q.quality) + (q.spread > 0.15 ? " (non-IJG table, rough)" : ""), ["DQT table 0"], "IJG scaling of the T.81 Annex K luminance table: S = mean(100 Q/Qstd); q = (200 - S)/2 for S <= 100, else 5000/S"); } }
@@ -2444,7 +2594,8 @@ function imageLog(result) {
   R("band_wavelength_nm", S.band && S.band.wl != null ? S.band.wl : "", S.band && S.band.wlSrc === "XMP:drone-dji:BandFreq" ? "derived" : "file", S.band ? S.band.wlSrc || "" : "", S.band ? "" : "na");
   if (S.irradiance) R("irradiance_dls", S.irradiance.value, S.irradiance.unit && S.irradiance.raw !== S.irradiance.value ? "derived" : "file", S.irradiance.src, S.irradiance.unit ? "" : "unit-unknown");
   else R("irradiance_dls", "", "missing", "", S.band ? "" : "na");
-  R("fpa_temp_c", "", "missing", "", S.thermal ? (S.sensorTempInvalid ? "invalid" : "sdk") : "na"); R("shutter_flag", "", "missing", "", S.thermal ? "sdk" : "na");
+  if (S.thermal && S.sensorTemp != null) R("fpa_temp_c", S.sensorTemp, "file", "XMP:Camera:SensorTemperature");
+  else R("fpa_temp_c", "", "missing", "", S.thermal ? (S.sensorTempInvalid ? "invalid" : /^DJI|^ThermoTIFF/.test(S.thermal.kind) ? "not-written" : "sdk") : "na"); R("shutter_flag", "", "missing", "", S.thermal ? "sdk" : "na");
   const aux = [[S.make, S.model].filter(Boolean).join(" "), S.software].filter(Boolean).join("; ");
   R("aux", aux, "file", "EXIF:IFD0:Make, Model, Software");
   return out;
@@ -2457,7 +2608,7 @@ function toExiftoolJSON(results, o) {
     const obj = { SourceFile: r.file.name };
     for (const g of r.groups) for (const t of g.tags) {
       if (g.id === "Derived" && !o.derived) continue;
-      const k = (o.g1 ? g.id.replace(/^XMP:/, "XMP-").replace(/^EXIF:/, "").replace(/^MakerNotes:/, "") : g0(g.id)) + ":" + t.name;
+      const k = (o.g1 ? g.id.replace(/^XMP:/, "XMP-").replace(/^EXIF:/, "").replace(/^MakerNotes:/, "").replace(/^APP\d+:/, "") : g0(g.id)) + ":" + t.name;
       if (k in obj) continue;
       let v = o.raw ? t.value : t.display;
       if (t.binary) v = "(Binary data " + t.binary.length + " bytes)";
@@ -2575,6 +2726,8 @@ function sniff(name, h) {
   if (/\.bbz$/.test(low) || (h[0] === 0x50 && h[1] === 0x4b && h[2] === 3 && h[3] === 4 && /^(syslog|version|log_\d+\.txt|IX-[\w-]+\.bb3)$/.test(new TextDecoder().decode(h.subarray(30, 30 + (h[26] | h[27] << 8)))))) return "bbz";
   if (/<pix4dmapper[\s>]/.test(s) || (/\.p4d$/.test(low) && /^\s*(<\?xml[^>]*>\s*)?</.test(s))) return "pix4d-project";
   if (/\.(psx|psz)$/.test(low) || /^\s*(<\?xml[^>]*>\s*)?<(document|chunk|frame) version="\d+\.\d+\.\d+"/.test(s) || (h[0] === 0x50 && h[1] === 0x4b && h[2] === 3 && h[3] === 4 && new TextDecoder().decode(h.subarray(30, 30 + (h[26] | h[27] << 8))) === "doc.xml")) return "metashape";
+  if (/^(\xef\xbb\xbf|\ufeff)?source,output,status,message,width,height,distance,humidity,emissivity,reflection,ambient_temp,/.test(s)) return "thermotiff-log";
+  if (/^\s*\{/.test(s) && /"software"\s*:\s*\{\s*"name"\s*:\s*"ThermoTIFF"/.test(s)) return "thermotiff-record";
   if (/\.bb3$/.test(low) || (h[0] === 0xcd && (h[1] & 0x80))) return "bb3";
   if (/RINEX VERSION \/ TYPE|COMPACT RINEX FORMAT/.test(s.slice(0, 200))) return "rinex";
   if (h[0] === 0xd3 && (h[1] & 0xfc) === 0) return "rtcm3";
@@ -2597,6 +2750,7 @@ function sniff(name, h) {
   if (/^\[\["\d{4}-\d\d-\d\d \d\d:\d\d:\d\d","[^"]*","/.test(s)) return "dji-events";
   if (/^\uFEFF?CUSTOM\.dateTime,OSD\.flyTime,OSD\.latitude,/.test(s)) return "dji-fr-csv";
   if (/\.(csv|txt)$/.test(low) && !/[\x00-\x08]/.test(s.slice(0, 512)) && csvHeader(s)) return "csv-geotags";
+  if (/\.csv$/.test(low) && !/[\x00-\x08]/.test(s.slice(0, 512)) && csvColumns(s)) return "csv-columns";
   if (/^\d{4}-\d\d-\d\d-\d\d-\d\d-\d\d\.\d+ [A-Z]{2,4}: /.test(s)) return "lidar-service";
   if (/(^|\n)[^\n$]{0,40}\$(G[PNLABQ]|BD)(GGA|RMC|GSA|GSV|VTG|ZDA|GLL|GST),/.test(s.slice(0, 2048)) && !/[\x00-\x08\x0e-\x1f]/.test(s.slice(0, 512))) return "nmea";
   if (/(^|\/)(diag|hostlog|sequoia_diag)\.dat$/.test(low) || /_em\.bb3$/.test(low)) return "encrypted";
@@ -2612,16 +2766,18 @@ async function parse(src, name, o) {
   let h = await slice(src, 0, 65536), gz = false;
   // gzip (.gz, as RINEX from IGS/EUREF/CZEPOS is distributed): unpacked in memory, then recognised by its content
   if (h[0] === 0x1f && h[1] === 0x8b && sizeOf(src) <= 200 * 1048576) { try { src = await gunzip(await slice(src, 0, sizeOf(src))); h = src.subarray(0, 65536); gz = true; } catch (e) { /* not readable as gzip */ } }
-  const kind = sniff(gz ? String(name).replace(/\.gz$/i, "") : name, h), size = sizeOf(src);
+  let kind = sniff(gz ? String(name).replace(/\.gz$/i, "") : name, h); const size = sizeOf(src);
+  if (kind === "csv-columns" && o.csvMap) kind = "csv-geotags";   // columns assigned by the user
   const P = PARSERS[kind];
   if (!P) return null;
   const L = newLog(kind, name, size); if (gz) L.notes.push("gzip");
   try { await P(src, L, h, o); } catch (e) { L.notes.push("parse-error"); L.error = String(e && e.message || e); }
   sanity(L, o.now);
+  atExposure(L);
   L.trajectory = thin(L.trajectory);
   L.verify = verify(L);
   if (L.verify.state === "new") L.notes.push("unverified");
-  if (!L.error && !L.encrypted && !L.listOnly && L.size && L.startMs == null && !L.exposures.length && !L.trajectory.length && !L.raw && !L.panels && !L.notes.some(n => /encrypted|undocumented|empty|no-positions|plan|processing|project-pointer/.test(n)) && !L.facts.some(f => /^(fBase|fFiles|fMessages|fPackets|fTopics|fParams|fPlacemarks|fPoints)/.test(f[0]) && f[1])) L.notes.push("nothing-read");
+  if (!L.error && !L.encrypted && !L.listOnly && L.size && L.startMs == null && !L.exposures.length && !L.trajectory.length && !L.raw && !L.panels && !L.notes.some(n => /encrypted|undocumented|empty|no-positions|plan|processing|project-pointer|unmapped/.test(n)) && !L.facts.some(f => /^(fBase|fFiles|fMessages|fPackets|fTopics|fParams|fPlacemarks|fPoints)/.test(f[0]) && f[1])) L.notes.push("nothing-read");
   return L;
 }
 
@@ -2653,6 +2809,50 @@ function sanity(L, now) {
   if (bad.noFix) fact(L, "fNoFix", bad.noFix);
   const real = Object.entries(bad).filter(x => x[0] !== "noFix");
   if (real.length) { L.notes.push("implausible"); fact(L, "fImplausible", real.map(([k, v]) => k + ": " + v).join(", ")); }
+}
+
+/* ---------------------------------------------------------------- flight state at each exposure
+   Parsers that know it leave L._aux = { gq: GNSS quality [{t, sv, hdop | eph, fix}], vib: [{t, imu, v (largest axis, m/s²), clip (cumulative)}],
+   modes: mode changes [{t, name, auto}], ev: messages of severity warning or worse [{t, lvl (0–7, RFC 5424), msg}] }, all in UTC ms.
+   Each timed exposure gets the GNSS record nearest in time (within 2 s), the largest vibration within ±0.5 s and the mode in force.
+   An exposure with a time but no position gets one interpolated linearly between the two trajectory points around it
+   when they are at most 2 s apart; it is marked interp and stays an estimate. e._tc is the exposure time on the clock of the
+   trajectory and of _aux (tlog: receive time; ULog: boot time), used when the exposure's own time comes from another clock. */
+const AT_GAP = 2000, AT_VIB = 500;
+function atExposure(L) {
+  const A = L._aux || {}; delete L._aux;
+  const ex = L.listOnly ? [] : L.exposures.filter(e => (e._tc != null ? e._tc : e.t) != null), tc = e => e._tc != null ? e._tc : e.t;
+  const byT = a => (a || []).filter(x => x.t != null && isFinite(x.t)).sort((x, y) => x.t - y.t);
+  const after = (a, t) => { let lo = 0, hi = a.length; while (lo < hi) { const m = (lo + hi) >> 1; if (a[m].t <= t) lo = m + 1; else hi = m; } return lo; };   // first index with a[i].t > t
+  // 4 positions interpolated to the exposure time
+  const tr = byT(L.trajectory.filter(p => p.lat != null)); let interp = 0;
+  if (tr.length > 1) for (const e of ex) { if (e.lat != null) continue; const t = tc(e), i = after(tr, t), a = tr[i - 1]; let b = tr[i];
+    if (a && a.t === t) b = a; if (!a || !b || b.t - a.t > AT_GAP) continue;
+    const f = b === a ? 0 : (t - a.t) / (b.t - a.t);
+    e.lat = a.lat + f * (b.lat - a.lat); e.lon = a.lon + f * (b.lon - a.lon); if (e.h == null && a.h != null && b.h != null) e.h = a.h + f * (b.h - a.h); e.interp = true; interp++; }
+  const gq = byT(A.gq), vib = byT(A.vib), modes = byT(A.modes), evs = byT(A.ev);
+  if (!ex.length || !(gq.length || vib.length || modes.length || evs.length || interp)) { for (const e of L.exposures) delete e._tc; return; }
+  for (const e of ex) { const t = tc(e);
+    if (gq.length) { const g = nearest(gq, t); if (Math.abs(g.t - t) <= AT_GAP) { e.sv = g.sv; if (g.hdop != null) e.hdop = +(+g.hdop).toFixed(2); if (g.eph != null) e.eph = +(+g.eph).toFixed(2); e.fix = g.fix; } }
+    if (vib.length) { let v = null; for (let i = Math.max(0, after(vib, t - AT_VIB - 1)); i < vib.length && vib[i].t <= t + AT_VIB; i++) if (vib[i].t >= t - AT_VIB && isFinite(vib[i].v)) v = Math.max(v == null ? 0 : v, vib[i].v); if (v != null) e.vib = +v.toFixed(1); }
+    if (modes.length) { const i = after(modes, t); if (i > 0) { e.mode = modes[i - 1].name; e.auto = modes[i - 1].auto; } } }
+  // summary for the check: imaging window = first to last exposure
+  const ts = ex.map(tc), t0 = Math.min(...ts), t1 = Math.max(...ts), S = { n: ex.length, interp };
+  const G = ex.filter(e => e.fix != null || e.sv != null);
+  if (G.length) S.gnss = { n: G.length, svMed: median(G.map(e => e.sv)), svMin: G.some(e => e.sv != null) ? Math.min(...G.filter(e => e.sv != null).map(e => e.sv)) : null,
+    hdopMax: G.some(e => e.hdop != null) ? Math.max(...G.filter(e => e.hdop != null).map(e => e.hdop)) : null, ephMax: G.some(e => e.eph != null) ? Math.max(...G.filter(e => e.eph != null).map(e => e.eph)) : null,
+    low: G.filter(e => e.fix != null && e.fix < 3).length, none: ex.length - G.length };
+  const V = ex.filter(e => e.vib != null);
+  if (V.length) { const clip = {}; for (const v of vib) if (v.t >= t0 - AT_VIB && v.t <= t1 + AT_VIB && isFinite(v.clip)) { const c = clip[v.imu] || (clip[v.imu] = [v.clip, v.clip]); c[0] = Math.min(c[0], v.clip); c[1] = Math.max(c[1], v.clip); }
+    S.vib = { n: V.length, max: Math.max(...V.map(e => e.vib)), over30: V.filter(e => e.vib > 30).length, over60: V.filter(e => e.vib > 60).length, clip: Object.values(clip).reduce((s, c) => s + c[1] - c[0], 0) }; }
+  const M = ex.filter(e => e.mode != null);
+  if (M.length) S.modes = { n: M.length, names: [...new Set(M.map(e => e.mode))], out: M.filter(e => e.auto === false).length, outNames: [...new Set(M.filter(e => e.auto === false).map(e => e.mode))], unknown: M.every(e => e.auto == null) };
+  const W = evs.filter(x => x.t >= t0 && x.t <= t1);
+  // repeated messages (a real tlog repeats "Arming Checks Disabled" every few seconds) are listed once with their count
+  if (W.length) { const by = new Map(); for (const x of W) by.set(x.msg, (by.get(x.msg) || 0) + 1);
+    S.ev = { n: W.length, err: W.filter(x => x.lvl <= 3).length, kinds: by.size, first: [...by].slice(0, 3).map(([m, k]) => k > 1 ? m + " ×" + k : m) }; }
+  L.atExp = S;
+  for (const e of L.exposures) delete e._tc;
 }
 
 /* ---------------------------------------------------------------- versions checked against real files
@@ -2688,6 +2888,7 @@ const VERIFIED = [
   { kind: "nmea", re: /(?!)/, ver: "", src: "synthetic", standard: true },
   { kind: "gpx", re: /(?!)/, ver: "", src: "synthetic", standard: true },
   { kind: "csv-geotags", re: /(?!)/, ver: "", src: "synthetic", standard: true },
+  { kind: "csv-columns", re: /(?!)/, ver: "", src: "synthetic", standard: true },
   { kind: "dji-fr-csv", re: /IOS 4\.(9[5-9]|10[0-7])\./, ver: "iOS app 4.95–4.107 (FlightRecord v14, decoded with dji-log-parser 0.5.7)", src: "internal + synthetic" },
   { kind: "dji-fr-csv", re: /DJIFly (10\.1\.8|46\.0\.0)$/, ver: "Mavic 3 Enterprise series, app platform 6 (10.1.8, 46.0.0; 2026): summary and track, exposures not in the CSV", src: "internal" },
   { kind: "emotion-transcript", re: /./, ver: "eMotion 2 console transcript (eBee Classic, 2017)", src: "internal" },
@@ -2702,6 +2903,9 @@ const VERIFIED = [
   { kind: "efl", re: /./, ver: "–", src: "internal" },
   { kind: "pix4d-project", re: /^Pix4Dmapper 4\.4\./, ver: "Pix4Dmapper 4.4.12 (.p4d file version 21)", src: "internal" },
   { kind: "metashape", re: /^Metashape 2\.1\./, ver: "Metashape 2.1.2 (chunk format 1.7.0)", src: "internal" },
+  // ThermoTIFF 0.1.0: read from its source code (conversion_log.csv, processing_record.json); checked on synthetic files only
+  { kind: "thermotiff-log", re: /(?!)/, ver: "", src: "source code + synthetic" },
+  { kind: "thermotiff-record", re: /(?!)/, ver: "", src: "source code + synthetic" },
   { kind: "dji-fr", re: /^v(8)\b/, ver: "FlightRecord v8 (iOS apps 4.3.64 and 4.9.1; 2019, 2026)", src: "internal" },
   { kind: "dji-fr", re: /^v(14)\b/, ver: "FlightRecord v14, summary only (iOS apps 4.95 and 4.103, 2022; app on platform 6, 2026)", src: "internal" }
 ];
@@ -2720,8 +2924,10 @@ function versionKey(L) {
     case "novatel": return "NovAtel";
     case "ardupilot-bin": case "ardupilot-log": case "tlog": return d.fw || fm;
     case "nmea": case "gpx": case "csv-geotags": return fm;
+    case "csv-columns": return "";   // nothing read yet: the version check follows the columns assigned by hand
     case "emotion-transcript": return fm;
     case "ebeex-afpu": case "pix4dcapture-log": case "pix4dcapture-mission": case "bbx": return d.fw || "";
+    case "thermotiff-log": case "thermotiff-record": return L.proc && L.proc.software[0].version ? "ThermoTIFF " + L.proc.software[0].version : "ThermoTIFF";
     case "pix4d-project": case "metashape": return L.proc && L.proc.software[0] && L.proc.software[0].version ? (L.kind === "metashape" ? "Metashape " : "Pix4Dmapper ") + L.proc.software[0].version : "";
     case "dji-fr": return "v" + (fm.match(/v(\d+)/) || [, ""])[1];
     case "dji-fr-csv": return [L.device.model, factOf(L, "fSoftware")].filter(Boolean).join(" ");
@@ -2879,7 +3085,7 @@ async function pULog(src, L, h) {
     }
     out._size = off; return (lay[name] = out);
   }
-  const gps = [], att = [];
+  const gps = [], att = [], navs = [];
   while (p + 3 <= b.length) {
     const ty = String.fromCharCode(b[p + pre + 2]);
     if (!decided && p > 16) { if (T.includes(String.fromCharCode(b[p + 2]))) pre = 0; else if (T.includes(String.fromCharCode(b[p + 4]))) pre = 2; decided = true; continue; }
@@ -2902,6 +3108,7 @@ async function pULog(src, L, h) {
         const alt = Lf.altitude_ellipsoid_m ? g("altitude_ellipsoid_m") : g("alt_ellipsoid", 1e-3);
         gps.push({ topic: s.name, ts, utc: g("time_utc_usec"), lat, lon, h: alt, fix: g("fix_type"), eph: g("eph"), epv: g("epv"), sv: g("satellites_used") });
       }
+      if (s && s.name === "vehicle_status" && !s.multi) { const Lf = layout(s.name); if (Lf.nav_state) { const v = rd(dvOf(m.subarray(2)), Lf.nav_state.t, Lf.nav_state.o); if (!navs.length || navs[navs.length - 1].v !== v) navs.push({ ts, v }); } }
       if (s && s.name === "camera_capture") { const Lf = layout(s.name), body = dvOf(m.subarray(2)), g = (k, sc) => Lf[k] ? rd(body, Lf[k].t, Lf[k].o) * (sc || 1) : null; att.push({ ts, utc: g("timestamp_utc"), seq: g("seq"), lat: g("lat"), lon: g("lon"), h: g("alt"), ok: g("result") }); }
     } else if (ty === "L") { logs.push({ ts: rd(md, "uint64_t", 1), lvl: m[0], msg: asc(m, 9, sz - 9) }); }
     else if (ty === "C") { logs.push({ ts: rd(md, "uint64_t", 3), lvl: m[0], msg: asc(m, 11, sz - 11) }); }
@@ -2914,7 +3121,10 @@ async function pULog(src, L, h) {
   const sync = use.filter(g => g.utc > 1e15).map(g => g.utc / 1000 - g.ts / 1000), off = median(sync);
   const toUtc = ts => off == null ? null : ts / 1000 + off;
   L.trajectory = use.filter(g => g.fix >= 2 && g.lat).map(g => ({ t: toUtc(g.ts), lat: g.lat, lon: g.lon, h: g.h, q: fixName(g.fix) }));
-  L.exposures = att.map((c, k) => ({ n: c.seq != null ? c.seq : k, t: c.utc > 1e15 ? c.utc / 1000 : toUtc(c.ts), lat: c.lat, lon: c.lon, h: c.h, q: "log" }));
+  L.exposures = att.map((c, k) => ({ n: c.seq != null ? c.seq : k, t: c.utc > 1e15 ? c.utc / 1000 : toUtc(c.ts), _tc: toUtc(c.ts), lat: c.lat, lon: c.lon, h: c.h, q: "log" }));
+  // state at the exposures (atExposure): GNSS quality, navigation state, logged messages of level warning or worse (levels are ASCII digits 0–7)
+  L._aux = { gq: use.map(g => ({ t: toUtc(g.ts), sv: g.sv, eph: g.eph, fix: g.fix })), modes: navs.map(x => ({ t: toUtc(x.ts), name: PX4_NAV[x.v] || "nav_state " + x.v, auto: x.v === 3 })),
+    ev: logs.map(x => ({ t: toUtc(x.ts), lvl: x.lvl >= 48 ? x.lvl - 48 : x.lvl, msg: x.msg })).filter(x => x.lvl <= 4) };
   if (tmin != null && off != null) { L.startMs = toUtc(tmin); L.endMs = toUtc(tmax); L.timeSource = "boot time + GPS time_utc_usec"; }
   const sysName = info.sys_name || info.vehicle_name || ""; L.device.make = /wingtra/i.test(sysName + JSON.stringify(info)) ? "Wingtra" : "PX4";
   L.device.model = info.vehicle_name || info.sys_name || null; L.device.fw = info.ver_sw_release_wingtra != null ? relVer(info.ver_sw_release_wingtra) : info.ver_sw_release ? relVer(info.ver_sw_release) : info.ver_sw || null;
@@ -2933,6 +3143,8 @@ async function pULog(src, L, h) {
   if (badMsg) { fact(L, "fBadMessages", badMsg); L.notes.push("corrupt-messages"); }
   L.gnss = { fix: countBy(use, g => fixName(g.fix)) };
 }
+// vehicle_status.nav_state (PX4 msg/VehicleStatus.msg); only AUTO_MISSION counts as the automatic mission
+const PX4_NAV = { 0: "MANUAL", 1: "ALTCTL", 2: "POSCTL", 3: "AUTO_MISSION", 4: "AUTO_LOITER", 5: "AUTO_RTL", 6: "POSITION_SLOW", 10: "ACRO", 12: "DESCEND", 13: "TERMINATION", 14: "OFFBOARD", 15: "STAB", 17: "AUTO_TAKEOFF", 18: "AUTO_LAND", 19: "AUTO_FOLLOW_TARGET", 20: "AUTO_PRECLAND", 21: "ORBIT", 22: "AUTO_VTOL_TAKEOFF" };
 const fixName = f => ({ 0: "none", 1: "none", 2: "2D", 3: "single", 4: "dgnss", 5: "float", 6: "fixed", 8: "fixed" }[f] || "fix " + f);
 const relVer = v => typeof v === "number" ? [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255].join(".") : v;
 
@@ -3337,10 +3549,19 @@ async function pEncrypted(src, L, h) {
    between versions (GMS/GWk since 3.x, TimeMS/Week before), so fields are looked up by name, not by position. */
 const DF_T = { b: [1, "getInt8"], B: [1, "getUint8"], M: [1, "getUint8"], h: [2, "getInt16"], H: [2, "getUint16"], i: [4, "getInt32"], I: [4, "getUint32"], f: [4, "getFloat32"], d: [8, "getFloat64"],
   c: [2, "getInt16", 0.01], C: [2, "getUint16", 0.01], e: [4, "getInt32", 0.01], E: [4, "getUint32", 0.01], L: [4, "getInt32", 1e-7], q: [8, "i64"], Q: [8, "u64"], n: [4, "s"], N: [16, "s"], Z: [64, "s"], a: [64, "x"] };
-const AP_WANT = /^(GPS|GPS2|GPA|CAM|TRIG|MSG|VER|PARM)$/;
+const AP_WANT = /^(GPS|GPS2|GPA|CAM|TRIG|MSG|VER|PARM|VIBE|MODE|ERR)$/;
+// flight modes by vehicle (ArduCopter/ArduPlane/Rover mode.h); AUTO is the mission mode. ERR subsystems: AP_Logger.h LogErrorSubsystem
+const AP_MODES = {
+  copter: { 0: "STABILIZE", 1: "ACRO", 2: "ALT_HOLD", 3: "AUTO", 4: "GUIDED", 5: "LOITER", 6: "RTL", 7: "CIRCLE", 9: "LAND", 11: "DRIFT", 13: "SPORT", 14: "FLIP", 15: "AUTOTUNE", 16: "POSHOLD", 17: "BRAKE", 18: "THROW", 19: "AVOID_ADSB", 20: "GUIDED_NOGPS", 21: "SMART_RTL", 22: "FLOWHOLD", 23: "FOLLOW", 24: "ZIGZAG", 25: "SYSTEMID", 26: "AUTOROTATE", 27: "AUTO_RTL", 28: "TURTLE" },
+  plane: { 0: "MANUAL", 1: "CIRCLE", 2: "STABILIZE", 3: "TRAINING", 4: "ACRO", 5: "FBWA", 6: "FBWB", 7: "CRUISE", 8: "AUTOTUNE", 10: "AUTO", 11: "RTL", 12: "LOITER", 13: "TAKEOFF", 14: "AVOID_ADSB", 15: "GUIDED", 16: "INITIALISING", 17: "QSTABILIZE", 18: "QHOVER", 19: "QLOITER", 20: "QLAND", 21: "QRTL", 22: "QAUTOTUNE", 23: "QACRO", 24: "THERMAL", 25: "LOITER_ALT_QLAND", 26: "AUTOLAND", 27: "GLIDE" },
+  rover: { 0: "MANUAL", 1: "ACRO", 3: "STEERING", 4: "HOLD", 5: "LOITER", 6: "FOLLOW", 7: "SIMPLE", 8: "DOCK", 9: "CIRCLE", 10: "AUTO", 11: "RTL", 12: "SMART_RTL", 15: "GUIDED", 16: "INITIALISING" } };
+const AP_AUTO = { copter: 3, plane: 10, rover: 10 };
+const AP_ERR = { 1: "main", 2: "radio", 3: "compass", 5: "radio failsafe", 6: "battery failsafe", 7: "GPS failsafe", 8: "GCS failsafe", 9: "fence failsafe", 10: "flight mode", 11: "GPS", 12: "crash check", 15: "parachute", 16: "EKF check", 17: "EKF failsafe", 18: "baro", 19: "CPU", 20: "ADS-B failsafe", 21: "terrain", 22: "navigation", 23: "terrain failsafe", 24: "EKF primary", 25: "thrust loss", 26: "sensors failsafe", 27: "leak failsafe", 28: "pilot input", 29: "vibration failsafe", 30: "internal error", 31: "dead reckoning failsafe" };
+const apFamily = v => /Copter|Heli/i.test(v || "") ? "copter" : /Plane/i.test(v || "") ? "plane" : /Rover|Boat/i.test(v || "") ? "rover" : null;
+const apMode = (fam, num, name) => ({ name: name || (fam && AP_MODES[fam][num]) || "mode " + num, auto: fam ? num === AP_AUTO[fam] : null });
 const AP_Q = { 0: "none", 1: "none", 2: "2D", 3: "single", 4: "dgnss", 5: "float", 6: "fixed" };
 function apState() {
-  const S = { gps: [], cam: [], trig: [], fw: null, vehicle: null, parm: 0, types: {}, hacc: null, status: null, sync: [], noWeek: 0 };
+  const S = { gps: [], cam: [], trig: [], fw: null, vehicle: null, parm: 0, types: {}, hacc: null, status: null, sync: [], noWeek: 0, gq: [], vib: [], modes: [], ev: [] };
   S.rec = (name, r) => {
     S.types[name] = (S.types[name] || 0) + 1;
     const us = r.TimeUS != null ? r.TimeUS : r.TimeMS != null && r.Week == null ? r.TimeMS * 1000 : null;
@@ -3349,12 +3570,17 @@ function apState() {
       S.status = st; let lat = r.Lat, lon = r.Lng; if (lat != null && Math.abs(lat) > 180) { lat *= 1e-7; lon *= 1e-7; }
       const t = wk > 0 && tow != null ? gpsToUtc(wk, tow) : null; if (t != null && us != null) S.sync.push(t - us / 1000); if (st >= 3 && !(wk > 0)) S.noWeek++;
       if (st >= 2 && lat) S.gps.push({ us, t, lat, lon, h: r.Alt, q: AP_Q[st] || "fix " + st, sH: S.hacc });
+      S.gq.push({ us, t, sv: r.NSats != null ? r.NSats : r.NSat, hdop: r.HDop, fix: st });
     } else if (name === "GPA" && (r.I == null || r.I === 0)) S.hacc = r.HAcc != null ? r.HAcc : null;
     else if (name === "CAM" || name === "TRIG") {
       let lat = r.Lat, lon = r.Lng; if (lat != null && Math.abs(lat) > 180) { lat *= 1e-7; lon *= 1e-7; }
       const t = r.GPSWeek > 0 && r.GPSTime != null ? gpsToUtc(r.GPSWeek, r.GPSTime) : null;
       (name === "CAM" ? S.cam : S.trig).push({ n: r.Img != null ? r.Img : (name === "CAM" ? S.cam : S.trig).length + 1, us, t, lat, lon, h: r.GPSAlt != null ? r.GPSAlt : r.Alt, hRel: r.RelAlt, q: AP_Q[S.status] || null, sH: S.hacc, roll: r.R != null ? r.R : r.Roll, pitch: r.P != null ? r.P : r.Pitch, yaw: r.Y != null ? r.Y : r.Yaw });
-    } else if (name === "MSG" && !S.fw) { const m = /^(Ardu\w+|Blimp|AP_Periph|PX4)\s+V?(\d+\.\d+(?:\.\d+)?\S*)/.exec(String(r.Message || "").trim()); if (m) { S.vehicle = m[1]; S.fw = m[1] + " " + m[2]; } }
+    } else if (name === "MSG") { const msg = String(r.Message || "").trim(), m = !S.fw && /^(Ardu\w+|Blimp|AP_Periph|PX4)\s+V?(\d+\.\d+(?:\.\d+)?\S*)/.exec(msg); if (m) { S.vehicle = m[1]; S.fw = m[1] + " " + m[2]; }
+      if (/failsafe|crash|glitch|error|lost/i.test(msg)) S.ev.push({ us, lvl: 4, msg }); }
+    else if (name === "VIBE") S.vib.push({ us, imu: r.IMU || 0, v: Math.max(r.VibeX, r.VibeY, r.VibeZ), clip: r.Clip != null ? r.Clip : (r.Clip0 || 0) + (r.Clip1 || 0) + (r.Clip2 || 0) });
+    else if (name === "MODE") S.modes.push({ us, num: r.ModeNum != null ? +r.ModeNum : +r.Mode, name: typeof r.Mode === "string" && !isFinite(+r.Mode) ? r.Mode : null });
+    else if (name === "ERR" && r.ECode) S.ev.push({ us, lvl: 3, msg: "ERR " + (AP_ERR[r.Subsys] || "subsystem " + r.Subsys) + ", code " + r.ECode });
     else if (name === "VER" && !S.fw && r.FWS) { const m = /^(Ardu\w+|Blimp)\s+V?(\S+)/.exec(String(r.FWS).trim()); if (m) { S.vehicle = m[1]; S.fw = m[1] + " " + m[2]; } }
     else if (name === "PARM") S.parm++;
   };
@@ -3367,6 +3593,9 @@ function apResult(S, L, fmtName) {
   L.exposures = ex.map(e => ({ n: e.n, t: e.t != null ? e.t : toUtc(e.us), lat: e.lat || null, lon: e.lon || null, h: e.h, sH: e.sH, q: e.q || "log", roll: e.roll, pitch: e.pitch, yaw: e.yaw }));
   for (const p of L.trajectory) span(L, p.t); for (const e of L.exposures) span(L, e.t);
   L.timeSource = off != null ? "GPS week + ms of week (GWk/GMS) − leap seconds; other messages via boot time" : null;
+  const fam = apFamily(S.vehicle);
+  L._aux = { gq: S.gq.map(g => ({ t: g.t != null ? g.t : toUtc(g.us), sv: g.sv, hdop: g.hdop, fix: g.fix })), vib: S.vib.map(v => ({ t: toUtc(v.us), imu: v.imu, v: v.v, clip: v.clip })),
+    modes: S.modes.map(m => Object.assign({ t: toUtc(m.us) }, apMode(fam, m.num, m.name))), ev: S.ev.map(e => ({ t: toUtc(e.us), lvl: e.lvl, msg: e.msg })) };
   L.device.make = "ArduPilot"; L.device.model = S.vehicle; L.device.fw = S.fw;
   fact(L, "fFormat", fmtName); fact(L, "fFirmware", S.fw);
   fact(L, "fExposures", ex.length ? ex.length + (S.cam.length ? " (CAM)" : " (TRIG)") : null);
@@ -3413,11 +3642,16 @@ async function pAPText(src, L, h, o) {
 }
 
 /* ---------------------------------------------------------------- MAVLink telemetry log (.tlog): <u64 BE Unix µs><MAVLink 1 or 2 packet> ...
-   Read: GPS_RAW_INT (24), CAMERA_FEEDBACK (180), CAMERA_TRIGGER (112), HEARTBEAT (0), AUTOPILOT_VERSION (148), STATUSTEXT (253).
+   Read: GPS_RAW_INT (24), CAMERA_FEEDBACK (180), CAMERA_TRIGGER (112), HEARTBEAT (0, autopilot and flight mode), AUTOPILOT_VERSION (148),
+   STATUSTEXT (253, firmware and messages of severity warning or worse), VIBRATION (241).
    Packets are not CRC-checked (that needs the per-message CRC_EXTRA table); the timestamp and header are checked instead. */
+// PX4 custom_mode in HEARTBEAT: main mode in bits 16–23, sub mode in bits 24–31 (px4_custom_mode.h); AUTO (4) + MISSION (4) is the mission
+const PX4_MAIN = { 1: "MANUAL", 2: "ALTCTL", 3: "POSCTL", 4: "AUTO", 5: "ACRO", 6: "OFFBOARD", 7: "STABILIZED", 8: "RATTITUDE" }, PX4_SUB = { 1: "READY", 2: "TAKEOFF", 3: "LOITER", 4: "MISSION", 5: "RTL", 6: "LAND", 8: "FOLLOW_TARGET", 9: "PRECLAND" };
+// MAV_TYPE of an ArduPilot heartbeat → vehicle (for the mode names)
+const mavFamily = ty => ty === 1 || (ty >= 19 && ty <= 25) ? "plane" : ty === 10 || ty === 11 ? "rover" : [2, 3, 4, 13, 14, 15].includes(ty) ? "copter" : null;
 const MAV_AP = { 3: "ArduPilot", 12: "PX4" }, MAV_FIX = { 0: "none", 1: "none", 2: "2D", 3: "single", 4: "dgnss", 5: "float", 6: "fixed", 7: "static", 8: "ppp" };
 async function pTlog(src, L, h, o) {
-  const gps = [], cam = [], trig = [], cnt = {}; let ap = null, fw = null, text = null;
+  const gps = [], cam = [], trig = [], cnt = {}, gq = [], vib = [], modes = [], ev = []; let ap = null, fw = null, text = null, lastMode = null;
   const okTs = (b, j) => { const hi = (b[j] << 24 | b[j + 1] << 16 | b[j + 2] << 8 | b[j + 3]) >>> 0; const us = hi * 4294967296 + ((b[j + 4] << 24 | b[j + 5] << 16 | b[j + 6] << 8 | b[j + 7]) >>> 0); return us > 3.2e14 && us < 4.1e15 ? us : 0; };
   await scan(src, (b, fin) => {
     let j = 0;
@@ -3426,28 +3660,34 @@ async function pTlog(src, L, h, o) {
       const len = b[j + 9], v2 = m === 0xfd, hl = v2 ? 10 : 6, sig = v2 && (b[j + 10] & 1) ? 13 : 0, tot = 8 + hl + len + 2 + sig;
       if (j + tot > b.length) return fin ? b.length : j;
       const sys = v2 ? b[j + 13] : b[j + 11], id = v2 ? b[j + 15] | b[j + 16] << 8 | b[j + 17] << 16 : b[j + 13];
-      const raw = b.subarray(j + 8 + hl, j + 8 + hl + len), need = { 0: 9, 24: 50, 180: 47, 112: 12, 148: 60, 253: 51 }[id];
+      const raw = b.subarray(j + 8 + hl, j + 8 + hl + len), need = { 0: 9, 24: 50, 180: 47, 112: 12, 148: 60, 241: 32, 253: 51 }[id];
       if (sys !== 255 && need) { const p = new Uint8Array(Math.max(need, raw.length)); p.set(raw); const dv = dvOf(p), t = us / 1000;
-        if (id === 0) { if (ap == null && MAV_AP[p[5]]) ap = MAV_AP[p[5]]; }
-        else if (id === 24) { const ft = p[28], lat = dv.getInt32(8, true) * 1e-7, lon = dv.getInt32(12, true) * 1e-7, he = dv.getInt32(30, true), hacc = dv.getUint32(34, true);
+        if (id === 0) { if (ap == null && MAV_AP[p[5]]) ap = MAV_AP[p[5]];
+          if (MAV_AP[p[5]]) { const cm = dv.getUint32(0, true), key = p[5] + ":" + p[4] + ":" + cm; if (key !== lastMode) { lastMode = key;
+            if (p[5] === 12) { const mm = (cm >>> 16) & 255, sm = cm >>> 24; modes.push({ t, name: mm === 4 ? "AUTO_" + (PX4_SUB[sm] || sm) : PX4_MAIN[mm] || "mode " + mm, auto: mm === 4 && sm === 4 }); }
+            else modes.push(Object.assign({ t }, apMode(mavFamily(p[4]), cm))); } } }
+        else if (id === 24) { const ft = p[28], eph = dv.getUint16(20, true); gq.push({ t, sv: p[29] === 255 ? null : p[29], hdop: eph === 65535 ? null : eph / 100, fix: ft }); const lat = dv.getInt32(8, true) * 1e-7, lon = dv.getInt32(12, true) * 1e-7, he = dv.getInt32(30, true), hacc = dv.getUint32(34, true);
           if (ft >= 2 && lat) gps.push({ t, lat, lon, h: he ? he / 1000 : dv.getInt32(16, true) / 1000, ell: !!he, q: MAV_FIX[ft] || "fix " + ft, sH: hacc ? hacc / 1000 : null }); }
-        else if (id === 180) { const tu = rd(dv, "uint64_t", 0); cam.push({ n: dv.getUint16(40, true), t: tu > 1e15 && tu < 4.1e15 ? tu / 1000 : t, lat: dv.getInt32(8, true) * 1e-7, lon: dv.getInt32(12, true) * 1e-7, h: dv.getFloat32(16, true), roll: dv.getFloat32(24, true), pitch: dv.getFloat32(28, true), yaw: dv.getFloat32(32, true) }); }
-        else if (id === 112) { const tu = rd(dv, "uint64_t", 0); trig.push({ n: dv.getUint32(8, true), t: tu > 1e15 && tu < 4.1e15 ? tu / 1000 : t }); }
+        else if (id === 180) { const tu = rd(dv, "uint64_t", 0); cam.push({ n: dv.getUint16(40, true), t: tu > 1e15 && tu < 4.1e15 ? tu / 1000 : t, _tc: t, lat: dv.getInt32(8, true) * 1e-7, lon: dv.getInt32(12, true) * 1e-7, h: dv.getFloat32(16, true), roll: dv.getFloat32(24, true), pitch: dv.getFloat32(28, true), yaw: dv.getFloat32(32, true) }); }
+        else if (id === 112) { const tu = rd(dv, "uint64_t", 0); trig.push({ n: dv.getUint32(8, true), t: tu > 1e15 && tu < 4.1e15 ? tu / 1000 : t, _tc: t }); }
+        else if (id === 241) vib.push({ t, imu: 0, v: Math.max(dv.getFloat32(8, true), dv.getFloat32(12, true), dv.getFloat32(16, true)), clip: dv.getUint32(20, true) + dv.getUint32(24, true) + dv.getUint32(28, true) });
         else if (id === 148 && !fw) { const v = dv.getUint32(16, true); if (v) fw = relVer(v); }
-        else if (id === 253 && !text) { const s = asc(p, 1, 50); if (/^(Ardu\w+|PX4)\s+v?\d/i.test(s)) text = s; } }
+        else if (id === 253) { const s = asc(p, 1, 50); if (!text && /^(Ardu\w+|PX4)\s+v?\d/i.test(s)) text = s; if (p[0] <= 4) ev.push({ t, lvl: p[0], msg: s }); } }
       cnt[id] = (cnt[id] || 0) + 1; j += tot;
     }
     return fin ? b.length : j;
   }, o);
   L.trajectory = gps.map(g => ({ t: g.t, lat: g.lat, lon: g.lon, h: g.h, q: g.q }));
   const ex = cam.length ? cam : trig, last = t => { let q = null; for (const g of gps) { if (g.t > t) break; q = g; } return q; };
-  L.exposures = ex.map(e => { const g = last(e.t); return { n: e.n, t: e.t, lat: e.lat || null, lon: e.lon || null, h: e.h, q: g ? g.q : "log", sH: g ? g.sH : null, roll: e.roll, pitch: e.pitch, yaw: e.yaw }; });
+  L.exposures = ex.map(e => { const g = last(e._tc); return { n: e.n, t: e.t, _tc: e._tc, lat: e.lat || null, lon: e.lon || null, h: e.h, q: g ? g.q : "log", sH: g ? g.sH : null, roll: e.roll, pitch: e.pitch, yaw: e.yaw }; });
+  L._aux = { gq, vib, modes, ev };
   for (const p of L.trajectory) span(L, p.t); for (const e of L.exposures) span(L, e.t);
   L.timeSource = "tlog receive time (ground station clock); CAMERA_FEEDBACK time_usec when set";
   L.device.make = ap; L.device.fw = text ? text.split(/\s+/).slice(0, 2).join(" ") : fw ? (ap || "") + " " + fw : null;
   fact(L, "fFormat", "MAVLink telemetry log (.tlog)"); fact(L, "fFirmware", L.device.fw);
   fact(L, "fExposures", ex.length ? ex.length + (cam.length ? " (CAMERA_FEEDBACK)" : " (CAMERA_TRIGGER)") : null);
   if (cam.length) { fact(L, "fHeight", "CAMERA_FEEDBACK alt_msl: above mean sea level"); L.notes.push("height-amsl"); }
+  else if (trig.length && gps.length) { const ell = gps.every(g => g.ell); fact(L, "fHeight", ell ? "ellipsoid (GPS_RAW_INT alt_ellipsoid, interpolated to CAMERA_TRIGGER)" : "GPS_RAW_INT alt: above mean sea level (interpolated to CAMERA_TRIGGER)"); if (!ell) L.notes.push("height-amsl"); }
   if (gps.length) fact(L, "fGnssFix", Object.entries(countBy(gps, g => g.q)).map(([k, v]) => k + ": " + v).join(", "));
   fact(L, "fMessages", Object.entries(cnt).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([k, v]) => ({ 0: "HEARTBEAT", 1: "SYS_STATUS", 2: "SYSTEM_TIME", 24: "GPS_RAW_INT", 27: "RAW_IMU", 29: "SCALED_PRESSURE", 30: "ATTITUDE", 33: "GLOBAL_POSITION_INT", 42: "MISSION_CURRENT", 62: "NAV_CONTROLLER_OUTPUT", 65: "RC_CHANNELS", 74: "VFR_HUD", 112: "CAMERA_TRIGGER", 136: "TERRAIN_REPORT", 147: "BATTERY_STATUS", 148: "AUTOPILOT_VERSION", 152: "MEMINFO", 178: "AHRS2", 180: "CAMERA_FEEDBACK", 193: "EKF_STATUS_REPORT", 241: "VIBRATION", 253: "STATUSTEXT" }[k] || "#" + k) + ": " + v).join(", "));
 }
@@ -3513,17 +3753,35 @@ const CSV_COL = {
   q: /^(solution|quality|q|fix|status|rtk ?status|solution ?status)$/
 };
 function csvSplit(line, d) { const out = []; let cur = "", q = false; for (let i = 0; i < line.length; i++) { const c = line[i]; if (q) { if (c === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; } else if (c === '"') q = true; else if (c === d) { out.push(cur); cur = ""; } else cur += c; } out.push(cur); return out.map(x => x.trim()); }
-function csvHeader(s) {
+const csvDelim = l => [",", ";", "\t"].sort((a, b) => l.split(b).length - l.split(a).length)[0];
+const csvCols = (l, d) => csvSplit(l, d).map(c => c.toLowerCase().replace(/\s*\[[^\]]*\]\s*/g, "").replace(/\s+/g, " ").trim());
+// map: { lat, lon, name?, t?, h? } column names assigned by the user; without it columns are found by name
+function csvHeader(s, map) {
   const lines = s.split(/\r?\n/).slice(0, 30);
   for (let i = 0; i < lines.length; i++) { const l = lines[i].replace(/^\uFEFF/, "").replace(/^#\s*(?=label|name|image)/i, ""); if (!l.trim() || /^#/.test(l)) continue;
-    const d = [",", ";", "\t"].sort((a, b) => l.split(b).length - l.split(a).length)[0], cols = csvSplit(l, d).map(c => c.toLowerCase().replace(/\s*\[[^\]]*\]\s*/g, "").replace(/\s+/g, " ").trim());
-    const idx = {}; for (const k in CSV_COL) idx[k] = cols.findIndex(c => CSV_COL[k].test(c));
+    const d = csvDelim(l), cols = csvCols(l, d);
+    const idx = {}; for (const k in CSV_COL) idx[k] = map ? (map[k] != null ? cols.indexOf(map[k]) : -1) : cols.findIndex(c => CSV_COL[k].test(c));
     if (idx.lat >= 0 && idx.lon >= 0) return { line: i, d, idx, cols };
     return null; }
   return null;
 }
-async function pCSV(src, L) {
-  const s = await text(src), H = csvHeader(s); if (!H) return; const { d, idx } = H; let proj = 0, row = 0;
+// a CSV whose column names are not recognised, but whose first data row has at least two values that look like degrees (5+ decimals):
+// its columns are offered for assignment by hand (guess: the first two such columns as latitude and longitude)
+function csvColumns(s) {
+  const lines = s.split(/\r?\n/).slice(0, 30); let H = null;
+  for (let i = 0; i < lines.length; i++) { const l = lines[i].replace(/^\uFEFF/, ""); if (!l.trim() || /^#/.test(l)) continue;
+    if (!H) { const d = csvDelim(l), cols = csvCols(l, d); if (cols.length < 2) return null; H = { line: i, d, cols }; continue; }
+    const deg = csvSplit(l, H.d).map((v, k) => /^-?\d{1,3}[.,]\d{5,}$/.test(v) ? k : -1).filter(k => k >= 0);
+    if (deg.length < 2) return null; H.guess = { lat: deg[0], lon: deg[1] }; return H; }
+  return null;
+}
+async function pCSVCols(src, L) {
+  const H = csvColumns(await text(src)); if (!H) return;
+  L.csv = { cols: H.cols, guess: H.guess }; L.notes.push("csv-unmapped");
+  fact(L, "fFormat", "CSV, coordinate columns not recognised by name"); fact(L, "fColumns", H.cols.join(", "));
+}
+async function pCSV(src, L, h, o) {
+  const map = o && o.csvMap, s = await text(src), H = csvHeader(s, map); if (!H) return; if (map) L.notes.push("csv-mapped"); const { d, idx } = H; let proj = 0, row = 0;
   const num = v => { if (v == null || v === "") return null; const x = +String(v).replace(d === ";" ? "," : /(?!)/, "."); return isFinite(x) ? x : null; };
   s.split(/\r?\n/).slice(H.line + 1).forEach(l => { if (!l.trim() || /^#/.test(l)) return; const p = csvSplit(l, d); row++;
     const lat = num(p[idx.lat]), lon = num(p[idx.lon]); if (lat == null || lon == null) return; if (Math.abs(lat) > 90 || Math.abs(lon) > 180) { proj++; return; }
@@ -3532,7 +3790,7 @@ async function pCSV(src, L) {
       q: /fix/.test(tq) ? "fixed" : /float/.test(tq) ? "float" : /single|autonom|3d/.test(tq) ? "single" : /ppk/.test(tq) ? "ppk" : "log" }); });
   for (const e of L.exposures) span(L, e.t); if (L.startMs != null) L.timeSource = "time column (read as UTC)";
   if (proj) L.notes.push("csv-projected");
-  fact(L, "fFormat", "CSV geotags (" + ({ ",": "comma", ";": "semicolon", "\t": "tab" })[d] + ")"); fact(L, "fColumns", Object.entries(idx).filter(x => x[1] >= 0).map(([k, v]) => k + " = " + H.cols[v]).join(", "));
+  fact(L, "fFormat", "CSV geotags (" + ({ ",": "comma", ";": "semicolon", "\t": "tab" })[d] + ")"); fact(L, "fColumns", Object.entries(idx).filter(x => x[1] >= 0).map(([k, v]) => k + " = " + H.cols[v]).join(", ") + (map ? " (assigned by hand)" : ""));
   fact(L, "fImages", L.exposures.length); fact(L, "fProjected", proj || null);
   fact(L, "fHeight", idx.h >= 0 ? "column " + H.cols[idx.h] + ": datum not stated in the file" : null);
 }
@@ -4101,6 +4359,61 @@ async function pP4D(src, L) {
   L.notes.push("processing");
 }
 
+/* ---- ThermoTIFF (J. Rous, MIT): conversion_log.csv and processing_record.json. ThermoTIFF converts DJI R-JPEGs to float32 TIFF in degrees Celsius
+   with the DJI Thermal SDK. Both files describe one conversion run: read as a processing record (software, the conversion step and its parameters).
+   File paths in them (input and output folders, full source paths) are not copied: only file names are kept, to match the loaded images. */
+const TT_PARAMS = [["distance", "object_distance_m"], ["humidity", "relative_humidity_pct"], ["emissivity", "emissivity"], ["reflection", "reflected_temperature_c"], ["ambient_temp", "ambient_temperature_c"]];
+const TT_METHOD = "DJI Thermal SDK: raw values of the R-JPEG to temperature in degrees Celsius (float32 TIFF), with the measurement parameters below";
+const TT_ATM = "DJI Thermal SDK built-in correction (method not published; inputs: object distance, relative humidity, ambient and reflected temperature)";
+const baseName = p => String(p || "").split(/[\\/]/).pop();
+function ttProc(L, sw, step, settings, images, extra) {
+  L.proc = Object.assign({ software: sw, steps: [step], source: "thermotiff", photogrammetry_settings: {}, adjustment_quality: {}, thermal_settings: settings, atmospheric_model: TT_ATM,
+    products: [{ type: "temperature images (degrees Celsius)", format: "TIFF float32", step: 1 }], geometry: [], gcp: null, saved_local: null, images: images.map(projBase) }, extra || {});
+  L.notes.push("processing");
+}
+async function pThermoLog(src, L) {
+  const lines = (await text(src)).replace(/^﻿/, "").split(/\r?\n/).filter(x => x.trim()), head = csvSplit(lines[0], ","), ix = n => head.indexOf(n);
+  const rows = lines.slice(1).map(l => csvSplit(l, ",")).filter(r => r.length >= head.length - 1);
+  const st = {}, combos = new Map(), api = new Set(), over = new Set(), names = []; let secs = 0;
+  for (const r of rows) {
+    const s = r[ix("status")] || ""; st[s] = (st[s] || 0) + 1; names.push(baseName(r[ix("source")]));
+    const t = +r[ix("seconds")]; if (isFinite(t)) secs += t;
+    if (s !== "ok") continue;
+    const p = {}; for (const [c, k] of TT_PARAMS) { const v = r[ix(c)]; if (v !== "" && v != null && isFinite(+v)) p[k] = +v; }
+    const key = JSON.stringify(p); combos.set(key, (combos.get(key) || 0) + 1);
+    if (r[ix("dji_api_version")]) api.add(r[ix("dji_api_version")]); if (r[ix("overridden")]) over.add(r[ix("overridden")]);
+  }
+  fact(L, "fFormat", "ThermoTIFF conversion_log.csv");
+  fact(L, "fImages", rows.length + " (" + Object.entries(st).map(([k, v]) => k + " " + v).join(", ") + ")");
+  const sets = [...combos.entries()].sort((a, b) => b[1] - a[1]), P = sets.length ? JSON.parse(sets[0][0]) : {};
+  const ov = [...over].join("; "), src0 = ov ? "set by the user for " + ov.replace(/=[^,;]*/g, "") + "; other values stored in the images" : "stored in the images";
+  fact(L, "fThermalParams", Object.entries(P).map(([k, v]) => k + " " + v).join(", ") + (sets.length > 1 ? " (" + sets.length + " different sets; the most frequent shown)" : ""));
+  if (ov) fact(L, "fOverridden", ov);
+  const settings = Object.assign({ method: TT_METHOD }, P, { parameter_source: src0 }, sets.length > 1 ? { parameter_sets: sets.map(([k, n]) => Object.assign(JSON.parse(k), { images: n })) } : {});
+  ttProc(L, [{ name: "ThermoTIFF", version: "", note: "the version is not in conversion_log.csv (it is in the TIFF and in processing_record.json)" }, { name: "DJI Thermal SDK", version: api.size ? "API " + [...api].join(", ") : "" }],
+    { order: 1, name: "Convert R-JPEG to temperature TIFF", method: TT_METHOD, parameters: Object.assign({}, P, { parameter_source: src0, images: rows.length, converted: st.ok || 0, errors: (st.error || 0) + (st.not_radiometric || 0), skipped: st.skipped || 0 }), duration_s: +secs.toFixed(2) },
+    settings, names);
+}
+async function pThermoRecord(src, L) {
+  let J; try { J = JSON.parse((await text(src)).replace(/^﻿/, "")); } catch (e) { L.notes.push("not-a-project"); return; }
+  const s = J.software || {}, p = J.parameters || null, out = J.output || {}, inp = J.input || {}, qc = J.quality_control || null;
+  const sw = [{ name: "ThermoTIFF", version: s.version || "" }, { name: "DJI Thermal SDK", version: s.dji_thermal_sdk_api ? "API " + s.dji_thermal_sdk_api : "" }];
+  if (s.exiftool) sw.push({ name: "ExifTool", version: String(s.exiftool) });
+  const P = {}; if (p) { if (p.distance_m != null) P.object_distance_m = p.distance_m; if (p.humidity_pct != null) P.relative_humidity_pct = p.humidity_pct; if (p.emissivity != null) P.emissivity = p.emissivity; if (p.reflected_C != null) P.reflected_temperature_c = p.reflected_C; }
+  const srcP = p && p.source ? p.source : null;
+  fact(L, "fFormat", "ThermoTIFF processing record " + (s.version || ""));
+  fact(L, "fSoftware", sw.map(x => x.name + " " + x.version).join(", "));
+  if (J.created) fact(L, "fCreated", J.created);
+  if (J.camera && J.camera.model) L.device = { model: J.camera.model };
+  fact(L, "fImages", (inp.images != null ? inp.images : "?") + (out.converted != null ? " (converted " + out.converted + ", errors " + (out.errors || 0) + ")" : ""));
+  if (p) fact(L, "fThermalParams", Object.entries(P).map(([k, v]) => k + " " + v).join(", ") + (srcP ? " (" + srcP + ")" : ""));
+  if (qc) fact(L, "fQc", (qc.flagged || 0) + " flagged" + (qc.reasons && Object.keys(qc.reasons).length ? ": " + Object.entries(qc.reasons).map(([k, v]) => k + " " + v).join(", ") : ""));
+  const steps = [{ order: 1, name: "Convert R-JPEG to temperature TIFF", method: TT_METHOD, parameters: Object.assign({}, P, srcP ? { parameter_source: srcP } : {}, { images: inp.images, converted: out.converted, errors: out.errors, output_format: out.format, record_created: J.created }) }];
+  if (qc) steps.push({ order: 2, name: "Quality control of the temperature images", method: "ThermoTIFF rules", parameters: { flagged: qc.flagged, reasons: qc.reasons, rules: qc.rules } });
+  ttProc(L, sw, steps[0], Object.assign({ method: TT_METHOD }, P, srcP ? { parameter_source: srcP } : {}), [], {});
+  L.proc.steps = steps;
+}
+
 /* ---- Agisoft Metashape: the .psx file only points to {name}.files/project.zip; the content is in doc.xml files inside the zips
    (document → chunks → chunk.zip → frames → frame.zip). Each step leaves its settings, duration and memory in a <meta> block
    ("AlignCameras/…"); Info/LastSavedSoftwareVersion is the version that last saved the file, not necessarily the one that ran each step. */
@@ -4202,7 +4515,7 @@ async function pMetashape(src, L, h) {
 const PARSERS = { "dji-mrk": pMRK, rinex: pRINEX, rtcm3: pRTCM, ulog: pULog, sbf: pSBF, bb3: pBB3, "sf-geoinfo": pGeoinfo, kml: pKML, jxl: pJXL,
   "wingtra-geotaglog": pWGeotaglog, "wingtra-json": pWJson, "wingtra-ini": pWIni, "wingtra-geotags": pWGeotags, "mica-paramlog": pParamlog, "mica-gpslog": pGpslog,
   tlmb: pTLMB, ubx: pUBX, novatel: pNovatel, "lidar-service": pService, pcmp: pPcmp, encrypted: pEncrypted,
-  "ardupilot-bin": pDataFlash, "ardupilot-log": pAPText, tlog: pTlog, nmea: pNMEA, gpx: pGPX, "csv-geotags": pCSV, "dji-fr-csv": pDjiCsv, "dji-fr": pDjiFR, "emotion-transcript": pEmTranscript, "ebeex-afpu": pAfpu, "pix4dcapture-log": pP4dCaptureLog, bbz: pBBZ, "pix4dcapture-mission": pP4dMission, bbx: pBBX, "dji-events": pDjiEvents, "dji-dat": pDjiDat, jeti: pJeti, efl: pEfl, "pix4d-project": pP4D, metashape: pMetashape };
+  "ardupilot-bin": pDataFlash, "ardupilot-log": pAPText, tlog: pTlog, nmea: pNMEA, gpx: pGPX, "csv-geotags": pCSV, "csv-columns": pCSVCols, "dji-fr-csv": pDjiCsv, "thermotiff-log": pThermoLog, "thermotiff-record": pThermoRecord, "dji-fr": pDjiFR, "emotion-transcript": pEmTranscript, "ebeex-afpu": pAfpu, "pix4dcapture-log": pP4dCaptureLog, bbz: pBBZ, "pix4dcapture-mission": pP4dMission, bbx: pBBX, "dji-events": pDjiEvents, "dji-dat": pDjiDat, jeti: pJeti, efl: pEfl, "pix4d-project": pP4D, metashape: pMetashape };
 
 /* ---------------------------------------------------------------- joining images with logs, checks */
 /* images: [{ name, S (reader summary), captureId, c2pa }] */
@@ -4312,6 +4625,15 @@ function combine(logs, images, solar) {
     add(good === n ? "ok" : good > 0.95 * n ? "info" : "warn", "cSolution", Object.entries(c).map(([k, v]) => k + ": " + v).join(", "), good / n);
     const sH = median(main.exposures.map(e => e.sH != null ? e.sH : e.sN != null ? Math.max(e.sN, e.sE) : null)); if (sH != null) add(sH <= 0.05 ? "ok" : sH <= 0.5 ? "info" : "warn", "cSigma", sH.toFixed(3) + " m", sH);
   }
+  // 4b flight state at the exposures (atExposure), from the main log or else the first log of this flight that records it
+  const ax = [main].concat(src).find(l => l && !l._other && l.atExp);
+  if (ax) { const S = ax.atExp, parts = [], sts = [], P = (state, txt) => { sts.push(state); parts.push(txt); };
+    if (S.gnss) { const g = S.gnss; P(g.low ? "warn" : "ok", "GNSS " + [g.svMed != null ? g.svMed + " satellites (min " + g.svMin + ")" : null, g.hdopMax != null ? "HDOP max " + g.hdopMax : null, g.ephMax != null ? "eph max " + g.ephMax + " m" : null, "below 3D fix: " + g.low].filter(Boolean).join(", ")); }
+    if (S.vib) { const v = S.vib; P(v.over60 || v.clip >= 100 ? "warn" : v.over30 || v.clip ? "info" : "ok", "vibration max " + v.max + " m/s² (over 30: " + v.over30 + ", over 60: " + v.over60 + "), clipping +" + v.clip); }
+    if (S.modes) { const m = S.modes; P(m.out ? "warn" : m.unknown ? "info" : "ok", m.out ? "outside the automatic mission: " + m.out + " (" + m.outNames.join(", ") + ")" : "mode " + m.names.join(", ")); }
+    if (S.ev) P(S.ev.err ? "warn" : "info", "autopilot errors and warnings: " + S.ev.n + " (" + S.ev.first.join("; ") + (S.ev.kinds > 3 ? "; …" : "") + ")");
+    if (S.interp) P("info", "interpolated positions: " + S.interp);
+    const R = { ok: 0, info: 1, warn: 2, bad: 3 }; if (parts.length) add(sts.reduce((a, b) => R[b] > R[a] ? b : a, "ok"), "cAtExposure", ax.name + ": " + parts.join(" · ")); }
   const ini = logs.find(l => l.kind === "wingtra-ini"); if (ini && ini.rtkFix != null) add(ini.rtkFix >= 95 ? "ok" : "warn", "cPpkFix", ini.rtkFix + " %");
   // flight window: logs of this flight that overlap the images (other flights and base stations left out)
   const imT = images.map(i => i.S && i.S.utcMs).filter(x => x != null);
@@ -4355,6 +4677,7 @@ function combine(logs, images, solar) {
     if (v.state === "new") add(v.standard ? "info" : "warn", "cUnverified", l.name + ": " + (v.key || "?") + (v.known ? " · ✓ " + v.known : ""));
     if (l.notes.includes("implausible")) add("warn", "cImplausible", l.name + ": " + factOf(l, "fImplausible"));
     if (l.notes.includes("nothing-read")) add("warn", "cNothingRead", l.name);
+    if (l.notes.includes("csv-unmapped")) add("warn", "cCsvMap", l.name + ": " + l.csv.cols.join(", "));
     if (l.encrypted) add("info", l.device && (l.device.serial || l.device.model) || l.startMs != null ? "cEncryptedSum" : "cEncrypted", l.name); if (l.error) add("bad", "cParseError", l.name + ": " + l.error); if (l.notes.includes("clock-jump")) add("info", "cClockJump", l.name); if (l.notes.includes("kml-geoid")) add("info", "cKmlGeoid", l.name); }
   return F;
 }
@@ -4430,18 +4753,28 @@ function sfmAngles(yaw, pitch, roll) {
 
 /* the processing record of each loaded project, in the shape of metadata.json (processing[], products[]) plus what provenance.json needs */
 const MS_PRODUCT_STEP = { "point cloud": /^Build(Point|Dense)Cloud$/, "3D model (mesh)": /^BuildModel$/, "tiled model": /^BuildTiledModel$/, DTM: /^BuildDem$/, DSM: /^BuildDem$/, DEM: /^BuildDem$/, orthomosaic: /^BuildOrthomosaic$/ };
+// conversion_log.csv and processing_record.json of the same ThermoTIFF run are one workflow: joined here
+function ttMerge(list) {
+  const tt = list.filter(l => l.proc.source === "thermotiff"); if (tt.length < 2) return list;
+  const log = tt.find(l => l.kind === "thermotiff-log"), rec = tt.find(l => l.kind === "thermotiff-record"); if (!log || !rec) return list;
+  const a = log.proc, b = rec.proc, s1 = Object.assign({}, b.steps[0], { parameters: Object.assign({}, b.steps[0].parameters, a.steps[0].parameters, { record_created: b.steps[0].parameters.record_created }), duration_s: a.steps[0].duration_s });
+  const m = { name: rec.name, kind: rec.kind, logs: [log.name, rec.name], proc: Object.assign({}, b, { steps: [s1].concat(b.steps.slice(1)), thermal_settings: a.thermal_settings, images: a.images }) };
+  return list.filter(l => l !== log && l !== rec).concat([m]);
+}
 function procRecord(logs) {
-  return (logs || []).filter(l => l && l.proc).map((l, i) => {
+  return ttMerge((logs || []).filter(l => l && l.proc)).map((l, i) => {
     const p = l.proc, wf = "WF" + (i + 1);
     const steps = p.steps.map(s => ({ order: s.order, name: s.name, method: s.method, parameters: Object.assign({}, s.parameters, s.duration_s != null ? { duration_s: s.duration_s } : {}, s.memory_bytes != null ? { memory_bytes: s.memory_bytes } : {}, s.software_version ? { software_version: s.software_version } : {}) }));
-    const processing = { workflow_id: wf, software: p.software.map(s => Object.assign({ name: s.name, version: s.version }, p.software_note ? { note: p.software_note } : {})), steps,
+    const processing = { workflow_id: wf, software: p.software.map(s => Object.assign({ name: s.name, version: s.version }, s.note ? { note: s.note } : p.software_note ? { note: p.software_note } : {})), steps,
       photogrammetry_settings: p.photogrammetry_settings || {}, adjustment_quality: p.adjustment_quality || {} };
+    if (p.thermal_settings) processing.thermal_settings = p.thermal_settings; if (p.atmospheric_model) processing.atmospheric_model = p.atmospheric_model;
+    if (p.source === "thermotiff") { delete processing.photogrammetry_settings; delete processing.adjustment_quality; }
     if (p.output_crs) processing.output_crs = p.output_crs;
     const products = p.products.map(x => Object.assign({ product_type: x.type }, x.format ? { format: x.format } : {}, p.output_crs ? { crs: p.output_crs } : {}, { workflow_id: wf }, p.vertical && /^(DSM|DTM|DEM|point cloud|3D)/.test(x.type) ? { vertical_crs: p.vertical } : {}));
     // which step made which product (Pix4D: by step number; Metashape: by step name)
-    const stepOf = x => p.source === "p4d" ? p.steps.find(s => s.order === x.step) : p.steps.find(s => MS_PRODUCT_STEP[x.type] && MS_PRODUCT_STEP[x.type].test(s.id));
+    const stepOf = x => p.source === "p4d" || p.source === "thermotiff" ? p.steps.find(s => s.order === x.step) : p.steps.find(s => MS_PRODUCT_STEP[x.type] && MS_PRODUCT_STEP[x.type].test(s.id));
     const made = p.products.map(stepOf).map(s => s ? s.order : null);
-    return { log: l.name, kind: l.kind, wf, processing, products, made, steps: p.steps, software: p.software, vertical: p.vertical, gcp: p.gcp, geometry: p.geometry || [], saved_local: p.saved_local, source: p.source, images: p.images || [] };
+    return { log: l.name, logs: l.logs || [l.name], kind: l.kind, wf, processing, products, made, steps: p.steps, software: p.software, vertical: p.vertical, gcp: p.gcp, geometry: p.geometry || [], saved_local: p.saved_local, source: p.source, images: p.images || [] };
   });
 }
 /* ---------------------------------------------------------------- values for the OpenSkyLab check taken from the flight logs */
@@ -4469,9 +4802,10 @@ function oslFromFlight(logs, F) {
   // processing project (Pix4D, Metashape): the processing block, the products and the GCP counts; calibration per sensor (matched by image size)
   const PR = procRecord(logs)[0];
   if (PR) {
-    const setp = (k, val, note) => { if (val == null || (typeof val === "object" && !Object.keys(val).length)) return; set(k, val, PR.log, note); if (out.mission[k]) out.mission[k].log = PR.log; };
+    const setp = (k, val, note) => { if (val == null || (typeof val === "object" && !Object.keys(val).length)) return; set(k, val, PR.logs.join(" + "), note); if (out.mission[k]) out.mission[k].log = PR.log; };
     const p = PR.processing;
     setp("processing.workflow_id", p.workflow_id, "nProcWf"); setp("processing.software", p.software, "nProcSw"); setp("processing.steps", p.steps, "nProc");
+    setp("processing.thermal_settings", p.thermal_settings, "nProcTt"); setp("processing.atmospheric_model", p.atmospheric_model, "nProcTt");
     setp("processing.photogrammetry_settings", p.photogrammetry_settings, "nProc"); setp("processing.adjustment_quality", p.adjustment_quality, "nProc"); setp("processing.output_crs", p.output_crs, "nProcCrs");
     if (PR.products.length) { setp("product.product_type", [...new Set(PR.products.map(x => x.product_type))].join(", "), "nProcProd"); setp("product.crs", p.output_crs, "nProcCrs");
       setp("product.workflow_id", p.workflow_id, "nProcWf"); setp("product.vertical_crs", PR.vertical, "nProc"); }
@@ -4487,8 +4821,9 @@ function oslFromFlight(logs, F) {
   for (const m of F.matches || []) {
     const e = exposureOf(logs, m); if (!e) continue; const l = logs.find(x => x.name === m.log), ell = /^ellipsoid/.test(factOf(l, "fHeight"));
     const r = {}, put = (col, val, note) => { if (val != null && val !== "" && !(typeof val === "number" && !isFinite(val))) r[col] = { val, src: l.name + " #" + e.n, note: note || "" }; };
-    put("timestamp_utc", iso(e.t)); put("lat_deg", e.lat != null ? +e.lat.toFixed(9) : null); put("lon_deg", e.lon != null ? +e.lon.toFixed(9) : null);
-    if (e.h != null) { if (ell) put("alt_ellipsoid_m", +(+e.h).toFixed(3)); else r._hNote = factOf(l, "fHeight"); }
+    const ip = e.interp ? "nInterp" : "";   // interpolated from the trajectory: an estimate
+    put("timestamp_utc", iso(e.t)); put("lat_deg", e.lat != null ? +e.lat.toFixed(9) : null, ip); put("lon_deg", e.lon != null ? +e.lon.toFixed(9) : null, ip);
+    if (e.h != null) { if (ell) put("alt_ellipsoid_m", +(+e.h).toFixed(3), ip); else r._hNote = factOf(l, "fHeight"); }
     if (e.q && /^(fixed|int|float|single|ppk)$/.test(e.q)) put("rtk_flag", e.q);
     const sx = e.sE != null ? e.sE : e.sH, sy = e.sN != null ? e.sN : e.sH; put("sigma_x_m", sx); put("sigma_y_m", sy); put("sigma_z_m", e.sV);
     out.images[m.image] = { log: m.log, n: e.n, how: m.how, status: m.status, candidates: m.candidates, dt: m.dt, dxy: m.dxy, dz: ell ? m.dz : null, cols: r };
@@ -4507,12 +4842,13 @@ function agree(col, imgVal, logVal, match) {
 }
 
 /* ---------------------------------------------------------------- exports */
-const EXP_COLS = ["source", "n", "name", "capture_id", "time_utc", "lat", "lon", "h_m", "sigma_h_m", "sigma_v_m", "solution", "image", "match", "dt_s", "dxy_m"];
+const EXP_COLS = ["source", "n", "name", "capture_id", "time_utc", "lat", "lon", "h_m", "sigma_h_m", "sigma_v_m", "solution", "image", "match", "dt_s", "dxy_m", "position", "satellites", "hdop", "eph_m", "vibration_m_s2", "flight_mode"];
 function csvCell(v) { const s = v == null ? "" : String(v); return /[",\n\r;]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }
 function exposuresCSV(logs, F) {
   const lines = [EXP_COLS.join(",")], byLog = new Map(); for (const m of (F && F.matches) || []) if (m.log) byLog.set(m.log + "#" + m.n, m);
   for (const l of logs) { if (l.listOnly) continue; for (const e of l.exposures) { const m = byLog.get(l.name + "#" + e.n) || {};
-    lines.push([l.name, e.n, e.name || "", e.captureId || "", iso(e.t) || "", e.lat != null ? e.lat.toFixed(9) : "", e.lon != null ? e.lon.toFixed(9) : "", e.h != null ? (+e.h).toFixed(3) : "", e.sH != null ? e.sH : e.sN != null ? Math.max(e.sN, e.sE) : "", e.sV != null ? e.sV : "", e.q || "", m.image || "", m.how || "", m.dt != null ? m.dt.toFixed(3) : "", m.dxy != null ? m.dxy.toFixed(3) : ""].map(csvCell).join(",")); } }
+    lines.push([l.name, e.n, e.name || "", e.captureId || "", iso(e.t) || "", e.lat != null ? e.lat.toFixed(9) : "", e.lon != null ? e.lon.toFixed(9) : "", e.h != null ? (+e.h).toFixed(3) : "", e.sH != null ? e.sH : e.sN != null ? Math.max(e.sN, e.sE) : "", e.sV != null ? e.sV : "", e.q || "", m.image || "", m.how || "", m.dt != null ? m.dt.toFixed(3) : "", m.dxy != null ? m.dxy.toFixed(3) : "",
+      e.interp ? "interpolated" : e.lat != null ? "log" : "", e.sv != null ? e.sv : "", e.hdop != null ? e.hdop : "", e.eph != null ? e.eph : "", e.vib != null ? e.vib : "", e.mode || ""].map(csvCell).join(",")); } }
   return lines.join("\r\n") + "\r\n";
 }
 function flightJSON(logs, F) {
@@ -4675,12 +5011,12 @@ cs: {
     nWx: "model Open-Meteo pro buňku sítě, ne měření na místě; vlastní záznam má přednost",
     nGnssMode: "RTK podle RtkFlag; PPK se ze snímku poznat nedá", nSun: "NOAA, z času UTC a polohy snímku", nDist: "≈ RelativeAltitude pro kolmý snímek nad rovinou", nAmb: "Exif 2.31: AmbientTemperature, Humidity, Pressure",
     nBbox: "Západ, jih, východ, sever ve WGS 84", nInterval: "Interval ISO 8601 v UTC", nProdGsd: "Velikost pixelu ortofota v cm", nSha: "Kontrolní součet tohoto souboru", nSoftware: "Software z EXIF; verzi doplňte",
-    nNotMs: "Senzor není multispektrální", nNotTh: "Senzor není termální", nNotEnv: "Modul prostředí a reference se vyžaduje u multispektrálních a termálních dat", nOblique: "Šikmé snímky: odklon gimbalu od nadiru větší než 15° aspoň u jednoho snímku; v závorce největší odklon (°)", nExpMode: "EXIF ExposureMode: 1 (ruční) = fixed, jinak auto", nApp4: "Parametry měření jsou v bloku APP4 (DJI) nebo CameraInfo (FLIR); čtečka je zatím nedekóduje",
+    nNotMs: "Senzor není multispektrální", nNotTh: "Senzor není termální", nNotEnv: "Modul prostředí a reference se vyžaduje u multispektrálních a termálních dat", nOblique: "Šikmé snímky: odklon gimbalu od nadiru větší než 15° aspoň u jednoho snímku; v závorce největší odklon (°)", nExpMode: "EXIF ExposureMode: 1 (ruční) = fixed, jinak auto", nApp4: "Parametry měření v souboru nejsou, nebo jejich uložení čtečka nezná (DJI APP4: ThermalParams2 a 3 čte, ThermalParams ze ZH20T jen zobrazí, škála není popsaná)", nCamSet: "Nastavení kamery při snímání, ne měření: okolní teplota a vlhkost se proto nepřebírají do environment.*. Teplotu z nich počítá SDK výrobce", nEmisCam: "Emisivita nastavená v kameře. Pokud referenční přístroj počítal s jinou, zapište jeho hodnotu", nFpaDji: "DJI R-JPEG (např. M3T) teplotu kamery ani senzoru nezapisuje; v souboru jsou jen parametry měření. Hodnotu nelze doplnit ze snímku", nFpaXmp: "XMP Camera:SensorTemperature (Pix4D), °C", nEnc: "Odvozeno ze struktury souboru: kde jsou surové hodnoty a čím se převádějí na teplotu", nEncTt: "TIFF z ThermoTIFF: teploty ve °C už spočítané DJI Thermal SDK", nPlanck: "FLIR: T = B / ln(R1 / (R2 · (S + O)) + F); jiný tvar než K1, K2 ve specifikaci, význam stejný", nSpecRange: "CentralWavelength ± FWHM/2 (XMP Camera, nm → µm); nominální pásmo, ne změřená spektrální odezva", nTtSet: "Parametry, se kterými ThermoTIFF převedl snímek (ImageDescription). Zda jsou z kamery, nebo zadané uživatelem, TIFF neříká: viz conversion_log.csv nebo záznam zpracování", nTtAtm: "Korekci počítá DJI Thermal SDK; postup DJI nezveřejňuje", nTtCap: "TIFF z ThermoTIFF parametry nastavené v kameře nenese (jsou v APP4 původního R-JPEG). Parametry převodu jsou v processing.thermal_settings", nTtSw: "Software a ImageDescription v TIFF", nLrf: "Laserový dálkoměr (DJI LRFTargetDistance), stav Normal", nDistNoLrf: "≈ RelativeAltitude pro kolmý snímek nad rovinou; laserový dálkoměr neměřil (vzdálenost 0)",
     "il_manual": "Zadá uživatel (identifikátor v datové sadě)", "il_no-tz": "Místní čas bez časového pásma: UTC doplňte z letového záznamu", "il_check-datum": "DJI AbsoluteAltitude: podle modelu elipsoidická nebo nadmořská výška, ověřte pro svůj dron",
     "il_sea-level": "Exif 3.0 Ref 2/3: výška vůči hladině moře, ne elipsoidu", "il_gps-alt": "EXIF GPSAltitude: oficiálně nad mořem, mnoho dronů ale zapisuje elipsoidickou výšku", "il_rel-takeoff": "Výška nad místem vzletu",
     "il_rtk-unknown": "GpsStatus = RTK bez rozlišení fixed/float", "il_rtk-int": "RtkFlag 48–49: celočíselné řešení nižší kvality (hodnota int)", "il_clock-suspect": "Hodiny kamery zřejmě nebyly nastavené: čas vezměte z letového záznamu", "il_ellipsoid-sensefly": "senseFly: GPSAltitude je výška nad elipsoidem, i když Ref uvádí hladinu moře (ověřeno proti geoinfo a KML z eMotion)", "il_invalid": "Senzor uvádí neplatnou hodnotu", "il_log": "Doplňte z letového záznamu", "il_sigma-axes": "Osa x = východ (RtkStdLon), y = sever (RtkStdLat); specifikace osy výslovně nedefinuje",
     "il_speed-axes": "x = východ (DJI FlightYSpeed), y = sever (DJI FlightXSpeed), podle příkladu v šabloně", "il_speed-z": "DJI FlightZSpeed; znaménko podle výrobce (NED: kladně dolů)", "il_na": "Netýká se tohoto senzoru",
-    "il_unit-unknown": "DJI neuvádí jednotku", "il_sdk": "Z termálního SDK nebo záznamu senzoru"
+    "il_unit-unknown": "DJI neuvádí jednotku", "il_sdk": "Z termálního SDK nebo záznamu senzoru", "il_not-written": "DJI R-JPEG tuto hodnotu nezapisuje"
   },
   blk: { dataset: "datová sada", mission: "let", sensor: "nosič a senzor", geometry: "geometrie kamery", multispectral: "multispektrální radiometrie", thermal: "termální radiometrie", environment: "podmínky prostředí", reference: "referenční měření", processing: "zpracování", product: "produkty" },
   batchEmpty: "Dávka potřebuje alespoň dva soubory. Vyberte více snímků z jednoho letu, nebo načtěte ukázkový let.", batchIntro: n => n + (n >= 2 && n <= 4 ? " soubory" : " souborů") + ". Řádky jsou seřazené podle pořadí načtení, čísla v grafech podle času.",
@@ -4705,7 +5041,7 @@ cs: {
     png: "Chyba ve struktuře PNG.", webp: "Chyba ve struktuře WebP.", bmff: "Chyba ve struktuře ISO BMFF (HEIC/MP4).", heif: "Položku HEIF se nepodařilo přečíst.", "dji-telemetry": "Video obsahuje telemetrii DJI (djmd/dbgi); čtečka ji nedekóduje.",
     telemetry: "Video obsahuje stopu s časovanými metadaty; nedekódováno.", "unknown-format": "Formát souboru nepoznávám.", parse: "Čtení skončilo chybou.", "large-file": "Velký soubor: čtu jen potřebné úseky.", raf: "EXIF přečten z vloženého náhledu JPEG.",
     "ext-mismatch": "Přípona neodpovídá obsahu souboru.", derive: "Odvozené hodnoty se nepodařilo spočítat.", input: "Vstup nelze přečíst.", "tag-cap": "Příliš mnoho značek; další přeskočeny.", jumbf: "Struktura JUMBF/C2PA je poškozená nebo neúplná.", clock: "Hodiny kamery zřejmě nebyly nastavené." },
-  grp: { File: "údaje o souboru a struktuře", "EXIF:IFD0": "hlavní obraz", "EXIF:IFD1": "náhled", "EXIF:ExifIFD": "expozice a čas", "EXIF:GPS": "poloha GNSS", "EXIF:Interop": "interoperabilita", "EXIF:SubIFD": "podřízený obraz",
+  grp: { File: "údaje o souboru a struktuře", "APP4:DJI": "termální parametry měření (DJI R-JPEG)", "APP7:DJI": "ladicí údaje DJI", "APP1:FLIR": "termální záznam FLIR FFF", "EXIF:IFD0": "hlavní obraz", "EXIF:IFD1": "náhled", "EXIF:ExifIFD": "expozice a čas", "EXIF:GPS": "poloha GNSS", "EXIF:Interop": "interoperabilita", "EXIF:SubIFD": "podřízený obraz",
     "MakerNotes:DJI": "blok výrobce DJI", "XMP:drone-dji": "DJI: poloha, náklony, RTK, kalibrace", "XMP:Camera": "Pix4D/MicaSense: pásmo, kamera, přesnost", "XMP:MicaSense": "MicaSense", "XMP:DLS": "čidlo ozáření MicaSense DLS", "XMP:sensefly": "senseFly: náklony a přesnost GNSS",
     "XMP:*": "XMP", ICC_Profile: "barevný profil", IPTC: "popis a autorská práva (IIM)", Photoshop: "bloky Photoshop IRB", JFIF: "hlavička JFIF", APP14: "Adobe APP14", MPF: "Multi-Picture Format", "MPF:*": "obraz MPF",
     GeoTIFF: "klíče GeoTIFF", PNG: "bloky PNG", RIFF: "WebP (RIFF)", QuickTime: "ISO BMFF / QuickTime", "QuickTime:*": "stopa", C2PA: "Content Credentials: aktivní manifest a podpis", "C2PA:Assertions": "tvrzení aktivního manifestu", "C2PA:*": "další manifest nebo jeho tvrzení", JUMBF: "boxy JUMBF (ISO/IEC 19566-5)",
@@ -4716,14 +5052,14 @@ cs: {
     DateTimeUTC: (v, tg) => v ? L_("cs", v) : "neznámý: místní čas bez časového pásma", TimeZone: v => v, SunElevation: v => NUMF("cs", v, 1) + "°", SunAzimuth: v => NUMF("cs", v, 1) + "°",
     GSD: (v, tg) => NUMF("cs", v, 2) + " cm/px" + L_("cs", (/ at (.*)$/.exec(tg.display) || ["", ""])[1] ? " při " + / at (.*)$/.exec(tg.display)[1] : ""), Footprint: v => NUMF("cs", v[0], 1) + " × " + NUMF("cs", v[1], 1) + " m",
     Irradiance: (v, tg) => L_("cs", tg.display.replace("(unit not stated)", "(jednotka neuvedena)").replace("uW/cm2/nm", "µW·cm⁻²·nm⁻¹")), JPEGQualityEstimate: (v, tg) => String(v) + (/rough/.test(tg.display) ? " (hrubý odhad)" : ""),
-    RadiometricJPEG: v => v + " (teploty nedekódovány; použijte SDK výrobce)", Band: (v, tg) => L_("cs", tg.display),
+    RadiometricJPEG: (v, tg) => v + (/parameters read/.test(tg.display) ? " (parametry měření přečteny; teploty se nepočítají)" : " (teploty se nepočítají; použijte SDK výrobce)"), LaserRangefinder: (v, tg) => v != null ? NUMF("cs", v, 3) + " m" : L_("cs", tg.display.replace("not measured", "neměřeno").replace("(status ", "(stav ").replace(", distance", ", vzdálenost")), ThermalParamsCheck: (v, tg) => v ? L_("cs", tg.display.replace(/outside 0-1(?!\d)/g, "mimo 0–1").replace("1.00: blackbody (brightness) temperature, no emissivity correction", "1,00: teplota černého tělesa (jasová), bez korekce emisivity").replace("outside 1-25 m (DJI Thermal SDK; ThermoTIFF does not trust the correction above 25 m)", "mimo 1–25 m (DJI Thermal SDK; nad 25 m ThermoTIFF korekci nevěří)").replace("outside 0-100 %", "mimo 0–100 %").replace(" m set in the camera; laser rangefinder ", " m nastaveno v kameře; laserový dálkoměr ").replace(" m set in the camera; height above take-off ", " m nastaveno v kameře; výška nad vzletem ").replace("(SDK limit 25 m)", "(limit SDK 25 m)")) : "v mezích", PeakSpectralSensitivity: v => NUMF("cs", v, 1) + " µm", TemperatureTIFF: (v, tg) => L_("cs", tg.display.replace("degrees Celsius", "stupně Celsia")), Band: (v, tg) => L_("cs", tg.display),
     ClockCheck: v => ({ reset: "hodiny kamery zřejmě nenastavené (1. ledna, brzy ráno)", old: "hodiny kamery zřejmě nenastavené (příliš starý rok)", "gps-mismatch": "DateTimeOriginal se liší od času GNSS o více než den" })[v] || v,
     CalibrationImage: () => "ano (kamera označila snímek jako kalibrační)", CameraClockOffset: v => (v >= 0 ? "+" : "−") + NUMF("cs", Math.abs(v), 1) + " s", SensorTemperatureCheck: () => "neplatná hodnota (0xFFFF / 10): teplota nezměřena",
     SunshineSamples: (v, tg) => L_("cs", tg.display.replace(" samples, ", " vzorků, ").replace("CH0 mean", "CH0 průměr").replace("integration", "integrace")), CRS: (v, tg) => tg.display, PixelSize: (v, tg) => L_("cs", tg.display.replace("(CRS units)", "(jednotky CRS)")), UpperLeft: (v, tg) => L_("cs", tg.display), Extent: (v, tg) => L_("cs", tg.display)
   },
   derNote: { PixelPitch: "rozteč pixelu = jednotka / FocalPlaneXResolution, nebo FocalLength / CalibratedFocalLength, nebo odhad z 35mm ekvivalentu", SensorSize: "snímač = rozteč pixelu × počet pixelů", FieldOfView: "FOV = 2·atan(snímač / 2f)",
     GroundSpeed: "√(X² + Y²)", GNSSSolution: "DJI: 0 bez řešení (s platnou polohou: dron bez RTK, samostatné GNSS), 16 samostatné určení, 32–34 float, 48–49 celočíselné nižší kvality, 50 fixed (narrow-lane)", DateTimeUTC: "pořadí zdrojů: UTCAtExposure, OffsetTimeOriginal, XMP s pásmem, čas GNSS, konvence MicaSense, senseFly a Parrot (EXIF v UTC), QuickTime. DJI zapisuje do UTCAtExposure i GPSTimeStamp čas GPS: čtečka odečítá přestupné sekundy (od 2017 18 s)",
-    TimeZone: "", SunElevation: "algoritmus NOAA včetně refrakce", SunAzimuth: "od severu po směru hodin", GSD: "GSD = p·H/f; rovina ve výšce vzletu", Footprint: "kolmý snímek", Irradiance: "", Band: "", RadiometricJPEG: "", ClockCheck: "čas vezměte z letového záznamu", CameraClockOffset: "DateTimeOriginal − časové pásmo − UTC; bez SubSecTimeOriginal má DateTimeOriginal celé sekundy", CalibrationImage: "XMP Camera:CalibrationPicture = 1", SensorTemperatureCheck: "",
+    TimeZone: "", SunElevation: "algoritmus NOAA včetně refrakce", SunAzimuth: "od severu po směru hodin", GSD: "GSD = p·H/f; rovina ve výšce vzletu", Footprint: "kolmý snímek", Irradiance: "", Band: "", RadiometricJPEG: "", LaserRangefinder: "nulová vzdálenost nebo jiný stav než Normal znamená, že dálkoměr neměřil", ThermalParamsCheck: "emisivita 0–1, vzdálenost u DJI 1–25 m, vlhkost 0–100 %, vzdálenost porovnaná s dálkoměrem nebo výškou nad vzletem", PeakSpectralSensitivity: "14387,6515 / PlanckB (jako ExifTool)", TemperatureTIFF: "", ClockCheck: "čas vezměte z letového záznamu", CameraClockOffset: "DateTimeOriginal − časové pásmo − UTC; bez SubSecTimeOriginal má DateTimeOriginal celé sekundy", CalibrationImage: "XMP Camera:CalibrationPicture = 1", SensorTemperatureCheck: "",
     SunshineSamples: "Parrot Sequoia, čidlo sunshine: 28 B na vzorek (čas µs, CH0, CH1, index zesílení, integrace ms, yaw, pitch, roll); ozáření v image logu je relativní CH0 / (zesílení × ms)",
     JPEGQualityEstimate: "škálování IJG tabulky T.81 příl. K: S = průměr(100·Q/Qstd); q = (200 − S)/2 pro S ≤ 100, jinak 5000/S", CRS: "", PixelSize: "", UpperLeft: "roh levého horního pixelu (PixelIsArea)", Extent: "xmin, ymin, xmax, ymax",
     GPSAltitude: "Exif 2.x: nad hladinou moře; Exif 3.0 předefinoval Ref 0/1 na výšku nad elipsoidem a hladinu moře přesunul na 2/3" },
@@ -4851,12 +5187,12 @@ en: {
     nWx: "Open-Meteo model value for a grid cell, not measured on site; a field record takes precedence",
     nGnssMode: "RTK from RtkFlag; PPK cannot be recognised from an image", nSun: "NOAA, from UTC time and image position", nDist: "≈ RelativeAltitude for a nadir image over flat ground", nAmb: "Exif 2.31: AmbientTemperature, Humidity, Pressure",
     nBbox: "West, south, east, north in WGS 84", nInterval: "ISO 8601 interval in UTC", nProdGsd: "Orthomosaic pixel size in cm", nSha: "Checksum of this file", nSoftware: "Software from EXIF; add the version",
-    nNotMs: "The sensor is not multispectral", nNotTh: "The sensor is not thermal", nNotEnv: "The environment and reference module is required for multispectral and thermal data", nOblique: "Oblique images: gimbal more than 15° off nadir in at least one image; the value gives the largest tilt (°)", nExpMode: "EXIF ExposureMode: 1 (manual) = fixed, otherwise auto", nApp4: "The measurement parameters are in the APP4 block (DJI) or CameraInfo (FLIR); the reader does not decode them yet",
+    nNotMs: "The sensor is not multispectral", nNotTh: "The sensor is not thermal", nNotEnv: "The environment and reference module is required for multispectral and thermal data", nOblique: "Oblique images: gimbal more than 15° off nadir in at least one image; the value gives the largest tilt (°)", nExpMode: "EXIF ExposureMode: 1 (manual) = fixed, otherwise auto", nApp4: "The file has no measurement parameters, or stores them in a way the reader does not know (DJI APP4: ThermalParams2 and 3 are read; ThermalParams from the ZH20T is only shown, its scale is not documented)", nCamSet: "Camera settings at capture, not measurements: the ambient temperature and humidity are therefore not copied to environment.*. The vendor SDK computes temperature from them", nEmisCam: "Emissivity set in the camera. If the reference instrument used another value, enter that value", nFpaDji: "DJI R-JPEG (e.g. M3T) does not record the camera or sensor temperature; the file holds only the measurement parameters. The value cannot be taken from the image", nFpaXmp: "XMP Camera:SensorTemperature (Pix4D), °C", nEnc: "Derived from the file structure: where the raw values are and what converts them to temperature", nEncTt: "TIFF from ThermoTIFF: temperatures in °C already computed by the DJI Thermal SDK", nPlanck: "FLIR: T = B / ln(R1 / (R2 · (S + O)) + F); a different form from K1, K2 in the specification, same role", nSpecRange: "CentralWavelength ± FWHM/2 (XMP Camera, nm → µm); nominal band, not a measured spectral response", nTtSet: "Parameters ThermoTIFF used for the conversion (ImageDescription). The TIFF does not say whether they came from the camera or were set by the user: see conversion_log.csv or the processing record", nTtAtm: "The DJI Thermal SDK applies the correction; DJI does not publish the method", nTtCap: "A ThermoTIFF TIFF does not carry the parameters set in the camera (they are in APP4 of the original R-JPEG). The conversion parameters are in processing.thermal_settings", nTtSw: "Software and ImageDescription of the TIFF", nLrf: "Laser rangefinder (DJI LRFTargetDistance), status Normal", nDistNoLrf: "≈ RelativeAltitude for a nadir image over flat ground; the laser rangefinder did not measure (distance 0)",
     "il_manual": "Entered by the user (identifier within the dataset)", "il_no-tz": "Local time without a time zone: take UTC from the flight log", "il_check-datum": "DJI AbsoluteAltitude: ellipsoidal or above sea level depending on the model; check for your drone",
     "il_sea-level": "Exif 3.0 Ref 2/3: height relative to sea level, not the ellipsoid", "il_gps-alt": "EXIF GPSAltitude: officially above sea level, but many drones write ellipsoidal height", "il_rel-takeoff": "Height above the take-off point",
     "il_rtk-unknown": "GpsStatus = RTK without fixed/float", "il_rtk-int": "RtkFlag 48–49: lower-grade integer solution (value int)", "il_clock-suspect": "The camera clock was probably not set: take the time from the flight log", "il_ellipsoid-sensefly": "senseFly: GPSAltitude is ellipsoidal height although Ref says sea level (checked against eMotion geoinfo and KML)", "il_invalid": "The sensor reports an invalid value", "il_log": "Fill in from the flight log", "il_sigma-axes": "Axis x = east (RtkStdLon), y = north (RtkStdLat); the specification does not define the axes explicitly",
     "il_speed-axes": "x = east (DJI FlightYSpeed), y = north (DJI FlightXSpeed), following the template example", "il_speed-z": "DJI FlightZSpeed; sign as given by the vendor (NED: positive down)", "il_na": "Not applicable to this sensor",
-    "il_unit-unknown": "DJI does not state the unit", "il_sdk": "From the thermal SDK or the sensor log"
+    "il_unit-unknown": "DJI does not state the unit", "il_sdk": "From the thermal SDK or the sensor log", "il_not-written": "DJI R-JPEG does not record this value"
   },
   blk: { dataset: "dataset", mission: "flight", sensor: "platform and sensor", geometry: "camera geometry", multispectral: "multispectral radiometry", thermal: "thermal radiometry", environment: "environmental conditions", reference: "reference measurements", processing: "processing", product: "products" },
   batchEmpty: "The batch view needs at least two files. Choose several images from one flight, or load the sample flight.", batchIntro: n => n + " files. Table rows follow the loading order; numbers in the plots follow time.",
@@ -4881,7 +5217,7 @@ en: {
     png: "Error in the PNG structure.", webp: "Error in the WebP structure.", bmff: "Error in the ISO BMFF structure (HEIC/MP4).", heif: "A HEIF item could not be read.", "dji-telemetry": "The video contains DJI telemetry (djmd/dbgi); the reader does not decode it.",
     telemetry: "The video has a timed-metadata track; not decoded.", "unknown-format": "Unknown file format.", parse: "Reading ended with an error.", "large-file": "Large file: only the needed byte ranges are read.", raf: "EXIF read from the embedded JPEG preview.",
     "ext-mismatch": "The extension does not match the file content.", derive: "Derived values could not be computed.", input: "The input cannot be read.", "tag-cap": "Too many tags; the rest were skipped.", jumbf: "The JUMBF/C2PA structure is damaged or incomplete.", clock: "The camera clock was probably not set." },
-  grp: { File: "file and structure", "EXIF:IFD0": "main image", "EXIF:IFD1": "thumbnail", "EXIF:ExifIFD": "exposure and time", "EXIF:GPS": "GNSS position", "EXIF:Interop": "interoperability", "EXIF:SubIFD": "sub-image",
+  grp: { File: "file and structure", "APP4:DJI": "thermal measurement parameters (DJI R-JPEG)", "APP7:DJI": "DJI debug info", "APP1:FLIR": "FLIR FFF thermal record", "EXIF:IFD0": "main image", "EXIF:IFD1": "thumbnail", "EXIF:ExifIFD": "exposure and time", "EXIF:GPS": "GNSS position", "EXIF:Interop": "interoperability", "EXIF:SubIFD": "sub-image",
     "MakerNotes:DJI": "DJI vendor block", "XMP:drone-dji": "DJI: position, attitude, RTK, calibration", "XMP:Camera": "Pix4D/MicaSense: band, camera, accuracy", "XMP:MicaSense": "MicaSense", "XMP:DLS": "MicaSense DLS irradiance sensor", "XMP:sensefly": "senseFly: attitude and GNSS accuracy",
     "XMP:*": "XMP", ICC_Profile: "colour profile", IPTC: "description and rights (IIM)", Photoshop: "Photoshop IRB blocks", JFIF: "JFIF header", APP14: "Adobe APP14", MPF: "Multi-Picture Format", "MPF:*": "MPF image",
     GeoTIFF: "GeoTIFF keys", PNG: "PNG chunks", RIFF: "WebP (RIFF)", QuickTime: "ISO BMFF / QuickTime", "QuickTime:*": "track", C2PA: "Content Credentials: active manifest and signature", "C2PA:Assertions": "assertions of the active manifest", "C2PA:*": "another manifest or its assertions", JUMBF: "JUMBF boxes (ISO/IEC 19566-5)",
@@ -5164,6 +5500,11 @@ T.cs.fltV.push(["Pix4Dmapper project (.p4d)", "projekt Pix4Dmapper (.p4d)"], [",
   [" markers · ", " značek · "], [/(\d+) control\b/, "$1 vlícovacích"], [/(\d+) check\b/, "$1 kontrolních"], [" disabled (check points or unused; projections are in frame.zip)", " vypnuto (kontrolní nebo nepoužité; projekce jsou ve frame.zip)"],
   [" disabled without projections", " vypnuto bez projekcí"], [" without coordinates", " bez souřadnic"], [" depth map set(s)", " sad hloubkových map"], [" (m, °, px)", " (m, °, px)"],
   [/(^|, )point cloud(?=,|$| “)/, "$1mračno bodů"], [/(^|, )orthomosaic(?=,|$| “)/, "$1ortomozaika"], [/(^|, )3D model \(mesh\)/, "$13D model (síť)"], ["point cloud (", "mračno bodů ("], ["3D textured mesh", "texturovaný 3D model"], ["orthomosaic (", "ortomozaika ("], ["index map (", "indexová mapa ("]);
+// ThermoTIFF (conversion of DJI R-JPEG to temperature TIFF): conversion_log.csv and processing_record.json as a processing record
+Object.assign(T.cs.fltK, { "thermotiff-log": "ThermoTIFF conversion_log.csv", "thermotiff-record": "ThermoTIFF záznam zpracování" }); Object.assign(T.en.fltK, { "thermotiff-log": "ThermoTIFF conversion_log.csv", "thermotiff-record": "ThermoTIFF processing record" });
+Object.assign(T.cs.fltF, { fThermalParams: "Parametry měření při převodu", fOverridden: "Přepsáno uživatelem", fQc: "Kontrola kvality" }); Object.assign(T.en.fltF, { fThermalParams: "Measurement parameters of the conversion", fOverridden: "Set by the user", fQc: "Quality control" });
+Object.assign(T.cs.on, { nProcTt: "Ze záznamu ThermoTIFF (převod R-JPEG na teploty pomocí DJI Thermal SDK). Cesty ke složkám ze souboru čtečka nepřebírá." }); Object.assign(T.en.on, { nProcTt: "From the ThermoTIFF record (R-JPEG converted to temperature with the DJI Thermal SDK). The reader does not copy folder paths from the file." });
+T.cs.fltV.push([" different sets; the most frequent shown)", " různých sad; zobrazena nejčastější)"], [" flagged", " označeno"], ["ThermoTIFF processing record ", "záznam zpracování ThermoTIFF "], ["stored in the images", "uloženo ve snímcích"], ["set by the user", "nastaveno uživatelem"], ["stored, differs between images", "uloženo, mezi snímky se liší"], [" (converted ", " (převedeno "], [", errors ", ", chyb "]);
 Object.assign(T.cs, { projUsed: n => "<b>Z projektu zpracování: " + n + (n >= 2 && n <= 4 ? " pole" : n === 1 ? " pole" : " polí") + "</b> (software, kroky, nastavení, GCP, produkty)." });
 Object.assign(T.en, { projUsed: n => "<b>From the processing project: " + n + (n === 1 ? " field" : " fields") + "</b> (software, steps, settings, GCPs, products)." });
 Object.assign(T.cs.fltC, { cAmbiguous: "Nejednoznačné párování (snímek nechán bez logu)", cMatchConflict: "Jedna expozice spárovaná s více snímky", cMatchRejected: "Kandidát v logu odmítnut (příliš daleko)" });
@@ -5171,6 +5512,26 @@ Object.assign(T.en.fltC, { cAmbiguous: "Ambiguous matches (image left without a 
 Object.assign(T.cs.expl, { cAmbiguous: "Když se ke snímku hodí dva záznamy logu zhruba stejně (dva lety se stejným číslováním, dvě expozice těsně po sobě), čtečka nehádá a snímek nechá bez hodnot z logu. Vyřešíte to tak, že načtete jen log daného letu.", cMatchConflict: "Dva různé snímky ukazují na stejnou expozici. Obvykle jde o přejmenovaný nebo zdvojený soubor; jeden z párů je chybný.", cMatchRejected: "Záznam se stejným názvem nebo indexem je od snímku dál než 200 m nebo 120 s, takže patří k jinému letu." });
 Object.assign(T.en.expl, { cAmbiguous: "When two log records fit an image about equally well (two flights with the same numbering, two exposures close in time), the reader does not guess and leaves the image without log values. Load only the log of that flight to resolve it.", cMatchConflict: "Two different images point at the same exposure. Usually a renamed or duplicated file; one of the pairs is wrong.", cMatchRejected: "A record with the same name or index lies more than 200 m or 120 s from the image, so it belongs to another flight." });
 T.cs.fltV.push([" candidates fit about equally", " kandidátů sedí zhruba stejně"], [" m from the image", " m od snímku"], [" s from the image", " s od snímku"], [/exposures ((?:#\d+, )*#\d+) within 0\.5 s of each other/, "expozice $1 v rozmezí 0,5 s"], ["exposure also matched by ", "expozici má i "]);
+
+/* flight state at the exposures (GNSS quality, vibration, mode, autopilot messages), interpolated positions, CSV columns assigned by hand */
+Object.assign(T.cs.fltC, { cAtExposure: "Stav letu při expozicích (GNSS, vibrace, režim, hlášení)", cCsvMap: "CSV se souřadnicemi, ale bez známých názvů sloupců: přiřaďte sloupce níže" });
+Object.assign(T.en.fltC, { cAtExposure: "Flight state at the exposures (GNSS, vibration, mode, messages)", cCsvMap: "CSV with coordinates but unknown column names: assign the columns below" });
+Object.assign(T.cs.expl, {
+  cAtExposure: "Ke každé expozici čtečka přiřadí nejbližší záznam GNSS (do 2 s: počet satelitů, HDOP nebo eph, typ fixu), nejvyšší vibrace v rozmezí ±0,5 s a letový režim. Upozorní na fix horší než 3D, na snímky mimo automatickou misi a na chyby autopilota mezi první a poslední expozicí. Vibrace hodnotí jen u ArduPilotu podle jeho dokumentace: pod 30 m/s² obvykle v pořádku, nad 60 m/s² téměř vždy problémy s udržením polohy a výšky, clipping má být nulový. Tyto prahy se týkají řízení letu, pro neostrost snímků jsou jen orientační; pro PX4 práh vibrací dokumentace neuvádí. Flight Review (PX4) uvádí jako vodítko aspoň 12 satelitů a vodorovnou přesnost pod 1 m. Poloha interpolovaná z trajektorie (záznam expozice ji nemá) je odhad.",
+  cCsvMap: "Názvy sloupců čtečka nezná, ale v prvním řádku dat jsou hodnoty, které vypadají jako stupně. Vyberte sloupce zeměpisné šířky a délky, případně času, výšky a názvu snímku, a potvrďte. Předvybrané jsou první dva takové sloupce, zkontrolujte je. Přiřazení se v záznamu označí jako ruční." });
+Object.assign(T.en.expl, {
+  cAtExposure: "For each exposure the reader takes the nearest GNSS record (within 2 s: satellites, HDOP or eph, fix type), the highest vibration within ±0.5 s and the flight mode. It flags a fix below 3D, images taken outside the automatic mission and autopilot errors between the first and last exposure. Vibration is rated for ArduPilot only, from its documentation: below 30 m/s² normally acceptable, above 60 m/s² nearly always causes problems with position or altitude hold, clipping should be zero. These limits concern flight control and are only indicative for image blur; PX4 documents no vibration limit. Flight Review (PX4) gives at least 12 satellites and horizontal accuracy below 1 m as a guide. A position interpolated from the trajectory (the exposure record has none) is an estimate.",
+  cCsvMap: "The reader does not know the column names, but the first data row has values that look like degrees. Choose the latitude and longitude columns, and optionally time, height and image name, then apply. The first two such columns are preselected; check them. The assignment is marked as manual in the record." });
+Object.assign(T.cs.fltN, { "csv-unmapped": "sloupce nepřiřazeny", "csv-mapped": "sloupce přiřazeny ručně" }); Object.assign(T.en.fltN, { "csv-unmapped": "columns not assigned", "csv-mapped": "columns assigned by hand" });
+Object.assign(T.cs.fltK, { "csv-columns": "CSV (neznámé sloupce)" }); Object.assign(T.en.fltK, { "csv-columns": "CSV (unknown columns)" });
+Object.assign(T.cs.on, { nInterp: "Poloha interpolovaná z trajektorie logu na čas expozice (záznam expozice polohu nemá); jde o odhad." });
+Object.assign(T.en.on, { nInterp: "Position interpolated from the log trajectory to the exposure time (the exposure record has none); an estimate." });
+Object.assign(T.cs, { csvMapH: "Přiřazení sloupců CSV", csvMap_lat: "Šířka", csvMap_lon: "Délka", csvMap_t: "Čas (UTC)", csvMap_h: "Výška", csvMap_name: "Snímek", csvMapGo: "Použít", csvMapNeed: "Vyberte šířku a délku", fltInterp: "interpolováno z trajektorie" });
+Object.assign(T.en, { csvMapH: "CSV column assignment", csvMap_lat: "Latitude", csvMap_lon: "Longitude", csvMap_t: "Time (UTC)", csvMap_h: "Height", csvMap_name: "Image", csvMapGo: "Apply", csvMapNeed: "Choose latitude and longitude", fltInterp: "interpolated from the trajectory" });
+T.cs.fltV.unshift(["ellipsoid (GPS_RAW_INT alt_ellipsoid, interpolated to CAMERA_TRIGGER)", "elipsoid (GPS_RAW_INT alt_ellipsoid, interpolováno na CAMERA_TRIGGER)"], ["autopilot errors and warnings: ", "chyby a varování autopilota: "]);
+T.cs.fltV.push(["GPS_RAW_INT alt: above mean sea level (interpolated to CAMERA_TRIGGER)", "GPS_RAW_INT alt: nad střední hladinou moře (interpolováno na CAMERA_TRIGGER)"], ["CSV, coordinate columns not recognised by name", "CSV, sloupce souřadnic nerozpoznány podle názvu"], [" (assigned by hand)", " (přiřazeno ručně)"],
+  [" satellites (min ", " satelitů (min "], ["below 3D fix: ", "fix horší než 3D: "], ["vibration max ", "vibrace max "], [" (over 30: ", " (nad 30: "], [", over 60: ", ", nad 60: "],
+  ["outside the automatic mission: ", "mimo automatickou misi: "], [/(: | · )mode /, "$1režim "], ["interpolated positions: ", "interpolované polohy: "]);
 /* ---------------------------------------------------------------- tab: flight (logs read by OSLFlight; function declarations only, this part follows the UI) */
 function flightImages() { return batchFiles().map(f => ({ name: f.name, S: f.res.summary, captureId: tv(f, "CaptureId") != null ? String(tv(f, "CaptureId")) : null, c2pa: !!f.res.summary.c2pa })); }
 function flightLogs() { return (st.logs || []).filter(l => l.L).map(l => l.L); }
@@ -5219,7 +5580,7 @@ function renderFlight() {
   const FS = flightState(), imgs = FS.imgs, F = FS.F, checks = unread.concat(F.checks);
   const main = logs.find(l => l.exposures === F.exposures) || null;
   let h = '<p class="note small">' + esc(t("fltIntro", logs.length, imgs.length)) + (busy ? " " + esc(t("fltReading")) : "") + "</p>";
-  h += '<h3 class="sub">' + esc(t("fltChecksH")) + '</h3><ul class="checks">' + checks.map(chk).join("") + "</ul>" + geomHtml(FS.G);
+  h += '<h3 class="sub">' + esc(t("fltChecksH")) + '</h3><ul class="checks">' + checks.map(chk).join("") + "</ul>" + csvMapHtml() + geomHtml(FS.G);
   h += '<h3 class="sub">' + esc(t("fltMapH")) + '</h3><div class="plot"><canvas id="fltCv" role="img" aria-label="' + esc(t("fltMapAria")) + '"></canvas></div>';
   h += '<div class="legend">' + ["fixed", "ppk", "float", "single", "none"].map(k => '<span><span aria-hidden="true" style="color:var(--' + RTK_ST[k][0] + ')">' + RTK_ST[k][1] + "</span> " + esc(t("rtk_" + k)) + "</span>").join("") + '<span><span aria-hidden="true">—</span> ' + esc(t("fltLegendTrk")) + '</span><span><span aria-hidden="true">◯</span> ' + esc(t("fltLegendImg")) + "</span></div>";
   h += '<h3 class="sub">' + esc(t("fltLogsH")) + "</h3>" + logs.map(l => {
@@ -5231,11 +5592,27 @@ function renderFlight() {
     const N = 200, byN = new Map(F.matches.filter(m => m.log === main.name).map(m => [m.n, m]));
     h += '<h3 class="sub">' + esc(t("fltExpH")) + " · " + esc(main.name) + '</h3><div class="tw"><table class="bt"><thead><tr><th>#</th><th>' + esc(t("thFile")) + "</th><th>" + esc(t("fltTime")) + "</th><th>" + esc(t("thLatLon")) + "</th><th>h</th><th>σH / σV</th><th>" + esc(t("fltSolution")) + "</th><th>" + esc(t("fltImage")) + "</th></tr></thead><tbody>" +
       main.exposures.slice(0, N).map(e => { const m = byN.get(e.n), sH = e.sH != null ? e.sH : e.sN != null ? Math.max(e.sN, e.sE) : null, q = e.q || "–", k = RTK_ST[q] ? q : "other";
-        return '<tr><td class="n">' + esc(e.n) + '</td><td class="fn0">' + esc(e.name || e.captureId || "–") + '</td><td class="n">' + esc(e.t != null ? fltTime(e.t) : "–") + '</td><td class="n">' + (e.lat != null ? fmt(e.lat, 7, false) + "<br>" + fmt(e.lon, 7, false) : "–") + '</td><td class="n">' + (e.h != null ? fmt(+e.h, 2) : "–") + '</td><td class="n">' + (sH != null ? fmt(sH, 3) : "–") + " / " + (e.sV != null ? fmt(e.sV, 3) : "–") + '</td><td><span class="chip s-' + ({ ok: "file", warn: "missing", bad: "bad", info: "derived", na: "na" })[(RTK_ST[k] || RTK_ST.other)[0]] + '"><i>' + (RTK_ST[k] || RTK_ST.other)[1] + "</i>" + esc(RTK_ST[q] ? t("rtk_" + q) : q) + "</span></td><td>" + (m ? esc(m.image) : "–") + "</td></tr>"; }).join("") + "</tbody></table></div>" +
+        return '<tr><td class="n">' + esc(e.n) + '</td><td class="fn0">' + esc(e.name || e.captureId || "–") + '</td><td class="n">' + esc(e.t != null ? fltTime(e.t) : "–") + '</td><td class="n"' + (e.interp ? ' title="' + esc(t("fltInterp")) + '"' : "") + ">" + (e.lat != null ? (e.interp ? "≈ " : "") + fmt(e.lat, 7, false) + "<br>" + (e.interp ? "≈ " : "") + fmt(e.lon, 7, false) : "–") + '</td><td class="n">' + (e.h != null ? fmt(+e.h, 2) : "–") + '</td><td class="n">' + (sH != null ? fmt(sH, 3) : "–") + " / " + (e.sV != null ? fmt(e.sV, 3) : "–") + '</td><td><span class="chip s-' + ({ ok: "file", warn: "missing", bad: "bad", info: "derived", na: "na" })[(RTK_ST[k] || RTK_ST.other)[0]] + '"><i>' + (RTK_ST[k] || RTK_ST.other)[1] + "</i>" + esc(RTK_ST[q] ? t("rtk_" + q) : q) + "</span></td><td>" + (m ? esc(m.image) : "–") + "</td></tr>"; }).join("") + "</tbody></table></div>" +
       (main.exposures.length > N ? '<p class="note small">' + esc(t("fltExpNote", N)) + "</p>" : "");
   }
   h += '<div class="toolbar"><button class="btn" id="x-fcsv">' + esc(t("fltCsv")) + '</button><button class="btn" id="x-fjson">' + esc(t("fltJson")) + '</button></div><p class="note small">' + esc(t("fltXNote")) + "</p>";
   P.innerHTML = h; drawFlight();
+}
+// a CSV with coordinates under unrecognised column names: the user assigns the columns, the file is read again with that assignment
+const CSV_MAP_KEYS = ["lat", "lon", "t", "h", "name"];
+function csvMapHtml() {
+  const L0 = (st.logs || []).map((e, i) => [e, i]).filter(([e]) => e.L && e.L.kind === "csv-columns"); if (!L0.length) return "";
+  return '<h3 class="sub">' + esc(t("csvMapH")) + "</h3>" + L0.map(([e, i]) => '<div class="toolbar csvmap"><b>' + esc(e.name) + "</b>" + CSV_MAP_KEYS.map(k => "<label>" + esc(t("csvMap_" + k)) + ' <select data-cm="' + i + '" data-ck="' + k + '"><option value="">–</option>' +
+    e.L.csv.cols.map((c, j) => '<option value="' + j + '"' + (e.L.csv.guess[k] === j ? " selected" : "") + ">" + esc(c || "#" + (j + 1)) + "</option>").join("") + "</select></label>").join("") +
+    '<button class="btn" data-cmgo="' + i + '">' + esc(t("csvMapGo")) + "</button></div>").join("");
+}
+async function csvRemap(i, b) {
+  const e = st.logs[i], map = {}; if (!e || !e.L || !e.L.csv) return;
+  for (const s of document.querySelectorAll('select[data-cm="' + i + '"]')) if (s.value !== "") map[s.dataset.ck] = e.L.csv.cols[+s.value];
+  if (map.lat == null || map.lon == null) { b.textContent = t("csvMapNeed"); return; }
+  e.busy = true; renderFiles(); afterLogs();
+  try { const L2 = await OSLFlight.parse(e.src, e.name, { csvMap: map }); if (L2) e.L = L2; } catch (err) { e.err = String(err && err.message || err); }
+  e.busy = false; st._fk = null; renderFiles(); afterLogs();
 }
 function geomHtml(G) {
   if (!G || !G.checks || !G.checks.length) return "";
@@ -5268,6 +5645,7 @@ function drawFlight() {
 function median(a) { const v = a.filter(x => x != null && isFinite(x)).sort((x, y) => x - y); if (!v.length) return null; const m = v.length >> 1; return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2; }
 function flightClick(b) {
   if (b.dataset.lg != null) { setTab("flt"); return true; }
+  if (b.dataset.cmgo != null) { csvRemap(+b.dataset.cmgo, b); return true; }
   if (b.dataset.rml != null) { st.logs.splice(+b.dataset.rml, 1); renderFiles(); afterLogs(); return true; }
   if (b.id === "x-fcsv") { download("flight_exposures.csv", "﻿" + OSLFlight.exposuresCSV(flightLogs(), st.flight), "text/csv;charset=utf-8"); return true; }
   if (b.id === "x-fjson") { download("flight_summary.json", OSLFlight.flightJSON(flightLogs(), st.flight), "application/json"); return true; }
@@ -5313,7 +5691,8 @@ const chip = (cls, icon, txt) => '<span class="chip ' + cls + '"><i aria-hidden=
 const ST_ICON = { file: "✓", derived: "ƒ", log: "⇄", missing: "!", na: "–", notapp: "·" };
 const stChip = s => chip("s-" + s, ST_ICON[s], t("st_" + s));
 // derived values that rest on an assumption (flat ground at take-off height, nadir view, one image for a batch, a guess from tags) are shown as estimates
-const EST_NOTE = /^(nAgl|nDist|nGsd|nGeo|nOneImage|nGnssMode|nSensorType|nWx)$/, isEst = r => r.st === "derived" && EST_NOTE.test(r.note || "");
+// a position from the log interpolated to the exposure time (nInterp) is an estimate as well
+const EST_NOTE = /^(nAgl|nDist|nGsd|nGeo|nOneImage|nGnssMode|nSensorType|nWx|nInterp)$/, isEst = r => (r.st === "derived" || r.st === "log") && EST_NOTE.test(r.note || "");
 const stChipR = r => isEst(r) ? chip("s-derived", "≈", t("st_estimate")) : stChip(r.st);
 const cssv = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
@@ -5892,7 +6271,7 @@ function oslRules(e, B) {
   if (S.software) F("sensor.firmware", S.software, "EXIF:IFD0:Software", "nFirmware");
   if (S.make || S.model) F("sensor.sensor_model", [S.make, S.model].filter(Boolean).join(" "), "EXIF:IFD0:Make, Model");
   if (S.serial) F("sensor.sensor_serial", S.serial, S.serialSrc);
-  if (S.sensorType) D("sensor.sensor_type", S.sensorType, S.thermal ? "JPEG APP3–APP5" : S.band ? S.band.src : "File:FileType, ColorComponents", "nSensorType");
+  if (S.sensorType) D("sensor.sensor_type", S.sensorType, S.thermal ? ({ "DJI R-JPEG": "JPEG APP3–APP5 (DJI)", "FLIR radiometric JPEG": "JPEG APP1 FLIR (FFF)", ThermoTIFF: "EXIF:IFD0:Software, ImageDescription (ThermoTIFF)" })[S.thermal.kind] || S.thermal.kind : S.band ? S.band.src : "File:FileType, ColorComponents", "nSensorType");
   if (S.sensorPxW) F("sensor.image_size", [S.sensorPxW, S.sensorPxH], tv(e, "ExifImageWidth") != null ? "EXIF:ExifIFD:ExifImageWidth, ExifImageHeight" : "ImageWidth, ImageHeight");
   if (S.bitDepth) F("sensor.bit_depth", S.bitDepth, "BitsPerSample");
   if (S.hfov) D("sensor.field_of_view", [+S.hfov.toFixed(2), +S.vfov.toFixed(2)], "Derived:FieldOfView", "nFov");
@@ -5926,7 +6305,24 @@ function oslRules(e, B) {
     if (S.dlsAttitude) (/rad/.test(S.dlsAttitude.src) ? D : F)("multispectral.dls_attitude", [S.dlsAttitude.roll, S.dlsAttitude.pitch, S.dlsAttitude.yaw].map(x => +x.toFixed(2)), S.dlsAttitude.src);
     const em = tv(e, "ExposureMode", /^EXIF:/); if (em != null && isFinite(+em)) F("multispectral.exposure_mode", +em === 1 ? "fixed" : "auto", "EXIF:ExifIFD:ExposureMode", "nExpMode");
   }
-  if (th) { X("thermal.fpa_temperature", "", "nSdk"); X("thermal.capture_measurement_params", "", "nApp4"); }
+  if (th) {
+    const T0 = S.thermal || {}, P0 = T0.params, TT = T0.thermotiff;
+    if (S.sensorTemp != null) F("thermal.fpa_temperature", S.sensorTemp, "XMP:Camera:SensorTemperature", "nFpaXmp"); else X("thermal.fpa_temperature", "", /^DJI|^ThermoTIFF/.test(T0.kind || "") ? "nFpaDji" : "nSdk");
+    if (P0) {
+      const p = {}; for (const [k, v] of Object.entries(P0)) if (k !== "src" && v != null) p[k] = v;
+      F("thermal.capture_measurement_params", p, P0.src, "nCamSet");
+      if (P0.emissivity != null) D("reference.emissivity_setting", P0.emissivity, P0.src, "nEmisCam");
+    } else X("thermal.capture_measurement_params", "", TT ? "nTtCap" : "nApp4");
+    if (T0.encoding) D("thermal.image_encoding", T0.encoding, T0.encodingSrc, TT ? "nEncTt" : "nEnc");
+    if (T0.planck) { const q = T0.planck; F("thermal.planck_constants", { R1: q.R1, B: q.B, F: q.F, O: q.O, R2: q.R2 }, q.src + ": PlanckR1, B, F, O, R2", "nPlanck"); }
+    if (S.band && S.band.wl > 3000 && S.band.fwhm) D("thermal.spectral_range", [+((S.band.wl - S.band.fwhm / 2) / 1000).toFixed(2), +((S.band.wl + S.band.fwhm / 2) / 1000).toFixed(2)], "XMP:Camera:CentralWavelength, WavelengthFWHM", "nSpecRange");
+    if (TT) {
+      const p = {}; for (const [k, v] of Object.entries(TT.params)) if (v != null) p[k] = v;
+      F("processing.thermal_settings", Object.assign({ method: "DJI Thermal SDK, raw values to temperature (degrees Celsius)" }, p, TT.source ? { source_image: TT.source } : {}), "EXIF:IFD0:ImageDescription", "nTtSet");
+      F("processing.atmospheric_model", "DJI Thermal SDK built-in correction (method not published; inputs: object distance, relative humidity, ambient and reflected temperature)", "EXIF:IFD0:ImageDescription", "nTtAtm");
+      F("processing.software", [{ name: "ThermoTIFF", version: TT.version || "" }, { name: "DJI Thermal SDK", version: TT.sdk_api ? "API " + TT.sdk_api : "" }], "EXIF:IFD0:Software, ImageDescription", "nTtSw");
+    }
+  }
   /* mission (from all loaded files) */
   const multi = B.n > 1 ? "nBatch" : "";
   if (B.t0) { D("mission.start_utc", B.t0, multi ? t("srcBatch", B.n) : S.utcSrc, multi); D("mission.end_utc", B.t1, multi ? t("srcBatch", B.n) : S.utcSrc, multi || "nOneImage"); }
@@ -5941,7 +6337,8 @@ function oslRules(e, B) {
   if (B.oblique != null) D("mission.oblique_images", B.oblique ? [true, +B.tiltMax.toFixed(1)] : false, "XMP:drone-dji:GimbalPitchDegree", multi ? "nOblique" : "nOneImage");
   /* environment */
   if (S.sun) { D("environment.solar_zenith", +(90 - S.sun.elevation).toFixed(2), "Derived:SunElevation (NOAA)", "nSun"); D("environment.solar_azimuth", +S.sun.azimuth.toFixed(2), "Derived:SunAzimuth (NOAA)", "nSun"); }
-  if (S.altRel != null && S.gimbal && S.gimbal.pitch != null && S.gimbal.pitch < -80) D("environment.sensor_target_distance", S.altRel, "XMP:drone-dji:RelativeAltitude", "nDist");
+  if (S.lrf && S.lrf.measured) F("environment.sensor_target_distance", +S.lrf.distance.toFixed(3), "XMP:drone-dji:LRFTargetDistance", "nLrf");
+  else if (S.altRel != null && S.gimbal && S.gimbal.pitch != null && S.gimbal.pitch < -80) D("environment.sensor_target_distance", S.altRel, "XMP:drone-dji:RelativeAltitude", S.lrf ? "nDistNoLrf" : "nDist");
   const amb = [["AmbientTemperature", "environment.air_temperature"], ["Humidity", "environment.relative_humidity"], ["Pressure", "environment.air_pressure"]];
   for (const [tg, k] of amb) { const v = tv(e, tg, /^EXIF:/); if (v != null) F(k, num(v), "EXIF:ExifIFD:" + tg, "nAmb"); }
   const W = wxFor(); if (W) { for (const [k, v] of Object.entries(W.vals)) if (v != null && !R["environment." + k]) D("environment." + k, v, k === "cloud_cover" ? W.src + ", in %" : W.src, "nWx"); if (!R["environment.weather_source"]) D("environment.weather_source", W.srcLong, W.src, "nWx"); }
@@ -6004,7 +6401,7 @@ function mergeFlight(e, rows) {
     if (x) { r.img = have(r) ? r.val : null; r.imgSrc = r.img != null ? r.src : null; r.cmp = r.img != null ? OSLFlight.agree(r.field, r.val, x.val, im) : null;
       // heights: a difference is only judged when the image says its height is ellipsoidal; otherwise the number is shown, not a verdict
       if (r.cmp && r.field === "alt_ellipsoid_m" && r.note !== "ellipsoid-sensefly") { r.cmpDiff = +r.img - +x.val; r.cmp = "not_comparable"; }
-      r.st = "log"; r.val = typeof x.val === "number" ? String(x.val) : x.val; r.src = x.src; r.note = ""; continue; }
+      r.st = "log"; r.val = typeof x.val === "number" ? String(x.val) : x.val; r.src = x.src; r.note = x.note || ""; continue; }
     if (r.block === "image_log" && im && r.field === "alt_ellipsoid_m" && im.cols._hNote) r.logNote = im.cols._hNote;
     if (m && (!have(r) || LOG_FIRST.test(key))) { r.img = have(r) ? r.val : null; r.imgSrc = r.img != null ? r.src : null; r.cmp = r.img != null && key === "mission.gnss_mode" ? (String(r.img) === String(m.val) ? "same" : "differ") : null; r.st = "log"; r.val = m.val; r.src = m.src; r.note = m.note; if (m.log) r.log = m.log; continue; }
     if (geo[key] != null && !have(r) && !(m && m.note && /^nPlan/.test(m.note))) { r.st = "derived"; r.val = geo[key]; r.src = gsrc; r.note = "nGeo"; }
@@ -6168,7 +6565,7 @@ function download(name, text, mime) {
 function ilRow(f) {
   const row = {}; for (const x of M.imageLog(f.res)) row[x.column] = x.value;
   const im = flightState().O.images[f.name];
-  if (im) { for (const [c, x] of Object.entries(im.cols)) if (c[0] !== "_") row[c] = String(x.val); row.aux = [row.aux, "timestamp, position, RTK and sigma from " + im.log + " #" + im.n].filter(Boolean).join("; "); row._log = im.log; }
+  if (im) { for (const [c, x] of Object.entries(im.cols)) if (c[0] !== "_") row[c] = String(x.val); row.aux = [row.aux, "timestamp, position, RTK and sigma from " + im.log + " #" + im.n + (im.cols.lat_deg && im.cols.lat_deg.note === "nInterp" ? " (position interpolated from the trajectory, an estimate)" : "")].filter(Boolean).join("; "); row._log = im.log; }
   return row;
 }
 function imageLogCSV(F) { const cols = M.IMAGE_LOG_COLUMNS, lines = [cols.join(",")]; for (const f of F) { const row = ilRow(f); lines.push(cols.map(c => M.csvCell(row[c] == null ? "" : row[c])).join(",")); } return lines.join("\r\n") + "\r\n"; }
@@ -6236,6 +6633,7 @@ function metaBuild(F) {
   const PR = OSLFlight.procRecord((st.logs || []).filter(l => l.L).map(l => l.L));
   if (PR.length) {
     const SRCS = { p4d: { software: "software/projectVersion", steps: "options: steps switched on and their settings", photogrammetry_settings: "options/initial, cameras/rig", adjustment_quality: "inputs: images (enabled, accuracyXY/Z), gcps; options/ortho/meanResolution", output_crs: "inputs/coordinateSystems/output" },
+      thermotiff: { software: "software (processing_record.json) or dji_api_version (conversion_log.csv)", steps: "the conversion run: parameters, image counts", thermal_settings: "parameters of the conversion (distance, humidity, emissivity, reflection, ambient) and their source", atmospheric_model: "DJI Thermal SDK, the converter ThermoTIFF uses", photogrammetry_settings: "not applicable", adjustment_quality: "not applicable" },
       metashape: { software: "meta Info/LastSavedSoftwareVersion", steps: "meta <Step>/… of the chunk", photogrammetry_settings: "settings accuracy_*, meta AlignCameras, OptimizeCameras", adjustment_quality: "cameras (transform), markers (reference enabled, frame projections), meta OptimizeCameras/sigma0", output_crs: "chunk reference" } };
     out.processing = PR.map((r, i) => { for (const k of Object.keys(r.processing)) fields.push({ path: "processing[" + i + "]." + k, pr: { log: r.log, source: r.log + ": " + (k === "workflow_id" ? "assigned by the reader, one per project" : (SRCS[r.source] || {})[k] || k) } }); return r.processing; });
     const prods = PR.flatMap(r => r.products.map(p => ({ p, log: r.log })));
@@ -6292,14 +6690,14 @@ async function provenanceJSON(F) {
     const im = FS.O.images[f.name];
     for (const x of M.imageLog(f.res)) {
       if (x.column === "aux") continue;
-      const c = cols[x.column] || (cols[x.column] = { image: 0, derived: 0, flight_log: 0, empty: 0, sources: new Set() });
-      if (im && im.cols[x.column]) { c.flight_log++; c.sources.add(im.log); }
+      const c = cols[x.column] || (cols[x.column] = { image: 0, derived: 0, flight_log: 0, flight_log_interpolated: 0, empty: 0, sources: new Set() });
+      if (im && im.cols[x.column]) { c.flight_log++; if (im.cols[x.column].note === "nInterp") c.flight_log_interpolated++; c.sources.add(im.log); }
       else if (x.status === "file") { c.image++; if (x.source) c.sources.add(x.source); }
       else if (x.status === "derived") { c.derived++; if (x.source) c.sources.add(x.source); }
       else c.empty++;
     }
   }
-  const ilCols = Object.fromEntries(Object.entries(cols).map(([k, c]) => [k, Object.assign(Object.fromEntries(["image", "derived", "flight_log", "empty"].filter(n => c[n]).map(n => [n, c[n]])), c.sources.size ? { sources: [...c.sources] } : {})]));
+  const ilCols = Object.fromEntries(Object.entries(cols).map(([k, c]) => [k, Object.assign(Object.fromEntries(["image", "derived", "flight_log", "flight_log_interpolated", "empty"].filter(n => c[n]).map(n => [n, c[n]])), c.sources.size ? { sources: [...c.sources] } : {})]));
   const mj = metadataJSON(F), il = imageLogCSV(F), now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const reads = inputs.map(x => x.read_utc).filter(Boolean).sort();
   const collections = [];
@@ -6313,11 +6711,14 @@ async function provenanceJSON(F) {
       if (!agents.some(a => a.id === id)) agents.push({ id, type: "software", name: sw.name, version: sw.version || "unknown" }); return id; });
     const base = prodIx; prodIx += r.products.length;
     // the loaded images the project lists (by file name); the step used them, not necessarily only them
-    const inProj = new Set(r.images), mine = F.filter(f => inProj.has(f.name.replace(/\.[^.]*$/, "").toLowerCase())), used = mine.length && mine.length === F.length && allImg === "images" ? ["images"] : mine.map(f => imgId.get(f));
+    // ThermoTIFF: the loaded TIFFs are the outputs of the conversion, the R-JPEGs its inputs (same file name, other extension)
+    const outImg = f => r.source === "thermotiff" && /\.tiff?$/i.test(f.name);
+    const inProj = new Set(r.images), mineAll = F.filter(f => inProj.has(f.name.replace(/\.[^.]*$/, "").toLowerCase())), mine = mineAll.filter(f => !outImg(f)), made = mineAll.filter(outImg).map(f => imgId.get(f));
+    const used = mine.length && mine.length === F.length && allImg === "images" ? ["images"] : mine.map(f => imgId.get(f));
     for (const s of r.steps) {
       const gen = r.made.map((o, k) => o === s.order ? "metadata.json#products[" + (base + k) + "]" : null).filter(Boolean);
       const a = { id: "activity:" + r.wf.toLowerCase() + "-" + s.order, type: "processing", order: s.order, name: s.name, agent: swAgents.length === 1 ? swAgents[0] : swAgents, workflow_id: r.wf,
-        used, generated: gen, recorded_in: logId.get(r.log),
+        used, generated: s.order === 1 ? gen.concat(made) : gen, recorded_in: r.logs.length > 1 ? r.logs.map(n => logId.get(n)) : logId.get(r.log),
         parameters: Object.assign({}, s.parameters, s.duration_s != null ? { duration_s: s.duration_s } : {}, s.memory_bytes != null ? { memory_bytes: s.memory_bytes } : {}, s.software_version ? { software_version: s.software_version } : {}) };
       acts.push(a);
     }
