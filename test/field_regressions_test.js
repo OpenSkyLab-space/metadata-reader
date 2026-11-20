@@ -1,4 +1,4 @@
-// Regression tests for vendor conventions found in field data (Reader 1.2.0).
+// Regression tests for vendor conventions found in field data (Reader 1.2.0; thermal cases 1.5.0).
 // All files are built here from scratch: the structure follows the vendors, every value is synthetic.
 // Usage: node test/field_regressions_test.js
 "use strict";
@@ -68,6 +68,41 @@ function sunshine() {
   return b.toString("base64");
 }
 
+/* ---- thermal (Reader 1.5.0): DJI R-JPEG APP3/APP4/APP7, FLIR FFF in APP1, ThermoTIFF TIFF; layouts as in ExifTool DJI.pm and FLIR.pm, values synthetic */
+function jpegSegs(tiff, xmp, segs) {
+  const parts = [Buffer.from([0xff, 0xd8])];
+  if (tiff) parts.push(seg(0xe1, Buffer.concat([Buffer.from("Exif\0\0", "latin1"), tiff])));
+  if (xmp) parts.push(seg(0xe1, Buffer.concat([Buffer.from("http://ns.adobe.com/xap/1.0/\0", "latin1"), Buffer.from(xmp, "utf8")])));
+  for (const [m, b] of segs) parts.push(seg(m, b));
+  parts.push(Buffer.from([0xff, 0xd9])); return Buffer.concat(parts);
+}
+function djiApp4v2(v) { /* 32-byte prefix "iirp", floats at +32, detection bytes 2c 01 20 00 at +64 */
+  const b = Buffer.alloc(256); Buffer.from([0xff, 0xd2, 0xd1, 0xff]).copy(b, 0); b.write("iirp", 4, "latin1");
+  [v.amb, v.dist, v.e, v.rh, v.refl].forEach((x, i) => b.writeFloatLE(x, 32 + 4 * i)); Buffer.from([0x2c, 0x01, 0x20, 0x00]).copy(b, 64); return b;
+}
+function djiApp4v3(v) { const b = Buffer.alloc(64); Buffer.from([0xaa, 0x55, 0x38, 0x00]).copy(b, 32); b.writeUInt16LE(v.rh, 36); b.writeUInt16LE(v.dist * 10, 38); b.writeUInt16LE(v.e * 100, 40); b.writeUInt16LE(v.refl * 10, 42); return b; }
+const djiDbg = id => Buffer.concat([Buffer.from("DJI-DBG\0[sensor_id:" + id, "latin1"), Buffer.alloc(6), Buffer.from("]", "latin1")]);
+const DJINS = { "drone-dji": "http://www.dji.com/drone-dji/1.0/" };
+const djiThermalJpeg = (app4, xmpProps) => jpegSegs(tiffBlock([[0x10f, 2, "DJI"], [0x110, 2, "ExampleT"]], [dto("2030:06:01 12:00:00")], null),
+  xmpPacket(DJINS, Object.assign({ "drone-dji:RelativeAltitude": "+60.000", "drone-dji:GimbalPitchDegree": "-90.00" }, xmpProps)),
+  [[0xe3, Buffer.alloc(32)], [0xe4, app4], [0xe7, djiDbg("SYN0000TEST")]]);
+function flirJpeg() {
+  /* FFF: 64-byte header (big-endian, version 100), directory of 2 records (RawData, CameraInfo); records little-endian */
+  const raw = Buffer.alloc(32 + 4 * 2 * 2); raw.writeUInt16LE(2, 0); raw.writeUInt16LE(4, 2); raw.writeUInt16LE(2, 4);
+  const ci = Buffer.alloc(0x470); ci.writeUInt16LE(2, 0);
+  const fl = (o, x) => ci.writeFloatLE(x, o), K = c => c + 273.15;
+  fl(0x20, 0.97); fl(0x24, 30); fl(0x28, K(15)); fl(0x2c, K(18)); fl(0x30, K(18)); fl(0x34, 1); fl(0x3c, 0.6);
+  fl(0x58, 12345.6); fl(0x5c, 1400); fl(0x60, 1); fl(0x70, 0.0066); fl(0x74, 0.0126); fl(0x78, -0.0023); fl(0x7c, -0.0067); fl(0x80, 1.9);
+  fl(0x90, K(150)); fl(0x94, K(-25)); ci.writeInt32LE(-500, 0x308); fl(0x30c, 0.5); ci.writeUInt16LE(9, 0x464);
+  const hdr = Buffer.alloc(64); hdr.write("FFF\0", 0, "latin1"); hdr.write("SYNTH", 4, "latin1"); hdr.writeUInt32BE(100, 0x14); hdr.writeUInt32BE(64, 0x18); hdr.writeUInt32BE(2, 0x1c);
+  const dir = Buffer.alloc(64), o1 = 128, o2 = o1 + raw.length;
+  dir.writeUInt16BE(1, 0); dir.writeUInt32BE(o1, 12); dir.writeUInt32BE(raw.length, 16); dir.writeUInt16BE(0x20, 32); dir.writeUInt32BE(o2, 44); dir.writeUInt32BE(ci.length, 48);
+  const fff = Buffer.concat([hdr, dir, raw, ci]), half = 700;
+  const chunk = (k, d) => Buffer.concat([Buffer.from("FLIR\0", "latin1"), Buffer.from([1, k, 1]), d]);
+  return jpegSegs(tiffBlock([[0x10f, 2, "ExampleIR"], [0x110, 2, "Duo"]], [dto("2030:06:01 12:00:00")], null), null, [[0xe1, chunk(0, fff.subarray(0, half))], [0xe1, chunk(1, fff.subarray(half))]]);
+}
+const TT_DESC = "Temperature in degrees Celsius (float32). Converted from DJI_0001_T.JPG by ThermoTIFF 0.1.0 using DJI Thermal SDK API 0x103. distance=20 m; humidity=55 %; emissivity=0.96; reflection=21.5 C; ambient=19 C";
+
 const CASES = [
   ["dls2_irradiance.tif", () => tiffBlock([[0x10f, 2, "MicaSense"], [0x110, 2, "RedEdge-P"]], [dto("2030:06:01 10:00:00")], null,
     { xmp: xmpPacket({ Camera: CAMNS, DLS: DLSNS }, { "Camera:BandName": "Blue", "Camera:CentralWavelength": "475", "Camera:Irradiance": "50.5", "DLS:HorizontalIrradiance": "48.0", "DLS:SpectralIrradiance": "50.5" }) }),
@@ -92,6 +127,21 @@ const CASES = [
     Buffer.concat([Buffer.from([0, 0, 0]), Buffer.from([0xff, 0xd8, 0xff, 0xd9])])),
     r => r.summary.band && r.summary.band.name === "Orange,Cyan,NIR" && r.summary.clockSuspect === "reset" && r.warnings.some(w => /JPEG at \+3/.test(w.text))
       && M.imageLog(r).find(c => c.column === "timestamp_utc").note === "clock-suspect"],
+  ["dji_rjpeg_params2.jpg", () => djiThermalJpeg(djiApp4v2({ amb: 22, dist: 5, e: 0.95, rh: 0.6, refl: 20 }), { "drone-dji:LRFStatus": "Normal", "drone-dji:LRFTargetDistance": "0.000" }),
+    r => { const T = r.summary.thermal, P = T && T.params; return P && P.emissivity === 0.95 && P.object_distance_m === 5 && P.relative_humidity_pct === 60 && P.reflected_temperature_c === 20 && P.ambient_temperature_c === 22
+      && T.sensorId === "SYN0000TEST" && r.summary.lrf && r.summary.lrf.measured === false && r.summary.sensorType === "thermal_LWIR" && T.checks.some(c => c[0] === "object_distance_m")
+      && r.groups.some(g => g.id === "APP4:DJI" && g.tags.some(t => t.name === "ThermalParamsPrefix" && t.value === "iirp")) && M.imageLog(r).find(c => c.column === "fpa_temp_c").note === "not-written"; }],
+  ["dji_rjpeg_params3.jpg", () => djiThermalJpeg(djiApp4v3({ rh: 70, dist: 12.5, e: 0.9, refl: 23.4 }), { "drone-dji:LRFStatus": "Normal", "drone-dji:LRFTargetDistance": "61.250" }),
+    r => { const P = r.summary.thermal.params; return P.relative_humidity_pct === 70 && P.object_distance_m === 12.5 && P.emissivity === 0.9 && Math.abs(P.reflected_temperature_c - 23.4) < 1e-9 && P.ambient_temperature_c == null && r.summary.lrf.measured === true && r.summary.lrf.distance === 61.25; }],
+  ["flir_fff.jpg", flirJpeg,
+    r => { const T = r.summary.thermal, P = T && T.params; return T.kind === "FLIR radiometric JPEG" && P.emissivity === 0.97 && P.object_distance_m === 30 && P.reflected_temperature_c === 15 && P.atmospheric_temperature_c === 18 && P.relative_humidity_pct === 60
+      && T.planck.B === 1400 && T.planck.O === -500 && T.planck.R2 === 0.5 && T.range[0] === -25 && T.range[1] === 150 && /4 x 2/.test(T.encoding)
+      && r.groups.some(g => g.id === "APP1:FLIR" && g.tags.some(t => t.name === "CreatorSoftware" && t.value === "SYNTH") && g.tags.some(t => t.name === "FrameRate" && t.value === 9)); }],
+  ["thermotiff.tif", () => tiffBlock([[0x10e, 2, TT_DESC], [0x10f, 2, "DJI"], [0x110, 2, "ExampleT"], [0x131, 2, "ThermoTIFF 0.1.0"], [0x102, 3, [32]], [0x153, 3, [3]],
+    [0xa480, 2, '<GDALMetadata><Item name="UNITTYPE" sample="0" role="unittype">degC</Item></GDALMetadata>']], [dto("2030:06:01 12:00:00")], null),
+    r => { const T = r.summary.thermal; return T && T.kind === "ThermoTIFF" && T.thermotiff.version === "0.1.0" && T.thermotiff.sdk_api === "0x103" && T.thermotiff.source === "DJI_0001_T.JPG"
+      && T.thermotiff.params.object_distance_m === 20 && T.thermotiff.params.relative_humidity_pct === 55 && T.thermotiff.params.emissivity === 0.96 && T.thermotiff.params.reflected_temperature_c === 21.5 && T.thermotiff.params.ambient_temperature_c === 19
+      && T.params === null && /UNITTYPE degC/.test(T.encoding) && r.summary.sensorType === "thermal_LWIR"; }],
   ["dji_rtk_int.jpg", () => jpeg(tiffBlock([[0x10f, 2, "DJI"], [0x110, 2, "ExampleDrone"]], [dto("2030:06:01 12:00:00")], null),
     xmpPacket({ "drone-dji": "http://www.dji.com/drone-dji/1.0/" }, { "drone-dji:RtkFlag": "49", "drone-dji:RtkStdLon": "0.1", "drone-dji:RtkStdLat": "0.1", "drone-dji:RtkStdHgt": "0.2" })),
     r => r.summary.rtk.state === "int" && M.imageLog(r).find(c => c.column === "rtk_flag").value === "int"],

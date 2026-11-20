@@ -203,6 +203,27 @@ const gpsMs = utc => utc + 18000; // after 2017
     ok(v(mk("tlmb", { fw: "1.6.0" })).state === "new" && !v(mk("tlmb", { fw: "1.6.0" })).standard, "verify: Sequoia 1.6 not verified, proprietary");
     ok(v(mk("rinex", {}, [["fFormat", "RINEX 4.01 observation"]])).state === "new", "verify: RINEX 4 not verified");
     ok(v(mk("rinex", {}, [["fFormat", "RINEX 3.04 observation"]])).state === "ok", "verify: RINEX 3.04 verified");
+    /* ThermoTIFF conversion_log.csv and processing_record.json (structure from the ThermoTIFF 0.1.0 source; values synthetic) */
+    { const csv = "\uFEFFsource,output,status,message,width,height,distance,humidity,emissivity,reflection,ambient_temp,t_min_C,t_max_C,t_mean_C,seconds,dji_api_version,overridden\r\n" +
+        "C:\\data\\in\\DJI_0001_T.JPG,C:\\data\\out\\DJI_0001_T.tif,ok,,640,512,20,50,0.95,25,25,10.000,30.000,20.000,0.50,0x103,emissivity=0.95\r\n" +
+        "C:\\data\\in\\DJI_0002_T.JPG,C:\\data\\out\\DJI_0002_T.tif,ok,,640,512,20,50,0.95,25,25,11.000,31.000,21.000,0.60,0x103,emissivity=0.95\r\n" +
+        "C:\\data\\in\\DJI_0003.JPG,,not_radiometric,not a radiometric DJI thermal JPEG,0,0,,,,,,nan,nan,nan,0.01,,emissivity=0.95\r\n";
+      const L = await F.parse(u8(csv), "conversion_log.csv"), p = L.proc;
+      ok(L.kind === "thermotiff-log" && p && p.source === "thermotiff", "thermotiff log kind");
+      ok(p.thermal_settings.emissivity === 0.95 && p.thermal_settings.object_distance_m === 20 && p.thermal_settings.relative_humidity_pct === 50 && /set by the user for emissivity/.test(p.thermal_settings.parameter_source), "thermotiff log parameters and source");
+      ok(p.steps[0].parameters.converted === 2 && p.steps[0].parameters.errors === 1 && near(p.steps[0].duration_s, 1.11, 1e-9), "thermotiff log counts");
+      ok(p.software[1].version === "API 0x103" && p.images.join() === "dji_0001_t,dji_0002_t,dji_0003", "thermotiff log SDK and file names");
+      ok(!JSON.stringify(L).includes("C:\\data"), "thermotiff log: no folder paths kept");
+      const R = F.procRecord([L])[0]; ok(R.processing.thermal_settings && R.processing.atmospheric_model && !R.processing.photogrammetry_settings && R.made[0] === 1, "thermotiff procRecord");
+      const rec = { software: { name: "ThermoTIFF", version: "0.1.0", dji_thermal_sdk_api: "0x103", exiftool: "12.76", python: "3.12", qt: "6.7" }, created: "2030-06-01T14:00:00+02:00",
+        camera: { model: "ExampleT", focal_length_mm: 9.1, width_px: 640, height_px: 512 }, input: { folder: "C:/secret/folder", images: 2, dates: ["2030-06-01"], duration_s: 120, mean_height_m: 60 },
+        parameters: { distance_m: 20, humidity_pct: 50, emissivity: 0.95, reflected_C: 25, source: "set by the user" }, output: { folder: "C:/secret/out", format: "TIFF float32, deflate, degrees Celsius", converted: 2, errors: 0 },
+        quality_control: { flagged: 1, reasons: { saturated: 1 }, rules: { max_C: 150 } } };
+      const J = await F.parse(u8(JSON.stringify(rec, null, 2)), "processing_record.json"), q = J.proc;
+      ok(J.kind === "thermotiff-record" && q.software.map(x => x.name + " " + x.version).join() === "ThermoTIFF 0.1.0,DJI Thermal SDK API 0x103,ExifTool 12.76", "thermotiff record software");
+      ok(q.thermal_settings.reflected_temperature_c === 25 && q.thermal_settings.parameter_source === "set by the user" && q.steps.length === 2 && q.steps[1].parameters.flagged === 1, "thermotiff record steps");
+      ok(!JSON.stringify(J).includes("secret"), "thermotiff record: no folder paths kept");
+      const M2 = F.procRecord([L, J]); ok(M2.length === 1 && M2[0].logs.length === 2 && M2[0].software[0].version === "0.1.0" && M2[0].steps[0].parameters.converted === 2 && M2[0].steps.length === 2 && M2[0].images.length === 3, "thermotiff log + record = one workflow"); }
     const kinds = Object.keys(F._internal.PARSERS || {}); ok(!kinds.length || kinds.every(k => F.VERIFIED.some(x => x.kind === k)), "verify: every parser has an entry in the table");
     const R = F.combine([mk("tlmb", { fw: "1.6.0" }, [], { verify: v(mk("tlmb", { fw: "1.6.0" })), startMs: null, endMs: null })], []);
     ok(R.checks.some(c => c.key === "cUnverified" && c.state === "warn"), "verify: proprietary unverified version is a warning"); }

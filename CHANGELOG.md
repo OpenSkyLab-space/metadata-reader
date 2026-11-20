@@ -8,6 +8,20 @@ Each entry names the versions of the parser (OSLMeta), the flight log module (OS
 
 - The "Why it matters" paragraph under the title is folded behind a button with a light-bulb icon; it opens on click (native `<details>`, no script, keyboard accessible). The header is shorter.
 - The four cards under the title ("What sets this reader apart") sit in one row, two by two or one column, never three plus a lone fourth; the links under the tool header do not break inside.
+- Thermal images: the measurement parameters set in the camera are read (layouts as in ExifTool; checked against ExifTool 12.76 on DJI M3T and senseFly Duet T images).
+  - DJI R-JPEG, APP4: ThermalParams2 (M3T and others: emissivity, object distance, relative humidity, reflected and ambient temperature, after an optional 32-byte prefix) and ThermalParams3; ThermalParams of the ZH20T is shown but not used, because the scale of its values is not documented. APP7 `DJI-DBG` gives the SensorID.
+  - FLIR FFF in APP1 (for example the senseFly Duet T): the chunks are joined and the CameraInfo and RawData records are read: emissivity, object distance, reflected, atmospheric and IR window temperature, IR window transmission, humidity, the Planck constants R1, B, F, O, R2, the atmospheric transmission coefficients, the camera temperature range and the size and type of the raw thermal image.
+  - The check fills `thermal.capture_measurement_params` (marked as camera settings: the ambient temperature and humidity set in the camera are not copied to `environment.*`), `reference.emissivity_setting` (the camera value, to be replaced if the reference instrument used another), `thermal.image_encoding`, `thermal.planck_constants` (FLIR) and `thermal.spectral_range` (XMP Camera band and FWHM).
+  - A plausibility check flags emissivity outside 0–1 or equal to 1 (brightness temperature), a DJI distance outside 1–25 m and an object distance far from the laser rangefinder or the height above take-off.
+  - For DJI R-JPEG the camera and FPA temperature is reported as not recorded by the camera, instead of asking for it.
+  - Temperatures are still not computed: that needs the vendor SDK (for DJI the DJI Thermal SDK, as in ThermoTIFF).
+- DJI laser rangefinder (XMP `LRFStatus`, `LRFTargetDistance`): a measured distance fills `environment.sensor_target_distance`; status Normal with distance 0 means no measurement, and the height above take-off is used as before, with a note.
+- ThermoTIFF (J. Rous, MIT), which converts DJI R-JPEGs to float32 TIFF in degrees Celsius with the DJI Thermal SDK:
+  - its TIFFs are recognised (Software, ImageDescription, GDAL_METADATA UNITTYPE degC) and fill `processing.thermal_settings`, `processing.atmospheric_model` and `processing.software`;
+  - its `conversion_log.csv` and `processing_record.json` are read as a processing record (one workflow when both are loaded), with ThermoTIFF, the DJI Thermal SDK API and ExifTool as software agents in `provenance.json` and the conversion as an activity that used the loaded R-JPEGs and generated the loaded TIFFs;
+  - folder paths in these files are not copied.
+  - Checked on synthetic files built from the ThermoTIFF 0.1.0 source; no field file yet.
+- Component versions to set at the release: parser OSLMeta and flight log module OSLFlight both changed (new decoded groups `APP4:DJI`, `APP7:DJI`, `APP1:FLIR`; new kinds `thermotiff-log`, `thermotiff-record`).
 
 ## [1.4.0] - 2026-11-19
 

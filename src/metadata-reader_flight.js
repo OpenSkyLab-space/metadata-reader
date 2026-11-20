@@ -90,6 +90,8 @@ function sniff(name, h) {
   if (/\.bbz$/.test(low) || (h[0] === 0x50 && h[1] === 0x4b && h[2] === 3 && h[3] === 4 && /^(syslog|version|log_\d+\.txt|IX-[\w-]+\.bb3)$/.test(new TextDecoder().decode(h.subarray(30, 30 + (h[26] | h[27] << 8)))))) return "bbz";
   if (/<pix4dmapper[\s>]/.test(s) || (/\.p4d$/.test(low) && /^\s*(<\?xml[^>]*>\s*)?</.test(s))) return "pix4d-project";
   if (/\.(psx|psz)$/.test(low) || /^\s*(<\?xml[^>]*>\s*)?<(document|chunk|frame) version="\d+\.\d+\.\d+"/.test(s) || (h[0] === 0x50 && h[1] === 0x4b && h[2] === 3 && h[3] === 4 && new TextDecoder().decode(h.subarray(30, 30 + (h[26] | h[27] << 8))) === "doc.xml")) return "metashape";
+  if (/^(\xef\xbb\xbf|\ufeff)?source,output,status,message,width,height,distance,humidity,emissivity,reflection,ambient_temp,/.test(s)) return "thermotiff-log";
+  if (/^\s*\{/.test(s) && /"software"\s*:\s*\{\s*"name"\s*:\s*"ThermoTIFF"/.test(s)) return "thermotiff-record";
   if (/\.bb3$/.test(low) || (h[0] === 0xcd && (h[1] & 0x80))) return "bb3";
   if (/RINEX VERSION \/ TYPE|COMPACT RINEX FORMAT/.test(s.slice(0, 200))) return "rinex";
   if (h[0] === 0xd3 && (h[1] & 0xfc) === 0) return "rtcm3";
@@ -217,6 +219,9 @@ const VERIFIED = [
   { kind: "efl", re: /./, ver: "–", src: "internal" },
   { kind: "pix4d-project", re: /^Pix4Dmapper 4\.4\./, ver: "Pix4Dmapper 4.4.12 (.p4d file version 21)", src: "internal" },
   { kind: "metashape", re: /^Metashape 2\.1\./, ver: "Metashape 2.1.2 (chunk format 1.7.0)", src: "internal" },
+  // ThermoTIFF 0.1.0: read from its source code (conversion_log.csv, processing_record.json); checked on synthetic files only
+  { kind: "thermotiff-log", re: /(?!)/, ver: "", src: "source code + synthetic" },
+  { kind: "thermotiff-record", re: /(?!)/, ver: "", src: "source code + synthetic" },
   { kind: "dji-fr", re: /^v(8)\b/, ver: "FlightRecord v8 (iOS apps 4.3.64 and 4.9.1; 2019, 2026)", src: "internal" },
   { kind: "dji-fr", re: /^v(14)\b/, ver: "FlightRecord v14, summary only (iOS apps 4.95 and 4.103, 2022; app on platform 6, 2026)", src: "internal" }
 ];
@@ -237,6 +242,7 @@ function versionKey(L) {
     case "nmea": case "gpx": case "csv-geotags": return fm;
     case "emotion-transcript": return fm;
     case "ebeex-afpu": case "pix4dcapture-log": case "pix4dcapture-mission": case "bbx": return d.fw || "";
+    case "thermotiff-log": case "thermotiff-record": return L.proc && L.proc.software[0].version ? "ThermoTIFF " + L.proc.software[0].version : "ThermoTIFF";
     case "pix4d-project": case "metashape": return L.proc && L.proc.software[0] && L.proc.software[0].version ? (L.kind === "metashape" ? "Metashape " : "Pix4Dmapper ") + L.proc.software[0].version : "";
     case "dji-fr": return "v" + (fm.match(/v(\d+)/) || [, ""])[1];
     case "dji-fr-csv": return [L.device.model, factOf(L, "fSoftware")].filter(Boolean).join(" ");
@@ -1616,6 +1622,61 @@ async function pP4D(src, L) {
   L.notes.push("processing");
 }
 
+/* ---- ThermoTIFF (J. Rous, MIT): conversion_log.csv and processing_record.json. ThermoTIFF converts DJI R-JPEGs to float32 TIFF in degrees Celsius
+   with the DJI Thermal SDK. Both files describe one conversion run: read as a processing record (software, the conversion step and its parameters).
+   File paths in them (input and output folders, full source paths) are not copied: only file names are kept, to match the loaded images. */
+const TT_PARAMS = [["distance", "object_distance_m"], ["humidity", "relative_humidity_pct"], ["emissivity", "emissivity"], ["reflection", "reflected_temperature_c"], ["ambient_temp", "ambient_temperature_c"]];
+const TT_METHOD = "DJI Thermal SDK: raw values of the R-JPEG to temperature in degrees Celsius (float32 TIFF), with the measurement parameters below";
+const TT_ATM = "DJI Thermal SDK built-in correction (method not published; inputs: object distance, relative humidity, ambient and reflected temperature)";
+const baseName = p => String(p || "").split(/[\\/]/).pop();
+function ttProc(L, sw, step, settings, images, extra) {
+  L.proc = Object.assign({ software: sw, steps: [step], source: "thermotiff", photogrammetry_settings: {}, adjustment_quality: {}, thermal_settings: settings, atmospheric_model: TT_ATM,
+    products: [{ type: "temperature images (degrees Celsius)", format: "TIFF float32", step: 1 }], geometry: [], gcp: null, saved_local: null, images: images.map(projBase) }, extra || {});
+  L.notes.push("processing");
+}
+async function pThermoLog(src, L) {
+  const lines = (await text(src)).replace(/^﻿/, "").split(/\r?\n/).filter(x => x.trim()), head = csvSplit(lines[0], ","), ix = n => head.indexOf(n);
+  const rows = lines.slice(1).map(l => csvSplit(l, ",")).filter(r => r.length >= head.length - 1);
+  const st = {}, combos = new Map(), api = new Set(), over = new Set(), names = []; let secs = 0;
+  for (const r of rows) {
+    const s = r[ix("status")] || ""; st[s] = (st[s] || 0) + 1; names.push(baseName(r[ix("source")]));
+    const t = +r[ix("seconds")]; if (isFinite(t)) secs += t;
+    if (s !== "ok") continue;
+    const p = {}; for (const [c, k] of TT_PARAMS) { const v = r[ix(c)]; if (v !== "" && v != null && isFinite(+v)) p[k] = +v; }
+    const key = JSON.stringify(p); combos.set(key, (combos.get(key) || 0) + 1);
+    if (r[ix("dji_api_version")]) api.add(r[ix("dji_api_version")]); if (r[ix("overridden")]) over.add(r[ix("overridden")]);
+  }
+  fact(L, "fFormat", "ThermoTIFF conversion_log.csv");
+  fact(L, "fImages", rows.length + " (" + Object.entries(st).map(([k, v]) => k + " " + v).join(", ") + ")");
+  const sets = [...combos.entries()].sort((a, b) => b[1] - a[1]), P = sets.length ? JSON.parse(sets[0][0]) : {};
+  const ov = [...over].join("; "), src0 = ov ? "set by the user for " + ov.replace(/=[^,;]*/g, "") + "; other values stored in the images" : "stored in the images";
+  fact(L, "fThermalParams", Object.entries(P).map(([k, v]) => k + " " + v).join(", ") + (sets.length > 1 ? " (" + sets.length + " different sets; the most frequent shown)" : ""));
+  if (ov) fact(L, "fOverridden", ov);
+  const settings = Object.assign({ method: TT_METHOD }, P, { parameter_source: src0 }, sets.length > 1 ? { parameter_sets: sets.map(([k, n]) => Object.assign(JSON.parse(k), { images: n })) } : {});
+  ttProc(L, [{ name: "ThermoTIFF", version: "", note: "the version is not in conversion_log.csv (it is in the TIFF and in processing_record.json)" }, { name: "DJI Thermal SDK", version: api.size ? "API " + [...api].join(", ") : "" }],
+    { order: 1, name: "Convert R-JPEG to temperature TIFF", method: TT_METHOD, parameters: Object.assign({}, P, { parameter_source: src0, images: rows.length, converted: st.ok || 0, errors: (st.error || 0) + (st.not_radiometric || 0), skipped: st.skipped || 0 }), duration_s: +secs.toFixed(2) },
+    settings, names);
+}
+async function pThermoRecord(src, L) {
+  let J; try { J = JSON.parse((await text(src)).replace(/^﻿/, "")); } catch (e) { L.notes.push("not-a-project"); return; }
+  const s = J.software || {}, p = J.parameters || null, out = J.output || {}, inp = J.input || {}, qc = J.quality_control || null;
+  const sw = [{ name: "ThermoTIFF", version: s.version || "" }, { name: "DJI Thermal SDK", version: s.dji_thermal_sdk_api ? "API " + s.dji_thermal_sdk_api : "" }];
+  if (s.exiftool) sw.push({ name: "ExifTool", version: String(s.exiftool) });
+  const P = {}; if (p) { if (p.distance_m != null) P.object_distance_m = p.distance_m; if (p.humidity_pct != null) P.relative_humidity_pct = p.humidity_pct; if (p.emissivity != null) P.emissivity = p.emissivity; if (p.reflected_C != null) P.reflected_temperature_c = p.reflected_C; }
+  const srcP = p && p.source ? p.source : null;
+  fact(L, "fFormat", "ThermoTIFF processing record " + (s.version || ""));
+  fact(L, "fSoftware", sw.map(x => x.name + " " + x.version).join(", "));
+  if (J.created) fact(L, "fCreated", J.created);
+  if (J.camera && J.camera.model) L.device = { model: J.camera.model };
+  fact(L, "fImages", (inp.images != null ? inp.images : "?") + (out.converted != null ? " (converted " + out.converted + ", errors " + (out.errors || 0) + ")" : ""));
+  if (p) fact(L, "fThermalParams", Object.entries(P).map(([k, v]) => k + " " + v).join(", ") + (srcP ? " (" + srcP + ")" : ""));
+  if (qc) fact(L, "fQc", (qc.flagged || 0) + " flagged" + (qc.reasons && Object.keys(qc.reasons).length ? ": " + Object.entries(qc.reasons).map(([k, v]) => k + " " + v).join(", ") : ""));
+  const steps = [{ order: 1, name: "Convert R-JPEG to temperature TIFF", method: TT_METHOD, parameters: Object.assign({}, P, srcP ? { parameter_source: srcP } : {}, { images: inp.images, converted: out.converted, errors: out.errors, output_format: out.format, record_created: J.created }) }];
+  if (qc) steps.push({ order: 2, name: "Quality control of the temperature images", method: "ThermoTIFF rules", parameters: { flagged: qc.flagged, reasons: qc.reasons, rules: qc.rules } });
+  ttProc(L, sw, steps[0], Object.assign({ method: TT_METHOD }, P, srcP ? { parameter_source: srcP } : {}), [], {});
+  L.proc.steps = steps;
+}
+
 /* ---- Agisoft Metashape: the .psx file only points to {name}.files/project.zip; the content is in doc.xml files inside the zips
    (document → chunks → chunk.zip → frames → frame.zip). Each step leaves its settings, duration and memory in a <meta> block
    ("AlignCameras/…"); Info/LastSavedSoftwareVersion is the version that last saved the file, not necessarily the one that ran each step. */
@@ -1717,7 +1778,7 @@ async function pMetashape(src, L, h) {
 const PARSERS = { "dji-mrk": pMRK, rinex: pRINEX, rtcm3: pRTCM, ulog: pULog, sbf: pSBF, bb3: pBB3, "sf-geoinfo": pGeoinfo, kml: pKML, jxl: pJXL,
   "wingtra-geotaglog": pWGeotaglog, "wingtra-json": pWJson, "wingtra-ini": pWIni, "wingtra-geotags": pWGeotags, "mica-paramlog": pParamlog, "mica-gpslog": pGpslog,
   tlmb: pTLMB, ubx: pUBX, novatel: pNovatel, "lidar-service": pService, pcmp: pPcmp, encrypted: pEncrypted,
-  "ardupilot-bin": pDataFlash, "ardupilot-log": pAPText, tlog: pTlog, nmea: pNMEA, gpx: pGPX, "csv-geotags": pCSV, "dji-fr-csv": pDjiCsv, "dji-fr": pDjiFR, "emotion-transcript": pEmTranscript, "ebeex-afpu": pAfpu, "pix4dcapture-log": pP4dCaptureLog, bbz: pBBZ, "pix4dcapture-mission": pP4dMission, bbx: pBBX, "dji-events": pDjiEvents, "dji-dat": pDjiDat, jeti: pJeti, efl: pEfl, "pix4d-project": pP4D, metashape: pMetashape };
+  "ardupilot-bin": pDataFlash, "ardupilot-log": pAPText, tlog: pTlog, nmea: pNMEA, gpx: pGPX, "csv-geotags": pCSV, "dji-fr-csv": pDjiCsv, "thermotiff-log": pThermoLog, "thermotiff-record": pThermoRecord, "dji-fr": pDjiFR, "emotion-transcript": pEmTranscript, "ebeex-afpu": pAfpu, "pix4dcapture-log": pP4dCaptureLog, bbz: pBBZ, "pix4dcapture-mission": pP4dMission, bbx: pBBX, "dji-events": pDjiEvents, "dji-dat": pDjiDat, jeti: pJeti, efl: pEfl, "pix4d-project": pP4D, metashape: pMetashape };
 
 /* ---------------------------------------------------------------- joining images with logs, checks */
 /* images: [{ name, S (reader summary), captureId, c2pa }] */
@@ -1945,18 +2006,28 @@ function sfmAngles(yaw, pitch, roll) {
 
 /* the processing record of each loaded project, in the shape of metadata.json (processing[], products[]) plus what provenance.json needs */
 const MS_PRODUCT_STEP = { "point cloud": /^Build(Point|Dense)Cloud$/, "3D model (mesh)": /^BuildModel$/, "tiled model": /^BuildTiledModel$/, DTM: /^BuildDem$/, DSM: /^BuildDem$/, DEM: /^BuildDem$/, orthomosaic: /^BuildOrthomosaic$/ };
+// conversion_log.csv and processing_record.json of the same ThermoTIFF run are one workflow: joined here
+function ttMerge(list) {
+  const tt = list.filter(l => l.proc.source === "thermotiff"); if (tt.length < 2) return list;
+  const log = tt.find(l => l.kind === "thermotiff-log"), rec = tt.find(l => l.kind === "thermotiff-record"); if (!log || !rec) return list;
+  const a = log.proc, b = rec.proc, s1 = Object.assign({}, b.steps[0], { parameters: Object.assign({}, b.steps[0].parameters, a.steps[0].parameters, { record_created: b.steps[0].parameters.record_created }), duration_s: a.steps[0].duration_s });
+  const m = { name: rec.name, kind: rec.kind, logs: [log.name, rec.name], proc: Object.assign({}, b, { steps: [s1].concat(b.steps.slice(1)), thermal_settings: a.thermal_settings, images: a.images }) };
+  return list.filter(l => l !== log && l !== rec).concat([m]);
+}
 function procRecord(logs) {
-  return (logs || []).filter(l => l && l.proc).map((l, i) => {
+  return ttMerge((logs || []).filter(l => l && l.proc)).map((l, i) => {
     const p = l.proc, wf = "WF" + (i + 1);
     const steps = p.steps.map(s => ({ order: s.order, name: s.name, method: s.method, parameters: Object.assign({}, s.parameters, s.duration_s != null ? { duration_s: s.duration_s } : {}, s.memory_bytes != null ? { memory_bytes: s.memory_bytes } : {}, s.software_version ? { software_version: s.software_version } : {}) }));
-    const processing = { workflow_id: wf, software: p.software.map(s => Object.assign({ name: s.name, version: s.version }, p.software_note ? { note: p.software_note } : {})), steps,
+    const processing = { workflow_id: wf, software: p.software.map(s => Object.assign({ name: s.name, version: s.version }, s.note ? { note: s.note } : p.software_note ? { note: p.software_note } : {})), steps,
       photogrammetry_settings: p.photogrammetry_settings || {}, adjustment_quality: p.adjustment_quality || {} };
+    if (p.thermal_settings) processing.thermal_settings = p.thermal_settings; if (p.atmospheric_model) processing.atmospheric_model = p.atmospheric_model;
+    if (p.source === "thermotiff") { delete processing.photogrammetry_settings; delete processing.adjustment_quality; }
     if (p.output_crs) processing.output_crs = p.output_crs;
     const products = p.products.map(x => Object.assign({ product_type: x.type }, x.format ? { format: x.format } : {}, p.output_crs ? { crs: p.output_crs } : {}, { workflow_id: wf }, p.vertical && /^(DSM|DTM|DEM|point cloud|3D)/.test(x.type) ? { vertical_crs: p.vertical } : {}));
     // which step made which product (Pix4D: by step number; Metashape: by step name)
-    const stepOf = x => p.source === "p4d" ? p.steps.find(s => s.order === x.step) : p.steps.find(s => MS_PRODUCT_STEP[x.type] && MS_PRODUCT_STEP[x.type].test(s.id));
+    const stepOf = x => p.source === "p4d" || p.source === "thermotiff" ? p.steps.find(s => s.order === x.step) : p.steps.find(s => MS_PRODUCT_STEP[x.type] && MS_PRODUCT_STEP[x.type].test(s.id));
     const made = p.products.map(stepOf).map(s => s ? s.order : null);
-    return { log: l.name, kind: l.kind, wf, processing, products, made, steps: p.steps, software: p.software, vertical: p.vertical, gcp: p.gcp, geometry: p.geometry || [], saved_local: p.saved_local, source: p.source, images: p.images || [] };
+    return { log: l.name, logs: l.logs || [l.name], kind: l.kind, wf, processing, products, made, steps: p.steps, software: p.software, vertical: p.vertical, gcp: p.gcp, geometry: p.geometry || [], saved_local: p.saved_local, source: p.source, images: p.images || [] };
   });
 }
 /* ---------------------------------------------------------------- values for the OpenSkyLab check taken from the flight logs */
@@ -1984,9 +2055,10 @@ function oslFromFlight(logs, F) {
   // processing project (Pix4D, Metashape): the processing block, the products and the GCP counts; calibration per sensor (matched by image size)
   const PR = procRecord(logs)[0];
   if (PR) {
-    const setp = (k, val, note) => { if (val == null || (typeof val === "object" && !Object.keys(val).length)) return; set(k, val, PR.log, note); if (out.mission[k]) out.mission[k].log = PR.log; };
+    const setp = (k, val, note) => { if (val == null || (typeof val === "object" && !Object.keys(val).length)) return; set(k, val, PR.logs.join(" + "), note); if (out.mission[k]) out.mission[k].log = PR.log; };
     const p = PR.processing;
     setp("processing.workflow_id", p.workflow_id, "nProcWf"); setp("processing.software", p.software, "nProcSw"); setp("processing.steps", p.steps, "nProc");
+    setp("processing.thermal_settings", p.thermal_settings, "nProcTt"); setp("processing.atmospheric_model", p.atmospheric_model, "nProcTt");
     setp("processing.photogrammetry_settings", p.photogrammetry_settings, "nProc"); setp("processing.adjustment_quality", p.adjustment_quality, "nProc"); setp("processing.output_crs", p.output_crs, "nProcCrs");
     if (PR.products.length) { setp("product.product_type", [...new Set(PR.products.map(x => x.product_type))].join(", "), "nProcProd"); setp("product.crs", p.output_crs, "nProcCrs");
       setp("product.workflow_id", p.workflow_id, "nProcWf"); setp("product.vertical_crs", PR.vertical, "nProc"); }
