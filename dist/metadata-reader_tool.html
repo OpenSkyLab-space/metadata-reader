@@ -2829,7 +2829,10 @@ function atExposure(L) {
     S.vib = { n: V.length, max: Math.max(...V.map(e => e.vib)), over30: V.filter(e => e.vib > 30).length, over60: V.filter(e => e.vib > 60).length, clip: Object.values(clip).reduce((s, c) => s + c[1] - c[0], 0) }; }
   const M = ex.filter(e => e.mode != null);
   if (M.length) S.modes = { n: M.length, names: [...new Set(M.map(e => e.mode))], out: M.filter(e => e.auto === false).length, outNames: [...new Set(M.filter(e => e.auto === false).map(e => e.mode))], unknown: M.every(e => e.auto == null) };
-  const W = evs.filter(x => x.t >= t0 && x.t <= t1); if (W.length) S.ev = { n: W.length, err: W.filter(x => x.lvl <= 3).length, first: W.slice(0, 3).map(x => x.msg) };
+  const W = evs.filter(x => x.t >= t0 && x.t <= t1);
+  // repeated messages (a real tlog repeats "Arming Checks Disabled" every few seconds) are listed once with their count
+  if (W.length) { const by = new Map(); for (const x of W) by.set(x.msg, (by.get(x.msg) || 0) + 1);
+    S.ev = { n: W.length, err: W.filter(x => x.lvl <= 3).length, kinds: by.size, first: [...by].slice(0, 3).map(([m, k]) => k > 1 ? m + " ×" + k : m) }; }
   L.atExp = S;
   for (const e of L.exposures) delete e._tc;
 }
@@ -4610,7 +4613,7 @@ function combine(logs, images, solar) {
     if (S.gnss) { const g = S.gnss; P(g.low ? "warn" : "ok", "GNSS " + [g.svMed != null ? g.svMed + " satellites (min " + g.svMin + ")" : null, g.hdopMax != null ? "HDOP max " + g.hdopMax : null, g.ephMax != null ? "eph max " + g.ephMax + " m" : null, "below 3D fix: " + g.low].filter(Boolean).join(", ")); }
     if (S.vib) { const v = S.vib; P(v.over60 || v.clip >= 100 ? "warn" : v.over30 || v.clip ? "info" : "ok", "vibration max " + v.max + " m/s² (over 30: " + v.over30 + ", over 60: " + v.over60 + "), clipping +" + v.clip); }
     if (S.modes) { const m = S.modes; P(m.out ? "warn" : m.unknown ? "info" : "ok", m.out ? "outside the automatic mission: " + m.out + " (" + m.outNames.join(", ") + ")" : "mode " + m.names.join(", ")); }
-    if (S.ev) P(S.ev.err ? "warn" : "info", "autopilot errors and warnings: " + S.ev.n + " (" + S.ev.first.join("; ") + (S.ev.n > 3 ? "; …" : "") + ")");
+    if (S.ev) P(S.ev.err ? "warn" : "info", "autopilot errors and warnings: " + S.ev.n + " (" + S.ev.first.join("; ") + (S.ev.kinds > 3 ? "; …" : "") + ")");
     if (S.interp) P("info", "interpolated positions: " + S.interp);
     const R = { ok: 0, info: 1, warn: 2, bad: 3 }; if (parts.length) add(sts.reduce((a, b) => R[b] > R[a] ? b : a, "ok"), "cAtExposure", ax.name + ": " + parts.join(" · ")); }
   const ini = logs.find(l => l.kind === "wingtra-ini"); if (ini && ini.rtkFix != null) add(ini.rtkFix >= 95 ? "ok" : "warn", "cPpkFix", ini.rtkFix + " %");

@@ -288,15 +288,15 @@ const gpsMs = utc => utc + 18000; // after 2017
     for (let i = 0; i < 10; i++) { const p = new Uint8Array(52), dv = new DataView(p.buffer); dv.setInt32(8, Math.round((49 + i * 1e-5) * 1e7), true); dv.setInt32(12, 14e7, true); dv.setInt32(16, 400000, true); dv.setUint16(20, 90, true); p[28] = 3; p[29] = 15; dv.setInt32(30, 445000 + i * 1000, true); parts.push(v1(t0 + i * 2e5, 24, p)); }
     { const p = new Uint8Array(32), dv = new DataView(p.buffer); dv.setFloat32(8, 12, true); dv.setFloat32(12, 13, true); dv.setFloat32(16, 14, true); parts.push(v1(t0 + 5e5, 241, p)); }
     { const p = new Uint8Array(12), dv = new DataView(p.buffer); dv.setUint32(8, 1, true); parts.push(v1(t0 + 5e5, 112, p)); }
-    { const p = new Uint8Array(51); p[0] = 4; p.set(u8("Synthetic warning"), 1); parts.push(v1(t0 + 1e6, 253, p)); }
+    { const p = new Uint8Array(51); p[0] = 4; p.set(u8("Synthetic warning"), 1); parts.push(v1(t0 + 1e6, 253, p), v1(t0 + 1.05e6, 253, p)); }
     parts.push(hb(t0 + 1.1e6, 3 << 16));
     { const p = new Uint8Array(12), dv = new DataView(p.buffer); dv.setUint32(8, 2, true); parts.push(v1(t0 + 1.3e6, 112, p)); }
     const L = await F.parse(cat(...parts), "px4.tlog"), [e1, e2] = L.exposures;
     ok(L.device.make === "PX4" && e1.interp && near(e1.lat, 49.000025, 1e-9) && near(e1.h, 447.5, 1e-6) && near(e2.lat, 49.000065, 1e-9), "tlog CAMERA_TRIGGER: position interpolated from GPS_RAW_INT");
     ok(e1.sv === 15 && e1.hdop === 0.9 && e1.vib === 14 && e1.mode === "AUTO_MISSION" && e1.auto && e2.mode === "POSCTL" && e2.auto === false, "tlog at exposure: satellites, HDOP, vibration, PX4 mode");
-    ok(/^ellipsoid .*CAMERA_TRIGGER/.test((L.facts.find(f => f[0] === "fHeight") || [])[1]) && L.atExp.interp === 2 && L.atExp.ev.n === 1 && !L.atExp.ev.err, "tlog: height source of interpolated exposures, STATUSTEXT warning in the window");
+    ok(/^ellipsoid .*CAMERA_TRIGGER/.test((L.facts.find(f => f[0] === "fHeight") || [])[1]) && L.atExp.interp === 2 && L.atExp.ev.n === 2 && !L.atExp.ev.err, "tlog: height source of interpolated exposures, STATUSTEXT warning in the window");
     const R = F.combine([L], [{ name: "IMG_1.JPG", S: { utcMs: t0 / 1000 + 500, lat: 49.000025, lon: 14 } }]), c = R.checks.find(x => x.key === "cAtExposure"), O = F.oslFromFlight([L], R);
-    ok(c && c.state === "warn" && /interpolated positions: 2/.test(c.det) && /autopilot errors and warnings: 1 \(Synthetic warning\)/.test(c.det), "check: interpolated positions and messages reported");
+    ok(c && c.state === "warn" && /interpolated positions: 2/.test(c.det) && /autopilot errors and warnings: 2 \(Synthetic warning ×2\)/.test(c.det), "check: interpolated positions and messages reported, a repeated message listed once");
     ok(O.images["IMG_1.JPG"] && O.images["IMG_1.JPG"].cols.lat_deg.note === "nInterp" && O.images["IMG_1.JPG"].cols.alt_ellipsoid_m.note === "nInterp", "provenance: interpolated position marked as an estimate");
     ok(/,interpolated,15,0\.9,,14,AUTO_MISSION$/.test(F.exposuresCSV([L], R).split("\r\n")[1]), "exposures CSV: interpolated position"); }
   /* ULog: GNSS quality, nav_state and a logged error at the exposures; camera_capture without a fix (0, 0) gets an interpolated position */
