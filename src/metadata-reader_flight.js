@@ -872,32 +872,76 @@ async function pTLMB(src, L, h, o) {
 
 /* ---------------------------------------------------------------- Wingtra LiDAR service.log and ppk.pcmp */
 async function pService(src, L) {
-  const kv = {}, rmc = [], temps = []; let clockJump = null, prevT = null, nTime = 0, first = null, last = null; const offs = [];
+  const kv = {}, rmc = [], temps = [], recs = [], nav = [], led = {}, model = new Map(), lat = [], adj = [], freq = [];
+  let clockJump = null, prevT = null, first = null, last = null, scanFail = 0, hist = [], calib = null; const offs = [];
   await eachLine(src, l => {
     const m = /^(\d{4})-(\d\d)-(\d\d)-(\d\d)-(\d\d)-(\d\d)\.(\d+) (\w+): (.*)$/.exec(l); if (!m) return;
-    const t = Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]) + parseFloat("0." + m[7]) * 1000, msg = m[9];
+    const t = Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]) + parseFloat("0." + m[7]) * 1000, msg = m[9].trim();
     if (first == null) first = t; last = t; if (prevT != null && t - prevT > 86400000 && !clockJump) clockJump = { from: prevT, to: t }; prevT = t;
     let x;
     if ((x = /^Firmware version: (.*)/.exec(msg))) kv.fw = x[1]; else if ((x = /^Receiver model: (.*)/.exec(msg))) kv.rx = x[1]; else if ((x = /^Scanner model: (.*)/.exec(msg))) kv.sc = x[1];
     else if ((x = /^(WINGTRA-[0-9a-f]+)$/.exec(msg))) kv.id = x[1]; else if ((x = /^Lidar (linear|angular) offset = \((.*)\)/.exec(msg))) kv[x[1]] = x[2];
-    else if ((x = /^WINGTRA orientation = \((.*)\)/.exec(msg))) kv.orient = x[1]; else if ((x = /^Recording to (.*)/.exec(msg))) kv.rec = x[1];
+    else if ((x = /^WINGTRA orientation = \((.*)\)/.exec(msg))) kv.orient = x[1];
+    else if ((x = /^Recording to (.*)/.exec(msg))) { kv.rec = x[1]; recs.push({ file: x[1], t }); }
+    else if ((x = /^(\S+\.data) checksum is (\d+)/.exec(msg))) { const r = recs.find(r => r.file === x[1]); if (r) r.sum = x[2]; else recs.push({ file: x[1], sum: x[2] }); }
     else if ((x = /^LiDAR scanner temperature is ([\d.]+)/.exec(msg))) temps.push(+x[1]); else if (/^Time is good/.test(msg)) kv.timeGood = t;
+    else if ((x = /^Kernel receiver model = (.*)/.exec(msg))) kv.rxModel = x[1];
+    else if ((x = /^Slave antenna offset = \((.*)\)/.exec(msg))) kv.ant2 = x[1];
+    else if ((x = /^(Max|Min) field of view is (-?[\d.]+)/.exec(msg))) kv["fov" + x[1]] = +x[2];
+    else if ((x = /^Read error model: (\w+) = (\S+)/.exec(msg))) model.set(x[1], x[2]);
+    else if ((x = /^IMU nSec = \S+, GPS nSec = \S+, latency = (-?\d+)/.exec(msg))) { if (kv.timeGood != null) lat.push(+x[1] / 1e6); }   // ns → ms, after the clock is set from GNSS
+    else if ((x = /^Adjusting clock by (-?[\d.]+) microsec/.exec(msg))) adj.push(+x[1]);
+    else if ((x = /^Adjusting frequency by (-?[\d.]+) ppm/.exec(msg))) freq.push(+x[1]);
+    else if ((x = /^Adjusting system time by (-?\d+) seconds/.exec(msg))) kv.step = +x[1];
+    else if ((x = /^NavSolver current state: (.*)/.exec(msg))) nav.push(x[1]);
+    else if ((x = /^(\w+) LED state is changed to (\w+)/.exec(msg))) led[x[1]] = x[2];
+    else if (/^Failed to connect to Hesai/.test(msg)) scanFail++;
+    else if (/^Hesai current temp/.test(msg)) hist = [];
+    else if ((x = /^Hesai total working time: (\d+) hours (\d+) minutes/.exec(msg))) kv.work = +x[1] * 60 + +x[2];
+    else if ((x = /^Hesai total startup times: (\d+)/.exec(msg))) kv.starts = +x[1];
+    else if ((x = /^Hesai total time (?:between (-?\d+) deg C and (-?\d+) deg C|below (-?\d+) deg C|(-?\d+) deg C): (\d+) hours (\d+) minutes/.exec(msg))) { const mn = +x[5] * 60 + +x[6]; if (mn) hist.push((x[1] != null ? x[1] + "–" + x[2] : x[3] != null ? "< " + x[3] : "> " + x[4]) + " °C: " + mn + " min"); }
+    else if ((x = /^Hesai factory calibration: "(.*)"$/.exec(msg))) { try { calib = JSON.parse(x[1].replace(/\\"/g, '"')).map(c => +c.e).filter(isFinite); } catch (e) { /* calibration text not readable */ } }
+    else if ((x = /^USB drive size is (\S+)/.exec(msg))) kv.usbSize = x[1];
+    else if ((x = /^USB drive used is (\S+)/.exec(msg))) { if (kv.usb0 == null) kv.usb0 = x[1]; kv.usb1 = x[1]; }
+    else if ((x = /^Record without GNSS is (\w+)/.exec(msg))) kv.noGnss = x[1];
+    else if (/^Stopped logging/.test(msg)) kv.stop = t;
     else if ((x = /^\$GPRMC,(\d\d)(\d\d)(\d\d(?:\.\d+)?),A,(\d\d)(\d\d\.\d+),([NS]),(\d{3})(\d\d\.\d+),([EW]),[^,]*,[^,]*,(\d\d)(\d\d)(\d\d)/.exec(msg))) {
       const ut = Date.UTC(2000 + +x[12], x[11] - 1, +x[10], +x[1], +x[2]) + parseFloat(x[3]) * 1000, la = (+x[4] + x[5] / 60) * (x[6] === "S" ? -1 : 1), lo = (+x[7] + x[8] / 60) * (x[9] === "W" ? -1 : 1);
-      rmc.push({ t: ut, lat: la, lon: lo }); offs.push(t - ut); nTime++; }
+      rmc.push({ t: ut, lat: la, lon: lo }); offs.push(t - ut); }
   });
   L.device.make = "Wingtra"; L.device.model = "WingtraOne LiDAR"; L.device.serial = kv.id || null; L.device.fw = kv.fw || null; L.device.receiver = kv.rx || null;
   L.trajectory = rmc.map(r => ({ t: r.t, lat: r.lat, lon: r.lon })); for (const r of rmc) span(L, r.t); L.timeSource = "NMEA $GPRMC (UTC)";
-  fact(L, "fFormat", "Wingtra LiDAR service.log"); fact(L, "fFirmware", kv.fw); fact(L, "fReceiver", kv.rx); fact(L, "fScanner", kv.sc); fact(L, "fSerial", kv.id);
-  fact(L, "fBoresight", kv.linear ? "linear (" + kv.linear + ") m · angular (" + kv.angular + ")°" : null); fact(L, "fOrientation", kv.orient); fact(L, "fRecording", kv.rec);
-  fact(L, "fScannerTemp", temps.length ? Math.min(...temps) + "–" + Math.max(...temps) + " °C" : null); fact(L, "fNmea", rmc.length);
+  L.lidar = { recorded: recs.map(r => r.file) };
+  const rng = a => a.length ? Math.min(...a) + "…" + Math.max(...a) : null, hm = mn => Math.floor(mn / 60) + " h " + (mn % 60) + " min";
+  fact(L, "fFormat", "Wingtra LiDAR service.log"); fact(L, "fFirmware", kv.fw); fact(L, "fReceiver", kv.rxModel ? kv.rx + " · " + kv.rxModel : kv.rx); fact(L, "fScanner", kv.sc); fact(L, "fSerial", kv.id);
+  fact(L, "fBoresight", kv.linear ? "linear (" + kv.linear + ") m · angular (" + kv.angular + ")°" : null); fact(L, "fOrientation", kv.orient); fact(L, "fSecAntenna", kv.ant2);
+  fact(L, "fFov", kv.fovMin != null && kv.fovMax != null ? kv.fovMin + "° → " + kv.fovMax + "° (" + ((kv.fovMax - kv.fovMin + 360) % 360) + "°)" : null);
+  fact(L, "fRecording", recs.length ? recs.map(r => r.file + (r.t != null ? " " + iso(r.t).slice(11, 19) : "") + (r.sum ? " (checksum " + r.sum + ")" : "")).join(" · ") + (kv.stop != null ? " · stop " + iso(kv.stop).slice(11, 19) : "") : null);
+  fact(L, "fRecordNoGnss", kv.noGnss); fact(L, "fUsb", kv.usbSize ? kv.usbSize + " · used " + kv.usb0 + (kv.usb1 !== kv.usb0 ? " → " + kv.usb1 : "") : null);
+  fact(L, "fNavStates", nav.length ? nav.join(" → ") : null); fact(L, "fLeds", Object.keys(led).length ? Object.entries(led).map(([k, v]) => k + ": " + v).join(", ") : null);
+  fact(L, "fImuModel", model.size ? [...model].map(([k, v]) => k + " " + v).join(", ") : null);
+  fact(L, "fImuLatency", lat.length ? "median " + median(lat).toFixed(2) + " ms · max " + Math.max(...lat).toFixed(1) + " ms (" + lat.length + ")" : null);
+  fact(L, "fClockSteer", adj.length || kv.step != null ? [kv.step != null ? "initial step " + kv.step + " s" : null, adj.length ? adj.length + " corrections, max " + Math.max(...adj.map(Math.abs)) + " µs" : null, freq.length ? "frequency " + rng(freq.map(x => +x.toFixed(2))) + " ppm" : null].filter(Boolean).join(" · ") : null);
+  fact(L, "fScannerTemp", temps.length ? Math.min(...temps) + "–" + Math.max(...temps) + " °C" : null);
+  fact(L, "fScannerUse", kv.work != null ? "working " + hm(kv.work) + (kv.starts != null ? " · " + kv.starts + " start-ups" : "") + (scanFail ? " · " + scanFail + " connection failures at start" : "") : null);
+  fact(L, "fScannerTempHist", hist.length ? hist.join(", ") : null);
+  fact(L, "fScannerCalib", calib && calib.length ? calib.length + " lasers, elevation " + Math.min(...calib) + "…" + Math.max(...calib) + "°" : null);
+  fact(L, "fNmea", rmc.length);
+  // a recording that never left the ground (all fixes within 50 m) is noted: no flight in this session
+  if (rmc.length >= 10) { const a = rmc[0], d = Math.max(...rmc.map(r => Math.hypot((r.lat - a.lat) * 111320, (r.lon - a.lon) * 111320 * Math.cos(a.lat / R2D)))); fact(L, "fMoved", d.toFixed(1) + " m"); if (d < 50) L.notes.push("lidar-static"); }
   fact(L, "fLogClock", first != null ? iso(first) + " … " + iso(last) : null);
   if (clockJump) { fact(L, "fClockJump", iso(clockJump.from) + " → " + iso(clockJump.to)); L.notes.push("clock-jump"); }
   if (offs.length) fact(L, "fClockVsGnss", (median(offs) / 1000).toFixed(3) + " s");
 }
 async function pPcmp(src, L) {
-  const s = await text(src); const files = [...s.matchAll(/<(data|trajectory|rover|imu|base)\s+path="([^"]+)"([^>]*)>/g)].map(m => m[1] + ": " + m[2] + (/ppk="1"/.test(m[3]) ? " (PPK)" : ""));
+  const s = await text(src), all = [...s.matchAll(/<(data|trajectory|rover|imu|base)\s+path="([^"]+)"([^>]*)>/g)];
+  const files = all.map(m => m[1] + ": " + m[2] + (/ppk="1"/.test(m[3]) ? " (PPK)" : ""));
   L.device.make = "Wingtra"; fact(L, "fFormat", "Wingtra LiDAR project (ppk.pcmp)"); fact(L, "fFiles", files.join(" · ")); fact(L, "fLasers", (s.match(/<laser number=/g) || []).length);
+  const rg = /<range\s+min="([^"]+)"\s+max="([^"]+)"/.exec(s), rot = /<rotation\s+min="([^"]+)"\s+max="([^"]+)"/.exec(s);
+  fact(L, "fFilters", rg || rot ? [rg ? "range " + +rg[1] + "–" + +rg[2] + " m" : null, rot ? "rotation " + rot[1] + " → " + rot[2] : null].filter(Boolean).join(" · ") : null);
+  const ant = [...s.matchAll(/<(priAnt|secAnt)\s+x="([^"]+)"\s+y="([^"]+)"\s+z="([^"]+)"/g)].map(m => (m[1] === "priAnt" ? "primary" : "secondary") + " (" + m[2] + ", " + m[3] + ", " + m[4] + ") m");
+  fact(L, "fAntennaOffsets", ant.length ? ant.join(" · ") : null);
+  L.lidar = { data: all.filter(m => m[1] === "data").map(m => m[2].split("/").pop()), inputs: all.filter(m => m[1] !== "data").map(m => m[2]) };
 }
 
 /* ---------------------------------------------------------------- encrypted or undocumented logs */
@@ -2043,6 +2087,10 @@ function combine(logs, images, solar) {
   // 9 originality
   const c2 = images.filter(i => i.c2pa).length; if (c2) add("warn", "cC2pa", c2 + " / " + images.length);
   // 10 logs that could not be read
+  // Wingtra LiDAR: the recordings that service.log wrote against the .data files that ppk.pcmp processes
+  { const rec = logs.filter(l => l.lidar && l.lidar.recorded), prj = logs.filter(l => l.lidar && l.lidar.data);
+    if (rec.length && prj.length) { const a = new Set(rec.flatMap(l => l.lidar.recorded)), b = new Set(prj.flatMap(l => l.lidar.data)), miss = [...b].filter(x => !a.has(x)), extra = [...a].filter(x => !b.has(x));
+      add(miss.length || extra.length ? "warn" : "ok", "cLidarFiles", a.size + " / " + b.size + (miss.length ? " · not recorded: " + miss.join(", ") : "") + (extra.length ? " · not in project: " + extra.join(", ") : "")); } }
   for (const l of logs) { const v = l.verify || {};
     if (v.state === "new") add(v.standard ? "info" : "warn", "cUnverified", l.name + ": " + (v.key || "?") + (v.known ? " · ✓ " + v.known : ""));
     if (l.notes.includes("implausible")) add("warn", "cImplausible", l.name + ": " + factOf(l, "fImplausible"));

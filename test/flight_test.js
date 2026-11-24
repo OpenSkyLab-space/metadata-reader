@@ -142,6 +142,22 @@ const gpsMs = utc => utc + 18000; // after 2017
     ok(L.kind === "wingtra-geotaglog" && L.exposures[0].q === "ppk" && L.startMs === Date.UTC(2026, 4, 14, 10), "wingtra geotaglog"); }
   { const L = await F.parse(u8("2022-01-06-15-27-05.720056333 KRN: Firmware version: 1.0\n2026-05-14-10-00-01.000000000 KRN: $GPRMC,100000.00,A,4900.0000,N,01400.0000,E,0.0,0.0,140526,,,A*00\n"), "service.log");
     ok(L.kind === "lidar-service" && L.notes.includes("clock-jump") && L.startMs === Date.UTC(2026, 4, 14, 10), "lidar service.log"); }
+  /* Wingtra LiDAR service.log lines as written by firmware 5.4 (values synthetic) and a ppk.pcmp naming the recordings */
+  { const T = k => "2026-05-14-10-00-" + String(k).padStart(2, "0") + ".000000000 ";
+    const rmc = k => T(k) + "KRN: $GPRMC,1000" + String(k).padStart(2, "0") + ".00,A,4900.0000,N,01400.0000,E,0.0,0.0,140526,,,A*00";
+    const lines = [T(0) + "KRN: Time is good", T(1) + "DWR: Recording to SYN-001.data", T(2) + "RCV: Kernel receiver model = SYNRX 1.0", T(2) + "KRN: Max field of view is 45", T(2) + "KRN: Min field of view is 315",
+      T(3) + "NAV: NavSolver current state: Static GPS", T(3) + "LED: GNSS LED state is changed to red", T(4) + "RCV: Adjusting clock by 3 microsec", T(4) + "RCV: Adjusting frequency by -1.25 ppm",
+      T(5) + "SCN: Hesai total working time: 1 hours 20 minutes", T(5) + "SCN: Hesai total startup times: 7", T(5) + "SCN: Hesai total time between 20 deg C and 40 deg C: 0 hours 59 minutes",
+      T(5) + 'SCN: Hesai factory calibration: "[{\\"i\\":1,\\"e\\":\\"15.0\\",\\"a\\":\\"0\\"},{\\"i\\":2,\\"e\\":\\"-16.0\\",\\"a\\":\\"0\\"}]"',
+      T(6) + "IMU: IMU nSec = 1, GPS nSec = 2, latency = 800000, IMU Flags =", T(20) + "DWR: SYN-001.data checksum is 123", T(20) + "KRN: Stopped logging"];
+    for (let k = 0; k < 12; k++) lines.push(rmc(k));
+    const L = await F.parse(u8(lines.join("\n") + "\n"), "service.log"), f = k => (L.facts.find(x => x[0] === k) || [])[1];
+    ok(/SYN-001\.data 10:00:01 \(checksum 123\) · stop 10:00:20/.test(f("fRecording")) && f("fFov") === "315° → 45° (90°)" && f("fNavStates") === "Static GPS" && f("fLeds") === "GNSS: red", "lidar service.log: recordings, field of view, navigation, LEDs");
+    ok(f("fScannerUse") === "working 1 h 20 min · 7 start-ups" && f("fScannerTempHist") === "20–40 °C: 59 min" && f("fScannerCalib") === "2 lasers, elevation -16…15°", "lidar service.log: scanner use and calibration");
+    ok(/^median 0\.80 ms/.test(f("fImuLatency")) && /1 corrections, max 3 µs · frequency -1\.25…-1\.25 ppm/.test(f("fClockSteer")) && L.notes.includes("lidar-static"), "lidar service.log: IMU latency, clock steering, static recording");
+    const P = await F.parse(u8('<?xml version="1.0"?>\n<Project>\n<Files>\n<data path="data/SYN-001.data"/>\n<data path="data/SYN-002.data"/>\n<trajectory path="x/t.txt" ppk="1">\n</trajectory>\n</Files>\n<Filters><range min="8.000" max="200.000"/></Filters>\n</Project>\n'), "ppk.pcmp");
+    const C = F.combine([L, P], []).checks.find(c => c.key === "cLidarFiles");
+    ok(P.kind === "pcmp" && /range 8–200 m/.test((P.facts.find(x => x[0] === "fFilters") || [])[1]) && C && C.state === "warn" && /not recorded: SYN-002\.data/.test(C.det), "lidar: project file not recorded by the scanner"); }
   { const L = await F.parse(new Uint8Array(4096).map((_, i) => (i * 7919) & 255), "IX-00-00000_0001_em.bb3"); ok(L && L.kind === "bb3", "em.bb3 recognised as bb3"); }
   { const L = await F.parse(new Uint8Array(0), "hostlog.dat"); ok(L && L.notes.includes("empty"), "empty diagnostics file"); }
   ok(F.sniff("photo.jpg", new Uint8Array([0xff, 0xd8, 0xff])) === null, "images are not logs");
