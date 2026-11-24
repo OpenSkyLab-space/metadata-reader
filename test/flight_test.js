@@ -249,6 +249,8 @@ const gpsMs = utc => utc + 18000; // after 2017
       ok(p.software[1].version === "API 0x103" && p.images.join() === "dji_0001_t,dji_0002_t,dji_0003", "thermotiff log SDK and file names");
       ok(!JSON.stringify(L).includes("C:\\data"), "thermotiff log: no folder paths kept");
       const R = F.procRecord([L])[0]; ok(R.processing.thermal_settings && R.processing.atmospheric_model && !R.processing.photogrammetry_settings && R.made[0] === 1, "thermotiff procRecord");
+      ok((L.facts.find(x => x[0] === "fTempRange") || [])[1] === "10.00 … 31.00 °C (image means 20.00 … 21.00 °C)" && !L.notes.includes("thermal-clipped"), "thermotiff log: temperature range");
+      const C = await F.parse(u8(csv.replace("10.000,30.000", "-20.000,30.000")), "conversion_log.csv"); ok(C.notes.includes("thermal-clipped") && /^1 · DJI_0001_T\.JPG \(-20 °C\)$/.test((C.facts.find(x => x[0] === "fTempClipped") || [])[1]), "thermotiff log: minimum at the DJI range limit is clipping");
       const rec = { software: { name: "ThermoTIFF", version: "0.1.0", dji_thermal_sdk_api: "0x103", exiftool: "12.76", python: "3.12", qt: "6.7" }, created: "2030-06-01T14:00:00+02:00",
         camera: { model: "ExampleT", focal_length_mm: 9.1, width_px: 640, height_px: 512 }, input: { folder: "C:/secret/folder", images: 2, dates: ["2030-06-01"], duration_s: 120, mean_height_m: 60 },
         parameters: { distance_m: 20, humidity_pct: 50, emissivity: 0.95, reflected_C: 25, source: "set by the user" }, output: { folder: "C:/secret/out", format: "TIFF float32, deflate, degrees Celsius", converted: 2, errors: 0 },

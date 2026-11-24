@@ -869,11 +869,16 @@ async function parseJPEG(ctx) {
     // an MPF image may follow zero padding: WingtraHub rewrites APP1 of Sony JPEGs and pads, so that the MPF offsets of the preview stay valid
     const nextMP = mpf ? mpf.images.filter(im => im.start).map(im => mpf.base + im.start).filter(o => o > end && o - end <= 65536).sort((a, b) => a - b)[0] : null;
     let pad = 0; if (nextMP != null) { const z = await src.read(end, nextMP - end); if (z.length === nextMP - end && z.every(x => x === 0)) pad = nextMP - end; }
-    const inMPF = mpf && (pad > 0 || mpf.images.some(im => im.start && mpf.base + im.start === end));
+    // DJI M3T (2026): the declared length of MPF image 1 reaches past its EOI, and the next MPF image starts right after that length;
+    // the bytes between are part of image 1 by the MPF list, not an unknown trailer
+    const len1 = mpf && mpf.images[0] && !mpf.images[0].start ? mpf.images[0].length : 0;
+    const inside = !pad && nextMP != null && len1 && end < len1 && nextMP >= len1 && nextMP - len1 <= 16 ? nextMP - end : 0;
+    const inMPF = mpf && (pad > 0 || inside > 0 || mpf.images.some(im => im.start && mpf.base + im.start === end));
     if (pad) ctx.seg("zero padding before MPF image", "trailer", end, pad, pad + " zero bytes");
-    let note = pad ? "MPF image after " + pad + " zero bytes" : "";
+    if (inside) ctx.seg("data after EOI within MPF image 1", "trailer", end, inside, inside + " bytes, counted in the MPF length of image 1");
+    let note = pad ? "MPF image after " + pad + " zero bytes" : inside ? "MPF image after " + inside + " bytes within the MPF length of image 1" : "";
     let jo = -1; for (let i = 0; i + 2 < head.length; i++) if (head[i] === 0xff && head[i + 1] === 0xd8 && head[i + 2] === 0xff) { jo = i; break; }
-    if (pad) { /* note set above */ }
+    if (pad || inside) { /* note set above */ }
     else if (head[0] === 0xff && head[1] === 0xd8) note = inMPF ? "MPF image" : "JPEG";
     else if (jo > 0) note = "JPEG at +" + jo;
     else if (latin1(head, 4, 4) === "ftyp") note = "MP4 video (EmbeddedVideo)";

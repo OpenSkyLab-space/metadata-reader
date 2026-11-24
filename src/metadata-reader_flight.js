@@ -274,8 +274,8 @@ const VERIFIED = [
   { kind: "efl", re: /./, ver: "–", src: "internal" },
   { kind: "pix4d-project", re: /^Pix4Dmapper 4\.4\./, ver: "Pix4Dmapper 4.4.12 (.p4d file version 21)", src: "internal" },
   { kind: "metashape", re: /^Metashape 2\.1\./, ver: "Metashape 2.1.2 (chunk format 1.7.0)", src: "internal" },
-  // ThermoTIFF 0.1.0: read from its source code (conversion_log.csv, processing_record.json); checked on synthetic files only
-  { kind: "thermotiff-log", re: /(?!)/, ver: "", src: "source code + synthetic" },
+  // ThermoTIFF 0.1.0: read from its source code; conversion_log.csv also checked on a real run (DJI M3T, SDK API 0x13), processing_record.json on synthetic files only
+  { kind: "thermotiff-log", re: /^ThermoTIFF/, ver: "ThermoTIFF 0.1.0 (DJI Thermal SDK API 0x13, M3T)", src: "internal" },
   { kind: "thermotiff-record", re: /(?!)/, ver: "", src: "source code + synthetic" },
   { kind: "dji-fr", re: /^v(8)\b/, ver: "FlightRecord v8 (iOS apps 4.3.64 and 4.9.1; 2019, 2026)", src: "internal" },
   { kind: "dji-fr", re: /^v(14)\b/, ver: "FlightRecord v14, summary only (iOS apps 4.95 and 4.103, 2022; app on platform 6, 2026)", src: "internal" }
@@ -1918,7 +1918,7 @@ function ttProc(L, sw, step, settings, images, extra) {
 async function pThermoLog(src, L) {
   const lines = (await text(src)).replace(/^﻿/, "").split(/\r?\n/).filter(x => x.trim()), head = csvSplit(lines[0], ","), ix = n => head.indexOf(n);
   const rows = lines.slice(1).map(l => csvSplit(l, ",")).filter(r => r.length >= head.length - 1);
-  const st = {}, combos = new Map(), api = new Set(), over = new Set(), names = []; let secs = 0;
+  const st = {}, combos = new Map(), api = new Set(), over = new Set(), names = [], tmin = [], tmax = [], tmean = [], clip = []; let secs = 0;
   for (const r of rows) {
     const s = r[ix("status")] || ""; st[s] = (st[s] || 0) + 1; names.push(baseName(r[ix("source")]));
     const t = +r[ix("seconds")]; if (isFinite(t)) secs += t;
@@ -1926,6 +1926,10 @@ async function pThermoLog(src, L) {
     const p = {}; for (const [c, k] of TT_PARAMS) { const v = r[ix(c)]; if (v !== "" && v != null && isFinite(+v)) p[k] = +v; }
     const key = JSON.stringify(p); combos.set(key, (combos.get(key) || 0) + 1);
     if (r[ix("dji_api_version")]) api.add(r[ix("dji_api_version")]); if (r[ix("overridden")]) over.add(r[ix("overridden")]);
+    const a = parseFloat(r[ix("t_min_C")]), b = parseFloat(r[ix("t_max_C")]), m = parseFloat(r[ix("t_mean_C")]);
+    if (isFinite(a)) tmin.push(a); if (isFinite(b)) tmax.push(b); if (isFinite(m)) tmean.push(m);
+    // the DJI Thermal SDK clips to the camera's measuring range: a minimum or maximum exactly at a DJI range limit marks clipped pixels (e.g. sky below −20 °C on the M3T)
+    if ([a, b].some(v => [-40, -20, 150, 500, 550].includes(v))) clip.push(baseName(r[ix("source")]) + " (" + [a, b].filter(v => [-40, -20, 150, 500, 550].includes(v)).join(", ") + " °C)");
   }
   fact(L, "fFormat", "ThermoTIFF conversion_log.csv");
   fact(L, "fImages", rows.length + " (" + Object.entries(st).map(([k, v]) => k + " " + v).join(", ") + ")");
@@ -1933,6 +1937,8 @@ async function pThermoLog(src, L) {
   const ov = [...over].join("; "), src0 = ov ? "set by the user for " + ov.replace(/=[^,;]*/g, "") + "; other values stored in the images" : "stored in the images";
   fact(L, "fThermalParams", Object.entries(P).map(([k, v]) => k + " " + v).join(", ") + (sets.length > 1 ? " (" + sets.length + " different sets; the most frequent shown)" : ""));
   if (ov) fact(L, "fOverridden", ov);
+  if (tmin.length) fact(L, "fTempRange", Math.min(...tmin).toFixed(2) + " … " + Math.max(...tmax).toFixed(2) + " °C" + (tmean.length ? " (image means " + Math.min(...tmean).toFixed(2) + " … " + Math.max(...tmean).toFixed(2) + " °C)" : ""));
+  if (clip.length) { fact(L, "fTempClipped", clip.length + " · " + clip.slice(0, 5).join(", ") + (clip.length > 5 ? " …" : "")); L.notes.push("thermal-clipped"); }
   const settings = Object.assign({ method: TT_METHOD }, P, { parameter_source: src0 }, sets.length > 1 ? { parameter_sets: sets.map(([k, n]) => Object.assign(JSON.parse(k), { images: n })) } : {});
   ttProc(L, [{ name: "ThermoTIFF", version: "", note: "the version is not in conversion_log.csv (it is in the TIFF and in processing_record.json)" }, { name: "DJI Thermal SDK", version: api.size ? "API " + [...api].join(", ") : "" }],
     { order: 1, name: "Convert R-JPEG to temperature TIFF", method: TT_METHOD, parameters: Object.assign({}, P, { parameter_source: src0, images: rows.length, converted: st.ok || 0, errors: (st.error || 0) + (st.not_radiometric || 0), skipped: st.skipped || 0 }), duration_s: +secs.toFixed(2) },

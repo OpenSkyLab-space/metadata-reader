@@ -117,6 +117,17 @@ function hubSonyJpeg() {
   const mp = mpfSeg(0), end = head.length + mp.length + tail.length;
   return Buffer.concat([head, mpfSeg(end + pad.length - base), tail, pad, preview]);
 }
+/* DJI M3T (2026): MPF image 1 declares a length past its EOI, filled with non-zero bytes; MPF image 2 starts right after that length */
+function djiMpfGapJpeg() {
+  const tiff = tiffBlock([[0x10f, 2, "DJI"], [0x110, 2, "ExampleT"]], [dto("2030:06:01 12:00:00")], null);
+  const mpfSeg = (len1, start) => { const list = Buffer.alloc(32); list.writeUInt32LE(0x20030000, 0); list.writeUInt32LE(len1, 4); list.writeUInt32LE(0, 8); list.writeUInt32LE(0x00010001, 16); list.writeUInt32LE(4, 20); list.writeUInt32LE(start, 24);
+    const t = Buffer.concat([Buffer.from([0x49, 0x49, 42, 0, 8, 0, 0, 0]), tiffIFD([[0xb000, 7, Buffer.from("0100", "latin1")], [0xb001, 4, [2]], [0xb002, 7, list]], 8)]);
+    return seg(0xe2, Buffer.concat([Buffer.from("MPF\0", "latin1"), t])); };
+  const head = Buffer.concat([Buffer.from([0xff, 0xd8]), seg(0xe1, Buffer.concat([Buffer.from("Exif\0\0", "latin1"), tiff]))]);
+  const base = head.length + 4 + 4, gap = Buffer.alloc(51, 0xff), tail = Buffer.from([0xff, 0xd9]), preview = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  const end = head.length + mpfSeg(0, 0).length + tail.length, len1 = end + gap.length;
+  return Buffer.concat([head, mpfSeg(len1, len1 - base), tail, gap, preview]);
+}
 const CASES = [
   ["dls2_irradiance.tif", () => tiffBlock([[0x10f, 2, "MicaSense"], [0x110, 2, "RedEdge-P"]], [dto("2030:06:01 10:00:00")], null,
     { xmp: xmpPacket({ Camera: CAMNS, DLS: DLSNS }, { "Camera:BandName": "Blue", "Camera:CentralWavelength": "475", "Camera:Irradiance": "50.5", "DLS:HorizontalIrradiance": "48.0", "DLS:SpectralIrradiance": "50.5" }) }),
@@ -168,6 +179,8 @@ const CASES = [
   ["wingtra_hub_sony.jpg", hubSonyJpeg,
     r => r.summary.clockSuspect === "rewritten" && r.warnings.some(w => w.code === "clock") && !r.warnings.some(w => w.code === "trailer")
       && r.structure.some(x => x.segment === "zero padding before MPF image" && x.length === 37) && r.structure.some(x => /^MPF image 2/.test(x.segment))],
+  ["dji_mpf_gap.jpg", djiMpfGapJpeg,
+    r => !r.warnings.some(w => w.code === "trailer") && r.structure.some(x => x.segment === "data after EOI within MPF image 1" && x.length === 51) && r.structure.some(x => /^MPF image 2/.test(x.segment))],
   ["gps_whole_seconds.tif", () => tiffBlock([[0x10f, 2, "MicaSense"], [0x110, 2, "RedEdge-P"]], [dto("2030:06:01 12:00:00"), [0x9291, 2, "408"]],
     gpsBlock(50, 14, 400).concat([[7, 5, [[11, 1], [0, 1], [0, 1]]], [29, 2, "2030:06:01"]])),
     r => r.summary.tz === 60 && r.summary.clockOffset === 0 && r.summary.utc === "2030-06-01T11:00:00.000Z"],

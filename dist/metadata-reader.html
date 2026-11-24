@@ -1243,11 +1243,16 @@ async function parseJPEG(ctx) {
     // an MPF image may follow zero padding: WingtraHub rewrites APP1 of Sony JPEGs and pads, so that the MPF offsets of the preview stay valid
     const nextMP = mpf ? mpf.images.filter(im => im.start).map(im => mpf.base + im.start).filter(o => o > end && o - end <= 65536).sort((a, b) => a - b)[0] : null;
     let pad = 0; if (nextMP != null) { const z = await src.read(end, nextMP - end); if (z.length === nextMP - end && z.every(x => x === 0)) pad = nextMP - end; }
-    const inMPF = mpf && (pad > 0 || mpf.images.some(im => im.start && mpf.base + im.start === end));
+    // DJI M3T (2026): the declared length of MPF image 1 reaches past its EOI, and the next MPF image starts right after that length;
+    // the bytes between are part of image 1 by the MPF list, not an unknown trailer
+    const len1 = mpf && mpf.images[0] && !mpf.images[0].start ? mpf.images[0].length : 0;
+    const inside = !pad && nextMP != null && len1 && end < len1 && nextMP >= len1 && nextMP - len1 <= 16 ? nextMP - end : 0;
+    const inMPF = mpf && (pad > 0 || inside > 0 || mpf.images.some(im => im.start && mpf.base + im.start === end));
     if (pad) ctx.seg("zero padding before MPF image", "trailer", end, pad, pad + " zero bytes");
-    let note = pad ? "MPF image after " + pad + " zero bytes" : "";
+    if (inside) ctx.seg("data after EOI within MPF image 1", "trailer", end, inside, inside + " bytes, counted in the MPF length of image 1");
+    let note = pad ? "MPF image after " + pad + " zero bytes" : inside ? "MPF image after " + inside + " bytes within the MPF length of image 1" : "";
     let jo = -1; for (let i = 0; i + 2 < head.length; i++) if (head[i] === 0xff && head[i + 1] === 0xd8 && head[i + 2] === 0xff) { jo = i; break; }
-    if (pad) { /* note set above */ }
+    if (pad || inside) { /* note set above */ }
     else if (head[0] === 0xff && head[1] === 0xd8) note = inMPF ? "MPF image" : "JPEG";
     else if (jo > 0) note = "JPEG at +" + jo;
     else if (latin1(head, 4, 4) === "ftyp") note = "MP4 video (EmbeddedVideo)";
@@ -2921,8 +2926,8 @@ const VERIFIED = [
   { kind: "efl", re: /./, ver: "–", src: "internal" },
   { kind: "pix4d-project", re: /^Pix4Dmapper 4\.4\./, ver: "Pix4Dmapper 4.4.12 (.p4d file version 21)", src: "internal" },
   { kind: "metashape", re: /^Metashape 2\.1\./, ver: "Metashape 2.1.2 (chunk format 1.7.0)", src: "internal" },
-  // ThermoTIFF 0.1.0: read from its source code (conversion_log.csv, processing_record.json); checked on synthetic files only
-  { kind: "thermotiff-log", re: /(?!)/, ver: "", src: "source code + synthetic" },
+  // ThermoTIFF 0.1.0: read from its source code; conversion_log.csv also checked on a real run (DJI M3T, SDK API 0x13), processing_record.json on synthetic files only
+  { kind: "thermotiff-log", re: /^ThermoTIFF/, ver: "ThermoTIFF 0.1.0 (DJI Thermal SDK API 0x13, M3T)", src: "internal" },
   { kind: "thermotiff-record", re: /(?!)/, ver: "", src: "source code + synthetic" },
   { kind: "dji-fr", re: /^v(8)\b/, ver: "FlightRecord v8 (iOS apps 4.3.64 and 4.9.1; 2019, 2026)", src: "internal" },
   { kind: "dji-fr", re: /^v(14)\b/, ver: "FlightRecord v14, summary only (iOS apps 4.95 and 4.103, 2022; app on platform 6, 2026)", src: "internal" }
@@ -4565,7 +4570,7 @@ function ttProc(L, sw, step, settings, images, extra) {
 async function pThermoLog(src, L) {
   const lines = (await text(src)).replace(/^﻿/, "").split(/\r?\n/).filter(x => x.trim()), head = csvSplit(lines[0], ","), ix = n => head.indexOf(n);
   const rows = lines.slice(1).map(l => csvSplit(l, ",")).filter(r => r.length >= head.length - 1);
-  const st = {}, combos = new Map(), api = new Set(), over = new Set(), names = []; let secs = 0;
+  const st = {}, combos = new Map(), api = new Set(), over = new Set(), names = [], tmin = [], tmax = [], tmean = [], clip = []; let secs = 0;
   for (const r of rows) {
     const s = r[ix("status")] || ""; st[s] = (st[s] || 0) + 1; names.push(baseName(r[ix("source")]));
     const t = +r[ix("seconds")]; if (isFinite(t)) secs += t;
@@ -4573,6 +4578,10 @@ async function pThermoLog(src, L) {
     const p = {}; for (const [c, k] of TT_PARAMS) { const v = r[ix(c)]; if (v !== "" && v != null && isFinite(+v)) p[k] = +v; }
     const key = JSON.stringify(p); combos.set(key, (combos.get(key) || 0) + 1);
     if (r[ix("dji_api_version")]) api.add(r[ix("dji_api_version")]); if (r[ix("overridden")]) over.add(r[ix("overridden")]);
+    const a = parseFloat(r[ix("t_min_C")]), b = parseFloat(r[ix("t_max_C")]), m = parseFloat(r[ix("t_mean_C")]);
+    if (isFinite(a)) tmin.push(a); if (isFinite(b)) tmax.push(b); if (isFinite(m)) tmean.push(m);
+    // the DJI Thermal SDK clips to the camera's measuring range: a minimum or maximum exactly at a DJI range limit marks clipped pixels (e.g. sky below −20 °C on the M3T)
+    if ([a, b].some(v => [-40, -20, 150, 500, 550].includes(v))) clip.push(baseName(r[ix("source")]) + " (" + [a, b].filter(v => [-40, -20, 150, 500, 550].includes(v)).join(", ") + " °C)");
   }
   fact(L, "fFormat", "ThermoTIFF conversion_log.csv");
   fact(L, "fImages", rows.length + " (" + Object.entries(st).map(([k, v]) => k + " " + v).join(", ") + ")");
@@ -4580,6 +4589,8 @@ async function pThermoLog(src, L) {
   const ov = [...over].join("; "), src0 = ov ? "set by the user for " + ov.replace(/=[^,;]*/g, "") + "; other values stored in the images" : "stored in the images";
   fact(L, "fThermalParams", Object.entries(P).map(([k, v]) => k + " " + v).join(", ") + (sets.length > 1 ? " (" + sets.length + " different sets; the most frequent shown)" : ""));
   if (ov) fact(L, "fOverridden", ov);
+  if (tmin.length) fact(L, "fTempRange", Math.min(...tmin).toFixed(2) + " … " + Math.max(...tmax).toFixed(2) + " °C" + (tmean.length ? " (image means " + Math.min(...tmean).toFixed(2) + " … " + Math.max(...tmean).toFixed(2) + " °C)" : ""));
+  if (clip.length) { fact(L, "fTempClipped", clip.length + " · " + clip.slice(0, 5).join(", ") + (clip.length > 5 ? " …" : "")); L.notes.push("thermal-clipped"); }
   const settings = Object.assign({ method: TT_METHOD }, P, { parameter_source: src0 }, sets.length > 1 ? { parameter_sets: sets.map(([k, n]) => Object.assign(JSON.parse(k), { images: n })) } : {});
   ttProc(L, [{ name: "ThermoTIFF", version: "", note: "the version is not in conversion_log.csv (it is in the TIFF and in processing_record.json)" }, { name: "DJI Thermal SDK", version: api.size ? "API " + [...api].join(", ") : "" }],
     { order: 1, name: "Convert R-JPEG to temperature TIFF", method: TT_METHOD, parameters: Object.assign({}, P, { parameter_source: src0, images: rows.length, converted: st.ok || 0, errors: (st.error || 0) + (st.not_radiometric || 0), skipped: st.skipped || 0 }), duration_s: +secs.toFixed(2) },
@@ -5463,7 +5474,7 @@ Object.assign(T.cs, {
     "wingtra-geotaglog": "Wingtra geotaglog", "wingtra-json": "Wingtra json", "wingtra-ini": "Wingtra ini", "wingtra-geotags": "Wingtra geotags.csv", "mica-paramlog": "MicaSense paramlog", "mica-gpslog": "MicaSense gpslog", tlmb: "Parrot TLMB", "lidar-service": "Wingtra LiDAR service.log", "lidar-data": "Wingtra LiDAR záznam .data", "wingtra-obc": "Wingtra log palubního počítače (OBC)", pcmp: "Wingtra LiDAR projekt", encrypted: "šifrovaný nebo nepopsaný log" },
   fltF: { fExposures: "Expozice", fQuality: "Kvalita (Q)", fSigma: "σ N / E / V (medián)", fHeight: "Výška", fNoTime: "Čas", fFormat: "Formát", fProgram: "Program", fMarker: "Bod (marker)", fReceiver: "Přijímač", fAntenna: "Anténa",
     fEpochs: "Epochy", fInterval: "Interval", fSats: "Družice (medián)", fSystems: "Systémy", fGaps: "Mezery v datech", fEpochFlags: "Příznaky epoch", fApprox: "Přibližná poloha (hlavička)", fRole: "Role", fNavRecords: "Záznamy efemerid", fNavSats: "Družice v efemeridách",
-    fMessages: "Zprávy", fCrcBad: "Chybný CRC", fMsgTypes: "Typy zpráv", fTow: "Čas v týdnu GPS", fVehicle: "Nosič", fFirmware: "Firmware", fCameraSerial: "Výrobní číslo kamery", fCameraCount: "Počet snímků podle logu", fCameraTriggers: "Spouštění kamery (Wingtra)", fPart: "Díl záznamu", fHardware: "Hardware", fSweeps: "Letové linie (sweep)", fPpkHealth: "Přijímač PPK: hlášení", fStreams: "Datové proudy", fBrokenAt: "Rámce poškozené od bajtu", fDuration: "Délka záznamu",
+    fMessages: "Zprávy", fCrcBad: "Chybný CRC", fMsgTypes: "Typy zpráv", fTow: "Čas v týdnu GPS", fVehicle: "Nosič", fFirmware: "Firmware", fCameraSerial: "Výrobní číslo kamery", fCameraCount: "Počet snímků podle logu", fCameraTriggers: "Spouštění kamery (Wingtra)", fPart: "Díl záznamu", fTempRange: "Teploty (min … max)", fTempClipped: "Snímky s hodnotou na mezi rozsahu", fHardware: "Hardware", fSweeps: "Letové linie (sweep)", fPpkHealth: "Přijímač PPK: hlášení", fStreams: "Datové proudy", fBrokenAt: "Rámce poškozené od bajtu", fDuration: "Délka záznamu",
     fTopics: "Témata (topics)", fGnssFix: "Řešení GNSS", fEph: "eph / epv (medián)", fLogMessages: "Zprávy logu", fParams: "Parametry", fBlocks: "Bloky", fPvtModes: "Režimy PVT", fHacc: "Přesnost H / V (medián)", fUndulation: "Undulace geoidu",
     fRawObs: "Surová měření (pro PPK)", fEvents: "Události kamery (ExtEvent)", fEventModes: "Řešení v okamžiku expozice", fFrames: "Rámce", fDeviceStrings: "Údaje o zařízení", fImages: "Snímky", fShots: "Expozice (sady)", fAccXY: "Přesnost XY / Z (medián)",
     fShareRtk: "Podíl σXY ≤ 0,1 m", fName: "Název", fCamera: "Kamera", fStart: "Začátek", fTrackPoints: "Body trajektorie", fCameraModel: "Model kamery", fSurvey: "Metoda měření", fTimeStamps: "Časové značky", fProject: "Projekt", fMatched: "Spárováno",
@@ -5495,7 +5506,7 @@ Object.assign(T.en, {
     "wingtra-geotaglog": "Wingtra geotaglog", "wingtra-json": "Wingtra json", "wingtra-ini": "Wingtra ini", "wingtra-geotags": "Wingtra geotags.csv", "mica-paramlog": "MicaSense paramlog", "mica-gpslog": "MicaSense gpslog", tlmb: "Parrot TLMB", "lidar-service": "Wingtra LiDAR service.log", "lidar-data": "Wingtra LiDAR recording .data", "wingtra-obc": "Wingtra payload computer log (OBC)", pcmp: "Wingtra LiDAR project", encrypted: "encrypted or undocumented log" },
   fltF: { fExposures: "Exposures", fQuality: "Quality (Q)", fSigma: "σ N / E / V (median)", fHeight: "Height", fNoTime: "Time", fFormat: "Format", fProgram: "Program", fMarker: "Marker", fReceiver: "Receiver", fAntenna: "Antenna",
     fEpochs: "Epochs", fInterval: "Interval", fSats: "Satellites (median)", fSystems: "Systems", fGaps: "Data gaps", fEpochFlags: "Epoch flags", fApprox: "Approximate position (header)", fRole: "Role", fNavRecords: "Ephemeris records", fNavSats: "Satellites in ephemerides",
-    fMessages: "Messages", fCrcBad: "CRC errors", fMsgTypes: "Message types", fTow: "GPS time of week", fVehicle: "Vehicle", fFirmware: "Firmware", fCameraSerial: "Camera serial number", fCameraCount: "Image count in the log", fCameraTriggers: "Camera triggers (Wingtra)", fPart: "Recording part", fHardware: "Hardware", fSweeps: "Flight lines (sweeps)", fPpkHealth: "PPK receiver: reports", fStreams: "Data streams", fBrokenAt: "Framing broken from byte", fDuration: "Log duration",
+    fMessages: "Messages", fCrcBad: "CRC errors", fMsgTypes: "Message types", fTow: "GPS time of week", fVehicle: "Vehicle", fFirmware: "Firmware", fCameraSerial: "Camera serial number", fCameraCount: "Image count in the log", fCameraTriggers: "Camera triggers (Wingtra)", fPart: "Recording part", fTempRange: "Temperatures (min … max)", fTempClipped: "Images with a value at a range limit", fHardware: "Hardware", fSweeps: "Flight lines (sweeps)", fPpkHealth: "PPK receiver: reports", fStreams: "Data streams", fBrokenAt: "Framing broken from byte", fDuration: "Log duration",
     fTopics: "Topics", fGnssFix: "GNSS solution", fEph: "eph / epv (median)", fLogMessages: "Log messages", fParams: "Parameters", fBlocks: "Blocks", fPvtModes: "PVT modes", fHacc: "Accuracy H / V (median)", fUndulation: "Geoid undulation",
     fRawObs: "Raw measurements (for PPK)", fEvents: "Camera events (ExtEvent)", fEventModes: "Solution at exposure", fFrames: "Frames", fDeviceStrings: "Device data", fImages: "Images", fShots: "Exposures (sets)", fAccXY: "Accuracy XY / Z (median)",
     fShareRtk: "Share σXY ≤ 0.1 m", fName: "Name", fCamera: "Camera", fStart: "Start", fTrackPoints: "Track points", fCameraModel: "Camera model", fSurvey: "Survey method", fTimeStamps: "Time stamps", fProject: "Project", fMatched: "Matched",
@@ -5554,7 +5565,7 @@ Object.assign(T.cs.fltN, { partial: "přečtena jen část" }); Object.assign(T.
 Object.assign(T.cs.fltK, { "emotion-transcript": "eMotion transcript", "ebeex-afpu": "eBee X log_n.txt" }); Object.assign(T.en.fltK, { "emotion-transcript": "eMotion transcript", "ebeex-afpu": "eBee X log_n.txt" });
 Object.assign(T.cs.fltF, { fFlight: "Let (vzlet – přistání)", fSession: "Letová relace", fPayload: "Payload", fSerials: "Výrobní čísla", fUnits: "Firmware jednotek", fTimeSync: "Synchronizace času s GNSS", fLogLevels: "Úrovně zpráv", fThermCalib: "Kalibrace termokamery (XMP)" });
 Object.assign(T.en.fltF, { fFlight: "Flight (take-off – landing)", fSession: "Flight session", fPayload: "Payload", fSerials: "Serial numbers", fUnits: "Unit firmware", fTimeSync: "Time sync with GNSS", fLogLevels: "Message levels", fThermCalib: "Thermal camera calibration (XMP)" });
-Object.assign(T.cs.fltN, { "exposures-no-position": "expozice bez polohy", "gps-no-fix-time": "čas GNSS bez fixu nepoužit: UTC neznámý", "lidar-static": "záznam na zemi (všechny polohy do 50 m)", "lidar-data-unreadable": "rámce záznamů nenalezeny", "obc-clock-unset": "hodiny OBC nejsou seřízené podle GNSS a log nemá spouštění PPK: čas v UTC neznámý", "lidar-data-broken": "rámce záznamů od jistého místa poškozené", "ulog-no-captures": "hlavička uvádí snímky, zprávy camera_capture chybí (zkrácený log?)", "no-positions": "bez poloh", "no-date": "bez data" }); Object.assign(T.en.fltN, { "exposures-no-position": "exposures without position", "gps-no-fix-time": "GNSS time without a fix not used: UTC unknown", "lidar-static": "recorded on the ground (all fixes within 50 m)", "lidar-data-unreadable": "record framing not found", "obc-clock-unset": "the OBC clock is not set from GNSS and the log has no PPK triggers: UTC unknown", "lidar-data-broken": "record framing broken from some point on", "ulog-no-captures": "header counts images, no camera_capture messages (reduced log?)", "no-positions": "no positions", "no-date": "no date" });
+Object.assign(T.cs.fltN, { "exposures-no-position": "expozice bez polohy", "gps-no-fix-time": "čas GNSS bez fixu nepoužit: UTC neznámý", "lidar-static": "záznam na zemi (všechny polohy do 50 m)", "lidar-data-unreadable": "rámce záznamů nenalezeny", "thermal-clipped": "teploty oříznuté na mezi měřicího rozsahu kamery (např. obloha pod −20 °C)", "obc-clock-unset": "hodiny OBC nejsou seřízené podle GNSS a log nemá spouštění PPK: čas v UTC neznámý", "lidar-data-broken": "rámce záznamů od jistého místa poškozené", "ulog-no-captures": "hlavička uvádí snímky, zprávy camera_capture chybí (zkrácený log?)", "no-positions": "bez poloh", "no-date": "bez data" }); Object.assign(T.en.fltN, { "exposures-no-position": "exposures without position", "gps-no-fix-time": "GNSS time without a fix not used: UTC unknown", "lidar-static": "recorded on the ground (all fixes within 50 m)", "lidar-data-unreadable": "record framing not found", "thermal-clipped": "temperatures clipped at the camera measuring range limit (e.g. sky below −20 °C)", "obc-clock-unset": "the OBC clock is not set from GNSS and the log has no PPK triggers: UTC unknown", "lidar-data-broken": "record framing broken from some point on", "ulog-no-captures": "header counts images, no camera_capture messages (reduced log?)", "no-positions": "no positions", "no-date": "no date" });
 Object.assign(T.cs.fltK, { "pix4dcapture-log": "Pix4Dcapture log" }); Object.assign(T.en.fltK, { "pix4dcapture-log": "Pix4Dcapture log" });
 Object.assign(T.cs.fltF, { fMission: "Typ mise", fAppSettings: "Nastavení aplikace" }); Object.assign(T.en.fltF, { fMission: "Mission type", fAppSettings: "App settings" });
 T.cs.fltV.push(["Pix4Dcapture app log", "log aplikace Pix4Dcapture"], [" (app defaults, not necessarily the flown plan)", " (výchozí hodnoty aplikace, ne nutně odlétaný plán)"], [" (selected in the app: ", " (zvoleno v aplikaci: "],
@@ -5749,6 +5760,7 @@ T.cs.fltV.push(["Wingtra LiDAR recording (.data)", "záznam Wingtra LiDAR (.data
   [/ · (\d+) ≠ (\d+) B/, " · $1 ≠ $2 B"], [/first part (\d{3})/, "první díl $1"], [/missing (\d{3})/g, "chybí $1"], [/after (\d{3}) a further part is expected/, "po $1 má následovat další díl"], ["NovAtel OEM binary", "NovAtel OEM binární"]);
 T.cs.fltV.push(["Wingtra payload computer log (OBC)", "log palubního počítače Wingtra (OBC)"], ["WingtraOne payload computer (OBC)", "palubní počítač WingtraOne (OBC)"], [/(\d+) PPK triggers \(/, "$1 spuštění PPK ("], [/ geotag items · triggers without a geotag item: /, " položek geotagu · spuštění bez položky geotagu: "],
   ["RF interference: ", "rušení RF: "], ["SBF parser failures: ", "chyby parseru SBF: "], ["receiver ExtError: ", "ExtError přijímače: "], [" (OBC clock, zone not stated)", " (hodiny OBC, pásmo neuvedeno)"], ["[error] ", "[chyba] "]);
+T.cs.fltV.push([" (image means ", " (průměry snímků "]);
 /* ---------------------------------------------------------------- tab: flight (logs read by OSLFlight; function declarations only, this part follows the UI) */
 function flightImages() { return batchFiles().map(f => ({ name: f.name, S: f.res.summary, captureId: tv(f, "CaptureId") != null ? String(tv(f, "CaptureId")) : null, c2pa: !!f.res.summary.c2pa })); }
 function flightLogs() { return (st.logs || []).filter(l => l.L).map(l => l.L); }
