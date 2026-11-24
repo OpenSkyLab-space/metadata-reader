@@ -866,10 +866,15 @@ async function parseJPEG(ctx) {
   }
   if (end < src.size) {
     const tl = src.size - end, head = await src.read(end, 16);
-    const inMPF = mpf && mpf.images.some(im => im.start && mpf.base + im.start === end);
-    let note = "";
+    // an MPF image may follow zero padding: WingtraHub rewrites APP1 of Sony JPEGs and pads, so that the MPF offsets of the preview stay valid
+    const nextMP = mpf ? mpf.images.filter(im => im.start).map(im => mpf.base + im.start).filter(o => o > end && o - end <= 65536).sort((a, b) => a - b)[0] : null;
+    let pad = 0; if (nextMP != null) { const z = await src.read(end, nextMP - end); if (z.length === nextMP - end && z.every(x => x === 0)) pad = nextMP - end; }
+    const inMPF = mpf && (pad > 0 || mpf.images.some(im => im.start && mpf.base + im.start === end));
+    if (pad) ctx.seg("zero padding before MPF image", "trailer", end, pad, pad + " zero bytes");
+    let note = pad ? "MPF image after " + pad + " zero bytes" : "";
     let jo = -1; for (let i = 0; i + 2 < head.length; i++) if (head[i] === 0xff && head[i + 1] === 0xd8 && head[i + 2] === 0xff) { jo = i; break; }
-    if (head[0] === 0xff && head[1] === 0xd8) note = inMPF ? "MPF image" : "JPEG";
+    if (pad) { /* note set above */ }
+    else if (head[0] === 0xff && head[1] === 0xd8) note = inMPF ? "MPF image" : "JPEG";
     else if (jo > 0) note = "JPEG at +" + jo;
     else if (latin1(head, 4, 4) === "ftyp") note = "MP4 video (EmbeddedVideo)";
     else note = hexstr(head, 8);
@@ -923,8 +928,9 @@ async function jpegSegment(ctx, m, d, dOff, iccChunks, seen) {
       const mpf = { base, images: [] };
       const g = ctx.gmap.get("MPF"), ent = g && g.tags.find(t => t.name === "MPImageList");
       const le = latin1(d, 4, 2) === "II";
-      if (ent && ent.binary) {
-        const nb = await ctx.src.read(ent.binary.offset, ent.binary.length);
+      // up to 64 bytes (4 images) the list is stored as a value array, not as a binary reference
+      const nb = !ent ? null : ent.binary ? await ctx.src.read(ent.binary.offset, ent.binary.length) : Array.isArray(ent.value) ? Uint8Array.from(ent.value) : null;
+      if (nb) {
         for (let k = 0; k * 16 + 16 <= nb.length && k < 64; k++) {
           const dv = DV(nb), attr = dv.getUint32(k * 16, le), size = dv.getUint32(k * 16 + 4, le), start = dv.getUint32(k * 16 + 8, le);
           const im = { flags: attr >>> 27 & 0x1f, format: attr >>> 24 & 7, type: attr & 0xffffff, length: size, start, dep1: dv.getUint16(k * 16 + 12, le), dep2: dv.getUint16(k * 16 + 14, le) };
@@ -2055,13 +2061,18 @@ function derive(result, opts, pending) {
   if (utcMs == null && result.info && result.info.qtCreate) { utcMs = result.info.qtCreate; utcSrc = "QuickTime:CreateDate (UTC)"; }
   const refMs = utcMs != null && utcSrc && !/^DateTimeOriginal/.test(utcSrc) ? utcMs : null;
   if (tz == null && local && refMs != null) { const dmin = Math.round((local.ms - refMs) / 60000 / 15) * 15; if (Math.abs(dmin) <= 14 * 60 && Math.abs(local.ms - refMs - dmin * 60000) < 300000) { tz = dmin; tzSrc = "DateTimeOriginal - UTC (" + (djiUtc ? "UTCAtExposure" : "GPS time") + ")"; } }
-  if (local && refMs != null && tz != null) { const off = (local.ms - refMs - tz * 60000) / 1000; S.clockOffset = off; D("CameraClockOffset", rnd(off, 1), (off >= 0 ? "+" : "") + num(rnd(off, 1)) + " s", [ID("DateTimeOriginal", EX), utcSrc], "DateTimeOriginal - time zone - UTC; DateTimeOriginal has whole seconds unless SubSecTimeOriginal is set"); }
+  // a reference in whole seconds (GPSTimeStamp rewritten without a fraction, e.g. by WingtraHub) is compared in whole seconds, so a sub-second part of DateTimeOriginal does not show up as an offset
+  if (local && refMs != null && tz != null) { const whole = refMs % 1000 === 0, lms = whole ? Math.floor(local.ms / 1000) * 1000 : local.ms, off = (lms - refMs - tz * 60000) / 1000; S.clockOffset = off; D("CameraClockOffset", rnd(off, 1), (off >= 0 ? "+" : "") + num(rnd(off, 1)) + " s", [ID("DateTimeOriginal", EX), utcSrc], "DateTimeOriginal - time zone - UTC; whole seconds when either time has no fraction (DateTimeOriginal without SubSecTimeOriginal, GPSTimeStamp without decimals)"); }
   S.localTime = local ? iso(local.ms).replace(/Z$/, "") : null; S.utc = utcMs != null ? iso(utcMs) : null; S.utcMs = utcMs; S.utcSrc = utcSrc; S.tz = tz; S.tzSrc = tzSrc;
   if (utcMs != null) D("DateTimeUTC", S.utc, S.utc, [utcSrc], tzSrc ? "time zone: " + tzStr(tz || 0) + " (" + tzSrc + ")" : "");
   else if (local) D("DateTimeUTC", null, "(unknown: local time without time zone)", [ID("DateTimeOriginal", EX)], "no OffsetTimeOriginal, no GPS time, no UTC tag");
   if (tz != null && tzSrc) D("TimeZone", tzStr(tz), tzStr(tz), [tzSrc]);
   if (local) { const ld = new Date(local.ms), yr = ld.getUTCFullYear(), reset = ld.getUTCMonth() === 0 && ld.getUTCDate() === 1 && ld.getUTCHours() < 6, gpsOff = gpsMs != null && Math.abs(local.ms - gpsMs) > 86400000;
-    if (reset || yr < 2005 || gpsOff) { S.clockSuspect = reset ? "reset" : yr < 2005 ? "old" : "gps-mismatch"; D("ClockCheck", S.clockSuspect, reset ? "camera clock probably not set (1 January, early morning)" : yr < 2005 ? "camera clock probably not set (year " + yr + ")" : "DateTimeOriginal differs from GPS time by more than one day", [ID("DateTimeOriginal", EX), gpsMs != null ? "Composite:GPSDateTime" : null], "take the time from the flight log"); result.warnings.push({ code: "clock", text: "camera clock suspect: DateTimeOriginal " + S.localTime, offset: null }); } }
+    // cameras write DateTimeOriginal and CreateDate from one clock; a difference of more than a day means one was rewritten after capture
+    // (WingtraHub 2.20 rewrites DateTimeOriginal of Sony a6100 photos and keeps CreateDate from an unset camera clock, 2019-01-01)
+    const cd = parseDT(dtc), rew = cd && Math.abs(local.ms - cd.ms) > 86400000;
+    if (!(reset || yr < 2005 || gpsOff) && rew) { S.clockSuspect = "rewritten"; D("ClockCheck", S.clockSuspect, "DateTimeOriginal differs from CreateDate (" + dtc + ") by more than one day: one of them was rewritten after capture", [ID("DateTimeOriginal", EX), ID("CreateDate", EX)], "take the time from the flight log"); result.warnings.push({ code: "clock", text: "DateTimeOriginal " + S.localTime + " and CreateDate " + dtc + " differ by more than one day", offset: null }); }
+    else if (reset || yr < 2005 || gpsOff) { S.clockSuspect = reset ? "reset" : yr < 2005 ? "old" : "gps-mismatch"; D("ClockCheck", S.clockSuspect, reset ? "camera clock probably not set (1 January, early morning)" : yr < 2005 ? "camera clock probably not set (year " + yr + ")" : "DateTimeOriginal differs from GPS time by more than one day", [ID("DateTimeOriginal", EX), gpsMs != null ? "Composite:GPSDateTime" : null], "take the time from the flight log"); result.warnings.push({ code: "clock", text: "camera clock suspect: DateTimeOriginal " + S.localTime, offset: null }); } }
   /* sun position */
   if (utcMs != null && lat != null) { const sp = solarPosition(utcMs, lat, lon); S.sun = sp; D("SunElevation", rnd(sp.elevation, 2), num(rnd(sp.elevation, 1)) + " deg", ["Derived:DateTimeUTC", "Composite:GPSLatitude"], "NOAA solar position algorithm, with refraction"); D("SunAzimuth", rnd(sp.azimuth, 2), num(rnd(sp.azimuth, 1)) + " deg", ["Derived:DateTimeUTC", "Composite:GPSLongitude"], "clockwise from north"); }
   /* GSD */

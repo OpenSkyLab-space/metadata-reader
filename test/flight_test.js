@@ -74,6 +74,20 @@ const gpsMs = utc => utc + 18000; // after 2017
     ok(L && L.kind === "ulog" && L.trajectory.length === 3, "ulog trajectory, prefix " + pre); ok(near(L.trajectory[0].lat, 49, 1e-9) && near(L.trajectory[0].h, 500, 1e-9), "ulog values, prefix " + pre);
     ok(L.startMs === Date.UTC(2026, 4, 14, 10, 0, 0), "ulog boot → UTC, prefix " + pre); ok(L.device.model === "SYN-VEHICLE!", "ulog info, prefix " + pre); }
 
+  /* Wingtra ULog as in WingtraPilot 2.20 field logs: logged string 'C' with a one-byte tag, receiver time without a fix, an image count without camera_capture */
+  { const pre = 2, msg = (t, body) => { const b = new Uint8Array(pre + 3 + body.length), d = new DataView(b.buffer); d.setUint16(pre, body.length, true); b[pre + 2] = t.charCodeAt(0); b.set(body, pre + 3); return b; };
+    const hdr = new Uint8Array(16); hdr.set([0x55, 0x4c, 0x6f, 0x67, 0x01, 0x12, 0x35, 1]);
+    const B = new Uint8Array(3 + 40); new DataView(B.buffer).setUint16(0, 40, true); B[2] = 0x42;
+    const fmt = msg("F", u8("vehicle_gps_position:uint64_t timestamp;uint64_t time_utc_usec;int32_t lat;int32_t lon;int32_t alt_ellipsoid;float eph;float epv;uint8_t fix_type;uint8_t satellites_used"));
+    const info = (() => { const k = u8("uint32_t camera_image_count"), v = new Uint8Array(4); new DataView(v.buffer).setUint32(0, 5, true); return msg("I", cat(new Uint8Array([k.length]), k, v)); })();
+    const sub = msg("A", cat(new Uint8Array([0, 1, 0]), u8("vehicle_gps_position")));
+    const data = k => { const b = new Uint8Array(40), d = new DataView(b.buffer); d.setUint16(0, 1, true); d.setUint32(2, 5e6 + k * 2e5, true); const utc = (Date.UTC(2011, 2, 26, 6, 46) + k * 200) * 1000; d.setUint32(10, utc % 2 ** 32, true); d.setUint32(14, Math.floor(utc / 2 ** 32), true); b[38] = 0; return msg("D", b); };
+    const C = (() => { const b = new Uint8Array(10 + 12), d = new DataView(b.buffer); b[0] = 0x33; b[1] = 0x30; d.setUint32(2, 4e6, true); b.set(u8("SYN ERROR 1!"), 10); return msg("C", b); })();
+    const L = await F.parse(cat(hdr, B, fmt, info, sub, data(0), C, data(1)), "syn_wingtra.ulg");
+    ok(L.startMs == null && L.notes.includes("gps-no-fix-time"), "ulog: receiver time without a fix not used");
+    ok(L.notes.includes("ulog-no-captures"), "ulog: image count without camera_capture noted");
+    const lm = L.facts.find(f => f[0] === "fLogMessages"); ok(lm && /: SYN ERROR 1!$/.test(lm[1]), "ulog Wingtra: logged string with a one-byte tag read whole"); }
+
   /* MicaSense paramlog: JSON schema, separator, records */
   { const P = [{ parent: 0, key: 1, type: "Ublox", size: 64, name: "Ublox" }, ...[["lat", "double", 8], ["lon", "double", 8], ["altMsl", "double", 8], ["altEll", "double", 8], ["hAcc", "float", 4], ["vAcc", "float", 4], ["timeOfWeek", "double", 8], ["gpsWeek", "int32_t", 4], ["nanoSecond", "int32_t", 4], ["year", "uint16_t", 2], ["month", "uint8_t", 1], ["day", "uint8_t", 1], ["hour", "uint8_t", 1], ["minute", "uint8_t", 1], ["second", "uint8_t", 1], ["valid", "bool", 1]].map(([n, t, s], i) => ({ parent: 1, key: 10 + i, type: t, size: s, name: n })),
       { parent: 0, key: 2, type: "CaptureLog", size: 21, name: "CaptureLog" }, { parent: 2, key: 40, type: "string", size: 21, name: "CaptureId" }];
@@ -120,6 +134,10 @@ const gpsMs = utc => utc + 18000; // after 2017
     ok(L.kind === "sf-geoinfo" && L.exposures[0].q === "ppk", "geoinfo"); }
   { const L = await F.parse(u8("[General]\nEventsRTKFix=98\nx=3950000\ny=950000\nz=4900000\nname=SYN\n"), "syn.ini"); ok(L.kind === "wingtra-ini" && L.rtkFix === 98 && L.base, "wingtra ini"); }
   { const L = await F.parse(u8("# image name,latitude [decimal degrees],longitude [decimal degrees],altitude [meter],omega [degrees],phi [degrees],kappa [degrees],accuracy horizontal [meter],accuracy vertical [meter]\nSYN_00001.JPG,49.0,14.0,500,0,0,0,0.02,0.03\n"), "syn geotags.csv"); ok(L.kind === "wingtra-geotags" && L.exposures[0].q === "ppk", "wingtra geotags"); }
+  { const H = "# image name,latitude [decimal degrees],longitude [decimal degrees],altitude [meter],omega [degrees],phi [degrees],kappa [degrees],accuracy horizontal [meter],accuracy vertical [meter]\n";
+    const rows = (p, n) => Array.from({ length: n }, (_, k) => p + String(k + 1).padStart(5, "0") + ".JPG,49.0" + k + ",14.0,500,0,0,0,0.02,0.03").join("\n") + "\n";
+    const A = await F.parse(u8(H + rows("SYN_A_", 40)), "syn_a geotags.csv"), Bq = await F.parse(u8(H + rows("SYN_B_", 30)), "syn_b geotags.csv"), R = F.combine([A, Bq], []);
+    ok(R.checks.some(c => c.key === "cOtherFlight") && !R.checks.some(c => c.key === "cCountMismatch"), "two geotags.csv naming different images: other flight, no count mismatch"); }
   { const L = await F.parse(u8(JSON.stringify({ geotaggingSessionId: "SYN", payload: "SYN-CAM", version: 1, images: [{ imageName: "SYN_1.tif", geotaggedImage: { imageTimeStamp: Date.UTC(2026, 4, 14, 10), geoRef: { coordSys: "PPK_WGS84", coordinate: [49, 14, 500], hAccuracy: 0.02, vAccuracy: 0.03 } } }], triggers: [], orienations: [] })), "syn.geotaglog");
     ok(L.kind === "wingtra-geotaglog" && L.exposures[0].q === "ppk" && L.startMs === Date.UTC(2026, 4, 14, 10), "wingtra geotaglog"); }
   { const L = await F.parse(u8("2022-01-06-15-27-05.720056333 KRN: Firmware version: 1.0\n2026-05-14-10-00-01.000000000 KRN: $GPRMC,100000.00,A,4900.0000,N,01400.0000,E,0.0,0.0,140526,,,A*00\n"), "service.log");

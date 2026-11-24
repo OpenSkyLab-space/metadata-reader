@@ -103,6 +103,20 @@ function flirJpeg() {
 }
 const TT_DESC = "Temperature in degrees Celsius (float32). Converted from DJI_0001_T.JPG by ThermoTIFF 0.1.0 using DJI Thermal SDK API 0x103. distance=20 m; humidity=55 %; emissivity=0.96; reflection=21.5 C; ambient=19 C";
 
+/* ---- Wingtra (Reader 1.5.0): a Sony JPEG after WingtraHub geotagging. DateTimeOriginal rewritten, CreateDate kept from an unset camera clock,
+   APP1 rewritten with zero padding after EOI so that the MPF preview offset stays valid; the MP image list (32 bytes) is stored as a value array */
+function hubSonyJpeg() {
+  const tiff = tiffBlock([[0x10f, 2, "SONY"], [0x110, 2, "ExampleCam"]], [dto("2030:06:01 12:00:00"), [0x9004, 2, "2019:01:01 00:04:50"], [0x9011, 2, "+01:00"]], null);
+  const mpfSeg = start => { // MPF payload: "MPF\0" + little-endian TIFF with version, number of images and a 2-entry image list
+    const list = Buffer.alloc(32); list.writeUInt32LE(0x20030000, 0); list.writeUInt32LE(999999, 4); list.writeUInt32LE(0, 8); list.writeUInt32LE(0x00010002, 16); list.writeUInt32LE(4, 20); list.writeUInt32LE(start, 24);
+    const t = Buffer.concat([Buffer.from([0x49, 0x49, 42, 0, 8, 0, 0, 0]), tiffIFD([[0xb000, 7, Buffer.from("0100", "latin1")], [0xb001, 4, [2]], [0xb002, 7, list]], 8)]);
+    return seg(0xe2, Buffer.concat([Buffer.from("MPF\0", "latin1"), t]));
+  };
+  const head = Buffer.concat([Buffer.from([0xff, 0xd8]), seg(0xe1, Buffer.concat([Buffer.from("Exif\0\0", "latin1"), tiff]))]);
+  const base = head.length + 4 + 4, pad = Buffer.alloc(37), tail = Buffer.from([0xff, 0xd9]), preview = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  const mp = mpfSeg(0), end = head.length + mp.length + tail.length;
+  return Buffer.concat([head, mpfSeg(end + pad.length - base), tail, pad, preview]);
+}
 const CASES = [
   ["dls2_irradiance.tif", () => tiffBlock([[0x10f, 2, "MicaSense"], [0x110, 2, "RedEdge-P"]], [dto("2030:06:01 10:00:00")], null,
     { xmp: xmpPacket({ Camera: CAMNS, DLS: DLSNS }, { "Camera:BandName": "Blue", "Camera:CentralWavelength": "475", "Camera:Irradiance": "50.5", "DLS:HorizontalIrradiance": "48.0", "DLS:SpectralIrradiance": "50.5" }) }),
@@ -150,7 +164,13 @@ const CASES = [
     r => r.summary.utc === "2030-06-01T12:00:00.500Z" && r.summary.tz === 120 && Math.abs(r.summary.clockOffset + 0.5) < 1e-6],
   ["dji_no_rtk.jpg", () => jpeg(tiffBlock([[0x10f, 2, "DJI"], [0x110, 2, "ExampleDrone"]], [dto("2030:06:01 14:00:00")], gpsBlock(50, 14, 300)),
     xmpPacket({ "drone-dji": "http://www.dji.com/drone-dji/1.0/" }, { "drone-dji:RtkFlag": "0" })),
-    r => r.summary.rtk.state === "single" && r.summary.rtk.noRtk === true]
+    r => r.summary.rtk.state === "single" && r.summary.rtk.noRtk === true],
+  ["wingtra_hub_sony.jpg", hubSonyJpeg,
+    r => r.summary.clockSuspect === "rewritten" && r.warnings.some(w => w.code === "clock") && !r.warnings.some(w => w.code === "trailer")
+      && r.structure.some(x => x.segment === "zero padding before MPF image" && x.length === 37) && r.structure.some(x => /^MPF image 2/.test(x.segment))],
+  ["gps_whole_seconds.tif", () => tiffBlock([[0x10f, 2, "MicaSense"], [0x110, 2, "RedEdge-P"]], [dto("2030:06:01 12:00:00"), [0x9291, 2, "408"]],
+    gpsBlock(50, 14, 400).concat([[7, 5, [[11, 1], [0, 1], [0, 1]]], [29, 2, "2030:06:01"]])),
+    r => r.summary.tz === 60 && r.summary.clockOffset === 0 && r.summary.utc === "2030-06-01T11:00:00.000Z"],
 ];
 
 (async () => {

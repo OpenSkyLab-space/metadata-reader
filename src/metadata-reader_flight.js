@@ -117,7 +117,7 @@ function sniff(name, h) {
   if (/\.csv$/.test(low) && !/[\x00-\x08]/.test(s.slice(0, 512)) && csvColumns(s)) return "csv-columns";
   if (/^\d{4}-\d\d-\d\d-\d\d-\d\d-\d\d\.\d+ [A-Z]{2,4}: /.test(s)) return "lidar-service";
   if (/(^|\n)[^\n$]{0,40}\$(G[PNLABQ]|BD)(GGA|RMC|GSA|GSV|VTG|ZDA|GLL|GST),/.test(s.slice(0, 2048)) && !/[\x00-\x08\x0e-\x1f]/.test(s.slice(0, 512))) return "nmea";
-  if (/(^|\/)(diag|hostlog|sequoia_diag)\.dat$/.test(low) || /_em\.bb3$/.test(low)) return "encrypted";
+  if (/(^|\/)(diag|hostlog|httplog|sequoia_diag)\.dat$/.test(low) || /_em\.bb3$/.test(low)) return "encrypted";
   if (/^[\s\S]{0,8}[\w-]+\/[\w\/.-]+\.lz\.enc\0/.test(s.slice(0, 300))) return "encrypted";   // DJI device log bundle (DJI Assistant export)
   return null;
 }
@@ -475,14 +475,15 @@ async function pULog(src, L, h) {
       if (s && s.name === "vehicle_status" && !s.multi) { const Lf = layout(s.name); if (Lf.nav_state) { const v = rd(dvOf(m.subarray(2)), Lf.nav_state.t, Lf.nav_state.o); if (!navs.length || navs[navs.length - 1].v !== v) navs.push({ ts, v }); } }
       if (s && s.name === "camera_capture") { const Lf = layout(s.name), body = dvOf(m.subarray(2)), g = (k, sc) => Lf[k] ? rd(body, Lf[k].t, Lf[k].o) * (sc || 1) : null; att.push({ ts, utc: g("timestamp_utc"), seq: g("seq"), lat: g("lat"), lon: g("lon"), h: g("alt"), ok: g("result") }); }
     } else if (ty === "L") { logs.push({ ts: rd(md, "uint64_t", 1), lvl: m[0], msg: asc(m, 9, sz - 9) }); }
-    else if (ty === "C") { logs.push({ ts: rd(md, "uint64_t", 3), lvl: m[0], msg: asc(m, 11, sz - 11) }); }
+    else if (ty === "C") { const w = pre ? 1 : 2; logs.push({ ts: rd(md, "uint64_t", 1 + w), lvl: m[0], msg: asc(m, 9 + w, sz - 9 - w) }); }   // tag: uint16 in PX4, one byte in the Wingtra variant (WingtraPilot 2.20)
     } catch (e) { badMsg++; }
     p = a + sz;
   }
   const topics = {}; for (const id in subs) { const s = subs[id]; const k = s.name + (s.multi ? "#" + s.multi : ""); topics[k] = (topics[k] || 0) + (cnt[id] || 0); }
   const use = gps.filter(g => g.topic === "vehicle_gps_position").length ? gps.filter(g => g.topic === "vehicle_gps_position") : gps;
-  // boot time → UTC from GPS messages with a valid UTC time
-  const sync = use.filter(g => g.utc > 1e15).map(g => g.utc / 1000 - g.ts / 1000), off = median(sync);
+  // boot time → UTC from GPS messages with a valid UTC time; without a fix the receiver time is not trusted (a WingtraOne log without a fix gave 2011)
+  const sync = use.filter(g => g.utc > 1e15 && (g.fix == null || g.fix >= 2)).map(g => g.utc / 1000 - g.ts / 1000), off = median(sync);
+  if (off == null && use.some(g => g.utc > 1e15)) L.notes.push("gps-no-fix-time");
   const toUtc = ts => off == null ? null : ts / 1000 + off;
   L.trajectory = use.filter(g => g.fix >= 2 && g.lat).map(g => ({ t: toUtc(g.ts), lat: g.lat, lon: g.lon, h: g.h, q: fixName(g.fix) }));
   L.exposures = att.map((c, k) => ({ n: c.seq != null ? c.seq : k, t: c.utc > 1e15 ? c.utc / 1000 : toUtc(c.ts), _tc: toUtc(c.ts), lat: c.lat, lon: c.lon, h: c.h, q: "log" }));
@@ -493,6 +494,8 @@ async function pULog(src, L, h) {
   const sysName = info.sys_name || info.vehicle_name || ""; L.device.make = /wingtra/i.test(sysName + JSON.stringify(info)) ? "Wingtra" : "PX4";
   L.device.model = info.vehicle_name || info.sys_name || null; L.device.fw = info.ver_sw_release_wingtra != null ? relVer(info.ver_sw_release_wingtra) : info.ver_sw_release ? relVer(info.ver_sw_release) : info.ver_sw || null;
   L.device.camera = info.camera_serial_number || null;
+  // a header count of images without camera_capture messages: a reduced log (the ULog that WingtraHub keeps next to the geotags has 9 topics)
+  if (+info.camera_image_count > 0 && !att.length) L.notes.push("ulog-no-captures");
   fact(L, "fFormat", "ULog" + (pre ? " (Wingtra variant, 2-byte prefix)" : ""));
   fact(L, "fVehicle", L.device.model); fact(L, "fFirmware", L.device.fw); fact(L, "fCameraSerial", L.device.camera); fact(L, "fCameraCount", info.camera_image_count);
   fact(L, "fDuration", tmin != null ? ((tmax - tmin) / 1e6).toFixed(0) + " s" : null);
@@ -903,7 +906,7 @@ async function pEncrypted(src, L, h) {
   const bundle = /\.lz\.enc\0/.test(new TextDecoder("latin1").decode(h.subarray(0, 300)));
   const e = entropy(h.subarray(0, 65536)); L.encrypted = bundle || e > 7.5;
   if (bundle) { fact(L, "fFormat", "DJI device log bundle (members *.lz.enc, encrypted by DJI)"); fact(L, "fEntropy", e.toFixed(2) + " bit/B"); L.notes.push("encrypted"); return; }
-  fact(L, "fFormat", /_em\.bb3$/i.test(L.name) ? "senseFly .bb3 (emergency log)" : /sequoia_diag/i.test(L.name) ? "Parrot Sequoia diagnostics" : /diag|hostlog/i.test(L.name) ? "MicaSense diagnostics" : "unknown");
+  fact(L, "fFormat", /_em\.bb3$/i.test(L.name) ? "senseFly .bb3 (emergency log)" : /sequoia_diag/i.test(L.name) ? "Parrot Sequoia diagnostics" : /diag|hostlog|httplog/i.test(L.name) ? "MicaSense diagnostics" : "unknown");
   fact(L, "fEntropy", e.toFixed(2) + " bit/B"); L.notes.push(L.encrypted ? "encrypted" : "undocumented");
 }
 
@@ -1967,9 +1970,12 @@ function combine(logs, images, solar) {
     const shots = main.exposures[0] && main.exposures[0].name ? new Set(main.exposures.map(e => shotKey(e.name))).size : main.exposures.length;
     add("info", "cCount", main.name + ": " + shots + (images.length ? " · " + images.length : ""), shots);
     const cen = l => { const v = l.exposures.filter(e => e.lat != null && isFinite(e.lat)); return v.length ? { lat: median(v.map(e => e.lat)), lon: median(v.map(e => e.lon)) } : null; }, c0 = cen(main);
+    const keys0 = main.exposures[0] && main.exposures[0].name ? new Set(main.exposures.map(e => shotKey(e.name))) : null;
+    // two files of one kind naming entirely different images belong to different flights (e.g. the RGB and the multispectral geotags.csv of one day)
+    const disjoint = l => keys0 && l.kind === main.kind && l.exposures.length && l.exposures[0].name && !l.exposures.some(e => keys0.has(shotKey(e.name)));
     for (const l of src.slice(1)) {
       const c = cen(l), far = c && c0 && Math.hypot((c.lat - c0.lat) * 111320, (c.lon - c0.lon) * 111320 * Math.cos(c0.lat / R2D)) > 5000;
-      const other = far || (l.session && main.session && l.session !== main.session) || (l.startMs != null && main.startMs != null && (l.startMs > main.endMs + 3600000 || l.endMs < main.startMs - 3600000)) || (l.kind === main.kind && (l.startMs == null) !== (main.startMs == null));
+      const other = far || (l.session && main.session && l.session !== main.session) || (l.startMs != null && main.startMs != null && (l.startMs > main.endMs + 3600000 || l.endMs < main.startMs - 3600000)) || (l.kind === main.kind && (l.startMs == null) !== (main.startMs == null)) || disjoint(l);
       if (other) { add("info", "cOtherFlight", l.name + (l.startMs != null ? " · " + isoS(l.startMs) : "")); l._other = true; continue; } const n2 = l.exposures[0] && l.exposures[0].name ? new Set(l.exposures.map(e => shotKey(e.name))).size : l.exposures.length; if (Math.abs(n2 - shots) > Math.max(2, 0.01 * shots)) add("warn", "cCountMismatch", main.name + " " + shots + " ≠ " + l.name + " " + n2); }
   } else add("info", "cNoExposures", "");
   if (images.length && src.length) { const ok = F.matches.filter(m => m.log).length; add(ok === images.length ? "ok" : ok ? "warn" : "bad", "cMatched", ok + " / " + images.length + (ok ? " · " + Object.entries(countBy(F.matches.filter(m => m.log), m => m.how)).map(([k, v]) => k + ": " + v).join(", ") : ""));

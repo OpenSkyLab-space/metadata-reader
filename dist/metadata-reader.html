@@ -1240,10 +1240,15 @@ async function parseJPEG(ctx) {
   }
   if (end < src.size) {
     const tl = src.size - end, head = await src.read(end, 16);
-    const inMPF = mpf && mpf.images.some(im => im.start && mpf.base + im.start === end);
-    let note = "";
+    // an MPF image may follow zero padding: WingtraHub rewrites APP1 of Sony JPEGs and pads, so that the MPF offsets of the preview stay valid
+    const nextMP = mpf ? mpf.images.filter(im => im.start).map(im => mpf.base + im.start).filter(o => o > end && o - end <= 65536).sort((a, b) => a - b)[0] : null;
+    let pad = 0; if (nextMP != null) { const z = await src.read(end, nextMP - end); if (z.length === nextMP - end && z.every(x => x === 0)) pad = nextMP - end; }
+    const inMPF = mpf && (pad > 0 || mpf.images.some(im => im.start && mpf.base + im.start === end));
+    if (pad) ctx.seg("zero padding before MPF image", "trailer", end, pad, pad + " zero bytes");
+    let note = pad ? "MPF image after " + pad + " zero bytes" : "";
     let jo = -1; for (let i = 0; i + 2 < head.length; i++) if (head[i] === 0xff && head[i + 1] === 0xd8 && head[i + 2] === 0xff) { jo = i; break; }
-    if (head[0] === 0xff && head[1] === 0xd8) note = inMPF ? "MPF image" : "JPEG";
+    if (pad) { /* note set above */ }
+    else if (head[0] === 0xff && head[1] === 0xd8) note = inMPF ? "MPF image" : "JPEG";
     else if (jo > 0) note = "JPEG at +" + jo;
     else if (latin1(head, 4, 4) === "ftyp") note = "MP4 video (EmbeddedVideo)";
     else note = hexstr(head, 8);
@@ -1297,8 +1302,9 @@ async function jpegSegment(ctx, m, d, dOff, iccChunks, seen) {
       const mpf = { base, images: [] };
       const g = ctx.gmap.get("MPF"), ent = g && g.tags.find(t => t.name === "MPImageList");
       const le = latin1(d, 4, 2) === "II";
-      if (ent && ent.binary) {
-        const nb = await ctx.src.read(ent.binary.offset, ent.binary.length);
+      // up to 64 bytes (4 images) the list is stored as a value array, not as a binary reference
+      const nb = !ent ? null : ent.binary ? await ctx.src.read(ent.binary.offset, ent.binary.length) : Array.isArray(ent.value) ? Uint8Array.from(ent.value) : null;
+      if (nb) {
         for (let k = 0; k * 16 + 16 <= nb.length && k < 64; k++) {
           const dv = DV(nb), attr = dv.getUint32(k * 16, le), size = dv.getUint32(k * 16 + 4, le), start = dv.getUint32(k * 16 + 8, le);
           const im = { flags: attr >>> 27 & 0x1f, format: attr >>> 24 & 7, type: attr & 0xffffff, length: size, start, dep1: dv.getUint16(k * 16 + 12, le), dep2: dv.getUint16(k * 16 + 14, le) };
@@ -2429,13 +2435,18 @@ function derive(result, opts, pending) {
   if (utcMs == null && result.info && result.info.qtCreate) { utcMs = result.info.qtCreate; utcSrc = "QuickTime:CreateDate (UTC)"; }
   const refMs = utcMs != null && utcSrc && !/^DateTimeOriginal/.test(utcSrc) ? utcMs : null;
   if (tz == null && local && refMs != null) { const dmin = Math.round((local.ms - refMs) / 60000 / 15) * 15; if (Math.abs(dmin) <= 14 * 60 && Math.abs(local.ms - refMs - dmin * 60000) < 300000) { tz = dmin; tzSrc = "DateTimeOriginal - UTC (" + (djiUtc ? "UTCAtExposure" : "GPS time") + ")"; } }
-  if (local && refMs != null && tz != null) { const off = (local.ms - refMs - tz * 60000) / 1000; S.clockOffset = off; D("CameraClockOffset", rnd(off, 1), (off >= 0 ? "+" : "") + num(rnd(off, 1)) + " s", [ID("DateTimeOriginal", EX), utcSrc], "DateTimeOriginal - time zone - UTC; DateTimeOriginal has whole seconds unless SubSecTimeOriginal is set"); }
+  // a reference in whole seconds (GPSTimeStamp rewritten without a fraction, e.g. by WingtraHub) is compared in whole seconds, so a sub-second part of DateTimeOriginal does not show up as an offset
+  if (local && refMs != null && tz != null) { const whole = refMs % 1000 === 0, lms = whole ? Math.floor(local.ms / 1000) * 1000 : local.ms, off = (lms - refMs - tz * 60000) / 1000; S.clockOffset = off; D("CameraClockOffset", rnd(off, 1), (off >= 0 ? "+" : "") + num(rnd(off, 1)) + " s", [ID("DateTimeOriginal", EX), utcSrc], "DateTimeOriginal - time zone - UTC; whole seconds when either time has no fraction (DateTimeOriginal without SubSecTimeOriginal, GPSTimeStamp without decimals)"); }
   S.localTime = local ? iso(local.ms).replace(/Z$/, "") : null; S.utc = utcMs != null ? iso(utcMs) : null; S.utcMs = utcMs; S.utcSrc = utcSrc; S.tz = tz; S.tzSrc = tzSrc;
   if (utcMs != null) D("DateTimeUTC", S.utc, S.utc, [utcSrc], tzSrc ? "time zone: " + tzStr(tz || 0) + " (" + tzSrc + ")" : "");
   else if (local) D("DateTimeUTC", null, "(unknown: local time without time zone)", [ID("DateTimeOriginal", EX)], "no OffsetTimeOriginal, no GPS time, no UTC tag");
   if (tz != null && tzSrc) D("TimeZone", tzStr(tz), tzStr(tz), [tzSrc]);
   if (local) { const ld = new Date(local.ms), yr = ld.getUTCFullYear(), reset = ld.getUTCMonth() === 0 && ld.getUTCDate() === 1 && ld.getUTCHours() < 6, gpsOff = gpsMs != null && Math.abs(local.ms - gpsMs) > 86400000;
-    if (reset || yr < 2005 || gpsOff) { S.clockSuspect = reset ? "reset" : yr < 2005 ? "old" : "gps-mismatch"; D("ClockCheck", S.clockSuspect, reset ? "camera clock probably not set (1 January, early morning)" : yr < 2005 ? "camera clock probably not set (year " + yr + ")" : "DateTimeOriginal differs from GPS time by more than one day", [ID("DateTimeOriginal", EX), gpsMs != null ? "Composite:GPSDateTime" : null], "take the time from the flight log"); result.warnings.push({ code: "clock", text: "camera clock suspect: DateTimeOriginal " + S.localTime, offset: null }); } }
+    // cameras write DateTimeOriginal and CreateDate from one clock; a difference of more than a day means one was rewritten after capture
+    // (WingtraHub 2.20 rewrites DateTimeOriginal of Sony a6100 photos and keeps CreateDate from an unset camera clock, 2019-01-01)
+    const cd = parseDT(dtc), rew = cd && Math.abs(local.ms - cd.ms) > 86400000;
+    if (!(reset || yr < 2005 || gpsOff) && rew) { S.clockSuspect = "rewritten"; D("ClockCheck", S.clockSuspect, "DateTimeOriginal differs from CreateDate (" + dtc + ") by more than one day: one of them was rewritten after capture", [ID("DateTimeOriginal", EX), ID("CreateDate", EX)], "take the time from the flight log"); result.warnings.push({ code: "clock", text: "DateTimeOriginal " + S.localTime + " and CreateDate " + dtc + " differ by more than one day", offset: null }); }
+    else if (reset || yr < 2005 || gpsOff) { S.clockSuspect = reset ? "reset" : yr < 2005 ? "old" : "gps-mismatch"; D("ClockCheck", S.clockSuspect, reset ? "camera clock probably not set (1 January, early morning)" : yr < 2005 ? "camera clock probably not set (year " + yr + ")" : "DateTimeOriginal differs from GPS time by more than one day", [ID("DateTimeOriginal", EX), gpsMs != null ? "Composite:GPSDateTime" : null], "take the time from the flight log"); result.warnings.push({ code: "clock", text: "camera clock suspect: DateTimeOriginal " + S.localTime, offset: null }); } }
   /* sun position */
   if (utcMs != null && lat != null) { const sp = solarPosition(utcMs, lat, lon); S.sun = sp; D("SunElevation", rnd(sp.elevation, 2), num(rnd(sp.elevation, 1)) + " deg", ["Derived:DateTimeUTC", "Composite:GPSLatitude"], "NOAA solar position algorithm, with refraction"); D("SunAzimuth", rnd(sp.azimuth, 2), num(rnd(sp.azimuth, 1)) + " deg", ["Derived:DateTimeUTC", "Composite:GPSLongitude"], "clockwise from north"); }
   /* GSD */
@@ -2753,7 +2764,7 @@ function sniff(name, h) {
   if (/\.csv$/.test(low) && !/[\x00-\x08]/.test(s.slice(0, 512)) && csvColumns(s)) return "csv-columns";
   if (/^\d{4}-\d\d-\d\d-\d\d-\d\d-\d\d\.\d+ [A-Z]{2,4}: /.test(s)) return "lidar-service";
   if (/(^|\n)[^\n$]{0,40}\$(G[PNLABQ]|BD)(GGA|RMC|GSA|GSV|VTG|ZDA|GLL|GST),/.test(s.slice(0, 2048)) && !/[\x00-\x08\x0e-\x1f]/.test(s.slice(0, 512))) return "nmea";
-  if (/(^|\/)(diag|hostlog|sequoia_diag)\.dat$/.test(low) || /_em\.bb3$/.test(low)) return "encrypted";
+  if (/(^|\/)(diag|hostlog|httplog|sequoia_diag)\.dat$/.test(low) || /_em\.bb3$/.test(low)) return "encrypted";
   if (/^[\s\S]{0,8}[\w-]+\/[\w\/.-]+\.lz\.enc\0/.test(s.slice(0, 300))) return "encrypted";   // DJI device log bundle (DJI Assistant export)
   return null;
 }
@@ -3111,14 +3122,15 @@ async function pULog(src, L, h) {
       if (s && s.name === "vehicle_status" && !s.multi) { const Lf = layout(s.name); if (Lf.nav_state) { const v = rd(dvOf(m.subarray(2)), Lf.nav_state.t, Lf.nav_state.o); if (!navs.length || navs[navs.length - 1].v !== v) navs.push({ ts, v }); } }
       if (s && s.name === "camera_capture") { const Lf = layout(s.name), body = dvOf(m.subarray(2)), g = (k, sc) => Lf[k] ? rd(body, Lf[k].t, Lf[k].o) * (sc || 1) : null; att.push({ ts, utc: g("timestamp_utc"), seq: g("seq"), lat: g("lat"), lon: g("lon"), h: g("alt"), ok: g("result") }); }
     } else if (ty === "L") { logs.push({ ts: rd(md, "uint64_t", 1), lvl: m[0], msg: asc(m, 9, sz - 9) }); }
-    else if (ty === "C") { logs.push({ ts: rd(md, "uint64_t", 3), lvl: m[0], msg: asc(m, 11, sz - 11) }); }
+    else if (ty === "C") { const w = pre ? 1 : 2; logs.push({ ts: rd(md, "uint64_t", 1 + w), lvl: m[0], msg: asc(m, 9 + w, sz - 9 - w) }); }   // tag: uint16 in PX4, one byte in the Wingtra variant (WingtraPilot 2.20)
     } catch (e) { badMsg++; }
     p = a + sz;
   }
   const topics = {}; for (const id in subs) { const s = subs[id]; const k = s.name + (s.multi ? "#" + s.multi : ""); topics[k] = (topics[k] || 0) + (cnt[id] || 0); }
   const use = gps.filter(g => g.topic === "vehicle_gps_position").length ? gps.filter(g => g.topic === "vehicle_gps_position") : gps;
-  // boot time → UTC from GPS messages with a valid UTC time
-  const sync = use.filter(g => g.utc > 1e15).map(g => g.utc / 1000 - g.ts / 1000), off = median(sync);
+  // boot time → UTC from GPS messages with a valid UTC time; without a fix the receiver time is not trusted (a WingtraOne log without a fix gave 2011)
+  const sync = use.filter(g => g.utc > 1e15 && (g.fix == null || g.fix >= 2)).map(g => g.utc / 1000 - g.ts / 1000), off = median(sync);
+  if (off == null && use.some(g => g.utc > 1e15)) L.notes.push("gps-no-fix-time");
   const toUtc = ts => off == null ? null : ts / 1000 + off;
   L.trajectory = use.filter(g => g.fix >= 2 && g.lat).map(g => ({ t: toUtc(g.ts), lat: g.lat, lon: g.lon, h: g.h, q: fixName(g.fix) }));
   L.exposures = att.map((c, k) => ({ n: c.seq != null ? c.seq : k, t: c.utc > 1e15 ? c.utc / 1000 : toUtc(c.ts), _tc: toUtc(c.ts), lat: c.lat, lon: c.lon, h: c.h, q: "log" }));
@@ -3129,6 +3141,8 @@ async function pULog(src, L, h) {
   const sysName = info.sys_name || info.vehicle_name || ""; L.device.make = /wingtra/i.test(sysName + JSON.stringify(info)) ? "Wingtra" : "PX4";
   L.device.model = info.vehicle_name || info.sys_name || null; L.device.fw = info.ver_sw_release_wingtra != null ? relVer(info.ver_sw_release_wingtra) : info.ver_sw_release ? relVer(info.ver_sw_release) : info.ver_sw || null;
   L.device.camera = info.camera_serial_number || null;
+  // a header count of images without camera_capture messages: a reduced log (the ULog that WingtraHub keeps next to the geotags has 9 topics)
+  if (+info.camera_image_count > 0 && !att.length) L.notes.push("ulog-no-captures");
   fact(L, "fFormat", "ULog" + (pre ? " (Wingtra variant, 2-byte prefix)" : ""));
   fact(L, "fVehicle", L.device.model); fact(L, "fFirmware", L.device.fw); fact(L, "fCameraSerial", L.device.camera); fact(L, "fCameraCount", info.camera_image_count);
   fact(L, "fDuration", tmin != null ? ((tmax - tmin) / 1e6).toFixed(0) + " s" : null);
@@ -3539,7 +3553,7 @@ async function pEncrypted(src, L, h) {
   const bundle = /\.lz\.enc\0/.test(new TextDecoder("latin1").decode(h.subarray(0, 300)));
   const e = entropy(h.subarray(0, 65536)); L.encrypted = bundle || e > 7.5;
   if (bundle) { fact(L, "fFormat", "DJI device log bundle (members *.lz.enc, encrypted by DJI)"); fact(L, "fEntropy", e.toFixed(2) + " bit/B"); L.notes.push("encrypted"); return; }
-  fact(L, "fFormat", /_em\.bb3$/i.test(L.name) ? "senseFly .bb3 (emergency log)" : /sequoia_diag/i.test(L.name) ? "Parrot Sequoia diagnostics" : /diag|hostlog/i.test(L.name) ? "MicaSense diagnostics" : "unknown");
+  fact(L, "fFormat", /_em\.bb3$/i.test(L.name) ? "senseFly .bb3 (emergency log)" : /sequoia_diag/i.test(L.name) ? "Parrot Sequoia diagnostics" : /diag|hostlog|httplog/i.test(L.name) ? "MicaSense diagnostics" : "unknown");
   fact(L, "fEntropy", e.toFixed(2) + " bit/B"); L.notes.push(L.encrypted ? "encrypted" : "undocumented");
 }
 
@@ -4603,9 +4617,12 @@ function combine(logs, images, solar) {
     const shots = main.exposures[0] && main.exposures[0].name ? new Set(main.exposures.map(e => shotKey(e.name))).size : main.exposures.length;
     add("info", "cCount", main.name + ": " + shots + (images.length ? " · " + images.length : ""), shots);
     const cen = l => { const v = l.exposures.filter(e => e.lat != null && isFinite(e.lat)); return v.length ? { lat: median(v.map(e => e.lat)), lon: median(v.map(e => e.lon)) } : null; }, c0 = cen(main);
+    const keys0 = main.exposures[0] && main.exposures[0].name ? new Set(main.exposures.map(e => shotKey(e.name))) : null;
+    // two files of one kind naming entirely different images belong to different flights (e.g. the RGB and the multispectral geotags.csv of one day)
+    const disjoint = l => keys0 && l.kind === main.kind && l.exposures.length && l.exposures[0].name && !l.exposures.some(e => keys0.has(shotKey(e.name)));
     for (const l of src.slice(1)) {
       const c = cen(l), far = c && c0 && Math.hypot((c.lat - c0.lat) * 111320, (c.lon - c0.lon) * 111320 * Math.cos(c0.lat / R2D)) > 5000;
-      const other = far || (l.session && main.session && l.session !== main.session) || (l.startMs != null && main.startMs != null && (l.startMs > main.endMs + 3600000 || l.endMs < main.startMs - 3600000)) || (l.kind === main.kind && (l.startMs == null) !== (main.startMs == null));
+      const other = far || (l.session && main.session && l.session !== main.session) || (l.startMs != null && main.startMs != null && (l.startMs > main.endMs + 3600000 || l.endMs < main.startMs - 3600000)) || (l.kind === main.kind && (l.startMs == null) !== (main.startMs == null)) || disjoint(l);
       if (other) { add("info", "cOtherFlight", l.name + (l.startMs != null ? " · " + isoS(l.startMs) : "")); l._other = true; continue; } const n2 = l.exposures[0] && l.exposures[0].name ? new Set(l.exposures.map(e => shotKey(e.name))).size : l.exposures.length; if (Math.abs(n2 - shots) > Math.max(2, 0.01 * shots)) add("warn", "cCountMismatch", main.name + " " + shots + " ≠ " + l.name + " " + n2); }
   } else add("info", "cNoExposures", "");
   if (images.length && src.length) { const ok = F.matches.filter(m => m.log).length; add(ok === images.length ? "ok" : ok ? "warn" : "bad", "cMatched", ok + " / " + images.length + (ok ? " · " + Object.entries(countBy(F.matches.filter(m => m.log), m => m.how)).map(([k, v]) => k + ": " + v).join(", ") : ""));
@@ -5053,13 +5070,13 @@ cs: {
     GSD: (v, tg) => NUMF("cs", v, 2) + " cm/px" + L_("cs", (/ at (.*)$/.exec(tg.display) || ["", ""])[1] ? " při " + / at (.*)$/.exec(tg.display)[1] : ""), Footprint: v => NUMF("cs", v[0], 1) + " × " + NUMF("cs", v[1], 1) + " m",
     Irradiance: (v, tg) => L_("cs", tg.display.replace("(unit not stated)", "(jednotka neuvedena)").replace("uW/cm2/nm", "µW·cm⁻²·nm⁻¹")), JPEGQualityEstimate: (v, tg) => String(v) + (/rough/.test(tg.display) ? " (hrubý odhad)" : ""),
     RadiometricJPEG: (v, tg) => v + (/parameters read/.test(tg.display) ? " (parametry měření přečteny; teploty se nepočítají)" : " (teploty se nepočítají; použijte SDK výrobce)"), LaserRangefinder: (v, tg) => v != null ? NUMF("cs", v, 3) + " m" : L_("cs", tg.display.replace("not measured", "neměřeno").replace("(status ", "(stav ").replace(", distance", ", vzdálenost")), ThermalParamsCheck: (v, tg) => v ? L_("cs", tg.display.replace(/outside 0-1(?!\d)/g, "mimo 0–1").replace("1.00: blackbody (brightness) temperature, no emissivity correction", "1,00: teplota černého tělesa (jasová), bez korekce emisivity").replace("outside 1-25 m (DJI Thermal SDK; ThermoTIFF does not trust the correction above 25 m)", "mimo 1–25 m (DJI Thermal SDK; nad 25 m ThermoTIFF korekci nevěří)").replace("outside 0-100 %", "mimo 0–100 %").replace(" m set in the camera; laser rangefinder ", " m nastaveno v kameře; laserový dálkoměr ").replace(" m set in the camera; height above take-off ", " m nastaveno v kameře; výška nad vzletem ").replace("(SDK limit 25 m)", "(limit SDK 25 m)")) : "v mezích", PeakSpectralSensitivity: v => NUMF("cs", v, 1) + " µm", TemperatureTIFF: (v, tg) => L_("cs", tg.display.replace("degrees Celsius", "stupně Celsia")), Band: (v, tg) => L_("cs", tg.display),
-    ClockCheck: v => ({ reset: "hodiny kamery zřejmě nenastavené (1. ledna, brzy ráno)", old: "hodiny kamery zřejmě nenastavené (příliš starý rok)", "gps-mismatch": "DateTimeOriginal se liší od času GNSS o více než den" })[v] || v,
+    ClockCheck: v => ({ reset: "hodiny kamery zřejmě nenastavené (1. ledna, brzy ráno)", old: "hodiny kamery zřejmě nenastavené (příliš starý rok)", "gps-mismatch": "DateTimeOriginal se liší od času GNSS o více než den", rewritten: "DateTimeOriginal se liší od CreateDate o více než den: jeden z nich byl po pořízení přepsán" })[v] || v,
     CalibrationImage: () => "ano (kamera označila snímek jako kalibrační)", CameraClockOffset: v => (v >= 0 ? "+" : "−") + NUMF("cs", Math.abs(v), 1) + " s", SensorTemperatureCheck: () => "neplatná hodnota (0xFFFF / 10): teplota nezměřena",
     SunshineSamples: (v, tg) => L_("cs", tg.display.replace(" samples, ", " vzorků, ").replace("CH0 mean", "CH0 průměr").replace("integration", "integrace")), CRS: (v, tg) => tg.display, PixelSize: (v, tg) => L_("cs", tg.display.replace("(CRS units)", "(jednotky CRS)")), UpperLeft: (v, tg) => L_("cs", tg.display), Extent: (v, tg) => L_("cs", tg.display)
   },
   derNote: { PixelPitch: "rozteč pixelu = jednotka / FocalPlaneXResolution, nebo FocalLength / CalibratedFocalLength, nebo odhad z 35mm ekvivalentu", SensorSize: "snímač = rozteč pixelu × počet pixelů", FieldOfView: "FOV = 2·atan(snímač / 2f)",
     GroundSpeed: "√(X² + Y²)", GNSSSolution: "DJI: 0 bez řešení (s platnou polohou: dron bez RTK, samostatné GNSS), 16 samostatné určení, 32–34 float, 48–49 celočíselné nižší kvality, 50 fixed (narrow-lane)", DateTimeUTC: "pořadí zdrojů: UTCAtExposure, OffsetTimeOriginal, XMP s pásmem, čas GNSS, konvence MicaSense, senseFly a Parrot (EXIF v UTC), QuickTime. DJI zapisuje do UTCAtExposure i GPSTimeStamp čas GPS: čtečka odečítá přestupné sekundy (od 2017 18 s)",
-    TimeZone: "", SunElevation: "algoritmus NOAA včetně refrakce", SunAzimuth: "od severu po směru hodin", GSD: "GSD = p·H/f; rovina ve výšce vzletu", Footprint: "kolmý snímek", Irradiance: "", Band: "", RadiometricJPEG: "", LaserRangefinder: "nulová vzdálenost nebo jiný stav než Normal znamená, že dálkoměr neměřil", ThermalParamsCheck: "emisivita 0–1, vzdálenost u DJI 1–25 m, vlhkost 0–100 %, vzdálenost porovnaná s dálkoměrem nebo výškou nad vzletem", PeakSpectralSensitivity: "14387,6515 / PlanckB (jako ExifTool)", TemperatureTIFF: "", ClockCheck: "čas vezměte z letového záznamu", CameraClockOffset: "DateTimeOriginal − časové pásmo − UTC; bez SubSecTimeOriginal má DateTimeOriginal celé sekundy", CalibrationImage: "XMP Camera:CalibrationPicture = 1", SensorTemperatureCheck: "",
+    TimeZone: "", SunElevation: "algoritmus NOAA včetně refrakce", SunAzimuth: "od severu po směru hodin", GSD: "GSD = p·H/f; rovina ve výšce vzletu", Footprint: "kolmý snímek", Irradiance: "", Band: "", RadiometricJPEG: "", LaserRangefinder: "nulová vzdálenost nebo jiný stav než Normal znamená, že dálkoměr neměřil", ThermalParamsCheck: "emisivita 0–1, vzdálenost u DJI 1–25 m, vlhkost 0–100 %, vzdálenost porovnaná s dálkoměrem nebo výškou nad vzletem", PeakSpectralSensitivity: "14387,6515 / PlanckB (jako ExifTool)", TemperatureTIFF: "", ClockCheck: "čas vezměte z letového záznamu", CameraClockOffset: "DateTimeOriginal − časové pásmo − UTC; v celých sekundách, pokud některý z časů nemá zlomek (DateTimeOriginal bez SubSecTimeOriginal, GPSTimeStamp bez desetin)", CalibrationImage: "XMP Camera:CalibrationPicture = 1", SensorTemperatureCheck: "",
     SunshineSamples: "Parrot Sequoia, čidlo sunshine: 28 B na vzorek (čas µs, CH0, CH1, index zesílení, integrace ms, yaw, pitch, roll); ozáření v image logu je relativní CH0 / (zesílení × ms)",
     JPEGQualityEstimate: "škálování IJG tabulky T.81 příl. K: S = průměr(100·Q/Qstd); q = (200 − S)/2 pro S ≤ 100, jinak 5000/S", CRS: "", PixelSize: "", UpperLeft: "roh levého horního pixelu (PixelIsArea)", Extent: "xmin, ymin, xmax, ymax",
     GPSAltitude: "Exif 2.x: nad hladinou moře; Exif 3.0 předefinoval Ref 0/1 na výšku nad elipsoidem a hladinu moře přesunul na 2/3" },
@@ -5342,7 +5359,7 @@ Object.assign(T.cs.fltN, { partial: "přečtena jen část" }); Object.assign(T.
 Object.assign(T.cs.fltK, { "emotion-transcript": "eMotion transcript", "ebeex-afpu": "eBee X log_n.txt" }); Object.assign(T.en.fltK, { "emotion-transcript": "eMotion transcript", "ebeex-afpu": "eBee X log_n.txt" });
 Object.assign(T.cs.fltF, { fFlight: "Let (vzlet – přistání)", fSession: "Letová relace", fPayload: "Payload", fSerials: "Výrobní čísla", fUnits: "Firmware jednotek", fTimeSync: "Synchronizace času s GNSS", fLogLevels: "Úrovně zpráv", fThermCalib: "Kalibrace termokamery (XMP)" });
 Object.assign(T.en.fltF, { fFlight: "Flight (take-off – landing)", fSession: "Flight session", fPayload: "Payload", fSerials: "Serial numbers", fUnits: "Unit firmware", fTimeSync: "Time sync with GNSS", fLogLevels: "Message levels", fThermCalib: "Thermal camera calibration (XMP)" });
-Object.assign(T.cs.fltN, { "exposures-no-position": "expozice bez polohy", "no-positions": "bez poloh", "no-date": "bez data" }); Object.assign(T.en.fltN, { "exposures-no-position": "exposures without position", "no-positions": "no positions", "no-date": "no date" });
+Object.assign(T.cs.fltN, { "exposures-no-position": "expozice bez polohy", "gps-no-fix-time": "čas GNSS bez fixu nepoužit: UTC neznámý", "ulog-no-captures": "hlavička uvádí snímky, zprávy camera_capture chybí (zkrácený log?)", "no-positions": "bez poloh", "no-date": "bez data" }); Object.assign(T.en.fltN, { "exposures-no-position": "exposures without position", "gps-no-fix-time": "GNSS time without a fix not used: UTC unknown", "ulog-no-captures": "header counts images, no camera_capture messages (reduced log?)", "no-positions": "no positions", "no-date": "no date" });
 Object.assign(T.cs.fltK, { "pix4dcapture-log": "Pix4Dcapture log" }); Object.assign(T.en.fltK, { "pix4dcapture-log": "Pix4Dcapture log" });
 Object.assign(T.cs.fltF, { fMission: "Typ mise", fAppSettings: "Nastavení aplikace" }); Object.assign(T.en.fltF, { fMission: "Mission type", fAppSettings: "App settings" });
 T.cs.fltV.push(["Pix4Dcapture app log", "log aplikace Pix4Dcapture"], [" (app defaults, not necessarily the flown plan)", " (výchozí hodnoty aplikace, ne nutně odlétaný plán)"], [" (selected in the app: ", " (zvoleno v aplikaci: "],
