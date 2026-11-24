@@ -621,6 +621,40 @@ const gpsMs = utc => utc + 18000; // after 2017
     ok(a.yaw === 122.8 && a.pitch === 0 && a.roll === 0, "sfm angles: nadir with roll 180"); ok(b.yaw === 121.7 && b.pitch === 0.1 && b.roll === 0, "sfm angles: nadir");
     ok(c.yaw === 10 && c.pitch === 30 && c.roll === 0, "sfm angles: oblique forward"); ok(d.yaw === 170 && d.pitch === 0 && d.roll === 0, "sfm angles: roll −180"); ok(F.sfmAngles(null, -90, 0) === null, "sfm angles need yaw and pitch"); }
 
+  /* Wingtra LiDAR recording .data (structure as firmware 5.4 writes it, values synthetic): 1 KiB header, records <u32 stream><u32 length><payload>,
+     NovAtel BESTPOS inside stream 2, cut into two parts in the middle of a record */
+  { const t0 = Date.UTC(2026, 4, 14, 10, 0, 0), g = t0 + 18000 - Date.UTC(1980, 0, 6), wk = Math.floor(g / 604800000), tow0 = g - wk * 604800000;
+    const hdr = new Uint8Array(1024), put = (b, o, str) => { for (let i = 0; i < str.length; i++) b[o + i] = str.charCodeAt(i); };
+    new DataView(hdr.buffer).setUint32(4, 1024, true); put(hdr, 8, "WINGTRA-SYN001"); put(hdr, 24, "5.4.0.0"); put(hdr, 40, "NovAtel OEM7500-1.00 SYN"); put(hdr, 104, "Hesai PandarXT32");
+    const recs = [], rec = (st, p) => { const b = new Uint8Array(8 + p.length), d = new DataView(b.buffer); d.setUint32(0, st, true); d.setUint32(4, p.length, true); b.set(p, 8); recs.push(b); };
+    const def = new Uint8Array(512); put(def, 0, "$IMURAW"); put(def, 65, "IL_IMU"); rec(1, def); const hd = new Uint8Array(64); put(hd, 0, "$HSAI"); rec(4, hd);
+    const bestpos = (ms, lat, lon) => { const m = new Uint8Array(28 + 72 + 4), d = new DataView(m.buffer); m.set([0xaa, 0x44, 0x12, 28]); d.setUint16(4, 42, true); d.setUint16(8, 72, true); d.setUint16(14, wk, true); d.setUint32(16, ms, true);
+      d.setUint32(28 + 4, 16, true); d.setFloat64(28 + 8, lat, true); d.setFloat64(28 + 16, lon, true); d.setFloat64(28 + 24, 300, true); d.setFloat32(28 + 32, 45, true); d.setFloat32(28 + 40, 1, true); d.setFloat32(28 + 44, 1, true); d.setFloat32(28 + 48, 2, true); m[28 + 65] = 12; return m; };
+    for (let k = 0; k < 200; k++) { const imu = new Uint8Array(32); new DataView(imu.buffer).setFloat64(0, tow0 / 1000 + k * 0.1, true); rec(1, imu); if (k % 10 === 0) rec(2, bestpos(tow0 + k * 100, 49 + k * 1e-6, 14)); rec(4, new Uint8Array(64)); }
+    const all = new Uint8Array(1024 + recs.reduce((a, b) => a + b.length, 0)); all.set(hdr); let o = 1024; for (const r of recs) { all.set(r, o); o += r.length; }
+    const cut = 15000, A = await F.parse(all.slice(0, cut), "WINGTRA-2026-05-14-10-00-00-001.data"), B = await F.parse(all.slice(cut), "WINGTRA-2026-05-14-10-00-00-002.data"), f = (L, k) => (L.facts.find(x => x[0] === k) || [])[1];
+    ok(A.kind === "lidar-data" && A.device.fw === "5.4.0.0" && f(A, "fScanner") === "Hesai PandarXT32" && A.startMs === t0 && A.verify.state === "ok", "lidar .data: header, time from IMU and NovAtel week");
+    ok(/^1 IMURAW · IL_IMU: \d+ \(10\/s\)/.test(f(A, "fStreams")) && /BESTPOS/.test(f(A, "fMsgTypes")) && f(A, "fPvtModes").startsWith("single: ") && A.trajectory.length > 0 && A.notes.includes("lidar-static"), "lidar .data: streams, NovAtel BESTPOS");
+    ok(B.kind === "lidar-data" && A.lidar.need > 0 && B.lidar.lead === A.lidar.need && B.endMs === t0 + 19900 && /begins with \d+ B/.test(f(B, "fPart")), "lidar .data: continuation part found by name, starts after the cut record");
+    const C = F.combine([A, B]).checks.find(c => c.key === "cLidarParts"); ok(C && C.state === "ok", "lidar .data: parts continuous");
+    const B2 = await F.parse(all.slice(cut + 3), "WINGTRA-2026-05-14-10-00-00-002.data"), C2 = F.combine([A, B2]).checks.find(c => c.key === "cLidarParts");
+    ok(C2 && C2.state === "warn" && /001 → 002/.test(C2.det), "lidar .data: bytes missing between parts");
+    const C3 = F.combine([A]).checks.find(c => c.key === "cLidarParts"); ok(C3 && C3.state === "warn" && /further part/.test(C3.det), "lidar .data: last part missing");
+    const N = await F.parse(Uint8Array.from([...bestpos(tow0, 49, 14), ...bestpos(tow0 + 1000, 49, 14.0001)]), "SYN.gps");
+    ok(N.kind === "novatel" && N.trajectory.length === 2 && N.startMs === t0 && Math.abs(N.trajectory[0].h - 345) < 1e-6, "novatel: BESTPOS positions, ellipsoidal height = MSL + undulation"); }
+
+  /* Wingtra payload computer (OBC) log, line format of WingtraPilot 2.20 (values synthetic); OBC clock 2 h ahead of UTC */
+  { const tow = k => 295824738 + k * 2000, ln = (t, lev, mod, msg) => "2026-Mar-18 " + t + "|" + lev + "|" + mod + "|" + msg;
+    const lines = [ln("12:10:00.100000", "NOTICE", "MAIN", "GIT_TAG: v2.20.3 GIT_HASH: abc1234 GIT_BRANCH: HEAD"), ln("12:10:01.000000", "NOTICE", "PYLD", "Camera Software      : ILCE-6100 v1.00"),
+      ln("12:10:02.000000", " WARN ", " PPK", "Found Trigger! TOW, WNc, Offset, ClkBias: 295800000, 2410, 0.002, 2.9e+10, ppkFixType 1"), ln("12:10:03.000000", " ERROR", "PYLD", "Original and copied files do not have the same file size")];
+    for (let k = 0; k < 3; k++) { const s = String(6 + k * 2).padStart(2, "0"); lines.push(ln("12:10:" + s + ".990000", "NOTICE", "MAIN", "New geotag item: " + k), ln("12:10:" + s + ".999000", " WARN ", " PPK", "Found Trigger! TOW, WNc, Offset, ClkBias: " + tow(k) + ", 2410, 0.002, 3.9e+07, ppkFixType 1")); }
+    const L = await F.parse(u8(lines.join("\n") + "\n"), "00007_20260318_121000.txt"), f = k => (L.facts.find(x => x[0] === k) || [])[1];
+    ok(L.kind === "wingtra-obc" && L.exposures.length === 3 && L.exposures[0].t === F.gpsToUtc(2410, tow(0)) && L.device.camera === "ILCE-6100 v1.00" && L.verify.state === "ok", "wingtra obc: geotagged triggers as exposures, camera, firmware");
+    ok(/^4 PPK triggers .* 3 geotag items · triggers without a geotag item: 1$/.test(f("fCameraTriggers")) && /^\+\d+\.\d s \(2 h \d+ min\)$/.test(f("fClockVsGnss")) && /^\[error\] PYLD: Original and copied/.test(f("fWarnings")), "wingtra obc: trigger count, clock offset, errors first");
+    ok(Math.abs(L.startMs - (Date.UTC(2026, 2, 18, 12, 10, 0, 100) - (Date.UTC(2026, 2, 18, 12, 10, 6, 999) - F.gpsToUtc(2410, tow(0))))) < 5, "wingtra obc: span moved to UTC by the trigger offset");
+    const X = await F.parse(u8('<?xml version="1.0"?>\n<log>\n\t<severity level="notice" timestamp="2023-Aug-04 08:04:19.987528">ulogWriter_thread: started.</severity>\n\t<severity level="error" timestamp="2023-Aug-04 08:04:20.000000">[ HELP]: [UMOUNT]: Process exit with non zero return 32</severity>\n</log>\n'), "20230804_080419_00012.xml");
+    ok(X.kind === "wingtra-obc" && X.notes.join() === "obc-clock-unset" && /\[error\] HELP: \[UMOUNT\]/.test((X.facts.find(x => x[0] === "fWarnings") || [])[1]), "wingtra obc xml (2.8): read, no UTC without triggers"); }
+
   console.log(fails ? fails + " of " + n + " checks failed" : "all " + n + " flight checks passed");
   process.exit(fails ? 1 : 0);
 })().catch(e => { console.error(e); process.exit(1); });

@@ -23,7 +23,7 @@ function fmtA(v, sig) { /* automatic decimals for a few significant digits */
   if (a === 0) return "0"; const d = Math.max(0, Math.min(8, sig - 1 - Math.floor(Math.log10(a))));
   return fmt(Number(v.toFixed(d)), d);
 }
-const dec = s => { const x = String(s).replace(/(^|[\s(;,=])-(?=\d)/g, "$1−"); return L === "cs" ? (/\d\.\d/.test(x) ? x.replace(/(\d), (?=[−+]?\d)/g, "$1; ") : x).replace(/(^|[^\d.,])(\d+)\.(\d+)(?![\d.])/g, "$1$2,$3") : x; };
+const dec = s => { const x = String(s).replace(/(^|[\s(;,=])-(?=\d)/g, "$1−"); return L === "cs" ? (/\d\.\d/.test(x) ? x.replace(/(\d), (?=[−+]?\d)/g, "$1; ") : x).replace(/(^|[^\d.,vV])(\d+)\.(\d+)(?![\d.])/g, "$1$2,$3") : x; };
 function fmtExp(tm) { if (!tm) return "–"; if (tm < 0.25001) return "1/" + fmt(Math.round(1 / tm), 0, false) + " s"; return fmt(tm, tm < 10 ? 1 : 0) + " s"; }
 function fmtTime(iso, ms) { /* ISO 8601 -> readable, decimal comma in cs */
   if (!iso) return "–"; const m = /^(\d{4}-\d\d-\d\d)T(\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)?$/.exec(iso);

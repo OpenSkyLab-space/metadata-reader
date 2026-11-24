@@ -4,7 +4,7 @@
    DJI Timestamp.MRK, RINEX 2/3 observation and navigation files, RTCM 3 (DJI PPKRAW.bin), PX4 ULog (also the Wingtra variant),
    Wingtra geotaglog / flight json / ini / geotags.csv, Septentrio SBF, senseFly eBee X .bb3 (the GNSS stream inside it),
    senseFly geoinfo.txt, eMotion KML, Trimble JobXML (.jxl), MicaSense paramlog.dat and gpslog.dat, Parrot Sequoia TLMB,
-   Wingtra LiDAR service.log and ppk.pcmp; generic: ArduPilot DataFlash .bin and text .log, MAVLink .tlog, NMEA 0183, GPX, CSV geotags.
+   Wingtra LiDAR service.log, ppk.pcmp and .data recordings, Wingtra payload computer (OBC) logs, NovAtel OEM binary; generic: ArduPilot DataFlash .bin and text .log, MAVLink .tlog, NMEA 0183, GPX, CSV geotags.
    Processing projects: Pix4Dmapper .p4d and Agisoft Metashape (doc.xml, chunk.zip, .psz; .psx is only a pointer) give the processing record.
    Encrypted logs are recognised and reported, not decoded.
    Nothing leaves the browser. Large files are read in blocks. */
@@ -116,6 +116,8 @@ function sniff(name, h) {
   if (/\.(csv|txt)$/.test(low) && !/[\x00-\x08]/.test(s.slice(0, 512)) && csvHeader(s)) return "csv-geotags";
   if (/\.csv$/.test(low) && !/[\x00-\x08]/.test(s.slice(0, 512)) && csvColumns(s)) return "csv-columns";
   if (/^\d{4}-\d\d-\d\d-\d\d-\d\d-\d\d\.\d+ [A-Z]{2,4}: /.test(s)) return "lidar-service";
+  if (/^\0*\d{4}-[A-Z][a-z]{2}-\d\d \d\d:\d\d:\d\d\.\d+\|\s*[A-Z]+\s*\|/.test(s) || /^<\?xml[^>]*>\s*<log>\s*(<severity level="\w+" timestamp="\d{4}-[A-Z][a-z]{2}-|$)/.test(s)) return "wingtra-obc";
+  if ((h.length >= 16 && h[0] === 0 && h[4] === 0 && h[5] === 4 && startsWith(h.subarray(8), "WINGTRA-")) || LIDAR_PART.test(n)) return "lidar-data";
   if (/(^|\n)[^\n$]{0,40}\$(G[PNLABQ]|BD)(GGA|RMC|GSA|GSV|VTG|ZDA|GLL|GST),/.test(s.slice(0, 2048)) && !/[\x00-\x08\x0e-\x1f]/.test(s.slice(0, 512))) return "nmea";
   if (/(^|\/)(diag|hostlog|httplog|sequoia_diag)\.dat$/.test(low) || /_em\.bb3$/.test(low)) return "encrypted";
   if (/^[\s\S]{0,8}[\w-]+\/[\w\/.-]+\.lz\.enc\0/.test(s.slice(0, 300))) return "encrypted";   // DJI device log bundle (DJI Assistant export)
@@ -141,7 +143,7 @@ async function parse(src, name, o) {
   L.trajectory = thin(L.trajectory);
   L.verify = verify(L);
   if (L.verify.state === "new") L.notes.push("unverified");
-  if (!L.error && !L.encrypted && !L.listOnly && L.size && L.startMs == null && !L.exposures.length && !L.trajectory.length && !L.raw && !L.panels && !L.notes.some(n => /encrypted|undocumented|empty|no-positions|plan|processing|project-pointer|unmapped/.test(n)) && !L.facts.some(f => /^(fBase|fFiles|fMessages|fPackets|fTopics|fParams|fPlacemarks|fPoints)/.test(f[0]) && f[1])) L.notes.push("nothing-read");
+  if (!L.error && !L.encrypted && !L.listOnly && L.size && L.startMs == null && !L.exposures.length && !L.trajectory.length && !L.raw && !L.panels && !L.notes.some(n => /encrypted|undocumented|empty|no-positions|plan|processing|project-pointer|unmapped|clock-unset/.test(n)) && !L.facts.some(f => /^(fBase|fFiles|fMessages|fPackets|fTopics|fParams|fPlacemarks|fPoints)/.test(f[0]) && f[1])) L.notes.push("nothing-read");
   return L;
 }
 
@@ -213,8 +215,11 @@ function atExposure(L) {
   if (M.length) S.modes = { n: M.length, names: [...new Set(M.map(e => e.mode))], out: M.filter(e => e.auto === false).length, outNames: [...new Set(M.filter(e => e.auto === false).map(e => e.mode))], unknown: M.every(e => e.auto == null) };
   const W = evs.filter(x => x.t >= t0 && x.t <= t1);
   // repeated messages (a real tlog repeats "Arming Checks Disabled" every few seconds) are listed once with their count
-  if (W.length) { const by = new Map(); for (const x of W) by.set(x.msg, (by.get(x.msg) || 0) + 1);
-    S.ev = { n: W.length, err: W.filter(x => x.lvl <= 3).length, kinds: by.size, first: [...by].slice(0, 3).map(([m, k]) => k > 1 ? m + " ×" + k : m) }; }
+  // messages that differ only in numbers (a Wingtra log repeats "Found Trigger! TOW, WNc, …" with each trigger) form one kind, shown with # for the numbers;
+  // errors (level 3 or worse) are listed first, then the most frequent kinds
+  if (W.length) { const by = new Map(); for (const x of W) { const k = x.msg.replace(/-?\d+(?:\.\d+)?(?:e[-+]?\d+)?/gi, "#"), g = by.get(k) || { msg: x.msg, n: 0, lvl: x.lvl }; g.n++; g.lvl = Math.min(g.lvl, x.lvl); by.set(k, g); }
+    const kinds = [...by].sort((a, b) => (b[1].lvl <= 3) - (a[1].lvl <= 3) || b[1].n - a[1].n);
+    S.ev = { n: W.length, err: W.filter(x => x.lvl <= 3).length, kinds: by.size, first: kinds.slice(0, 3).map(([k, g]) => g.n > 1 ? k + " ×" + g.n : g.msg) }; }
   L.atExp = S;
   for (const e of L.exposures) delete e._tc;
 }
@@ -233,8 +238,8 @@ const VERIFIED = [
   { kind: "sf-geoinfo", re: /rev 3$/, ver: "geoinfo rev 3", src: "internal" },
   { kind: "kml", re: /eMotion|^KML$/, ver: "eMotion 3 (eBee Plus, eBee X)", src: "internal", standard: true },
   { kind: "jxl", re: /JobXML 5\.7/, ver: "JobXML 5.7 (eMotion)", src: "internal" },
-  { kind: "mica-gpslog", re: /^v7\./, ver: "RedEdge-MX v7.x", src: "internal" },
-  { kind: "mica-paramlog", re: /./, ver: "RedEdge-M, RedEdge-MX v7.x", src: "internal" },
+  { kind: "mica-gpslog", re: /^v7\.|^v1\.3\./, ver: "RedEdge-MX v7.x, RedEdge-P v1.3.x", src: "internal" },
+  { kind: "mica-paramlog", re: /./, ver: "RedEdge-M, RedEdge-MX v7.x, RedEdge-P v1.3.x", src: "internal" },
   { kind: "ubx", re: /./, ver: "u-blox 5–M8 (NAV-PVT, NAV-SOL, RXM-RAW/RAWX)", src: "internal + RTKLIB", standard: true },
   { kind: "tlmb", re: /^1\.7\./, ver: "Sequoia 1.7.x", src: "internal" },
   { kind: "wingtra-geotaglog", re: /v1$/, ver: "geotaglog v1 (WingtraPilot 2.20)", src: "internal" },
@@ -243,7 +248,9 @@ const VERIFIED = [
   { kind: "wingtra-geotags", re: /./, ver: "WingtraHub 2.x", src: "internal" },
   { kind: "lidar-service", re: /^5\.4\./, ver: "Wingtra LiDAR 5.4.x", src: "internal" },
   { kind: "pcmp", re: /./, ver: "Wingtra LiDAR 5.4.x", src: "internal" },
-  { kind: "novatel", re: /./, ver: "OEMV", src: "RTKLIB" },
+  { kind: "wingtra-obc", re: /^v?2\.(19|20)\.|^"?[pv]?2\.8\.3/, ver: "WingtraPilot 2.8.3 (xml), 2.19–2.20 (txt)", src: "internal" },
+  { kind: "lidar-data", re: /^5\.4\./, ver: "Wingtra LiDAR 5.4.x (NovAtel OEM7500, Hesai PandarXT32)", src: "internal" },
+  { kind: "novatel", re: /./, ver: "OEMV (RTKLIB); OEM7 BESTPOS, RANGECMP4 inside Wingtra LiDAR .data", src: "RTKLIB + internal" },
   { kind: "encrypted", re: /./, ver: "–", src: "internal" },
   // read from the published format descriptions; NMEA, GPX and CSV checked only on synthetic files so far
   { kind: "ardupilot-bin", re: /^Ardu(Plane 4\.4\.|Copter 4\.6\.)/, ver: "ArduPlane 4.4.x, ArduCopter 4.6.x", src: "public (Zenodo 12107372, 22310050)", standard: true },
@@ -284,7 +291,7 @@ function versionKey(L) {
     case "ulog": return d.fw && !/^[0-9a-f]{40}$/.test(d.fw) ? (d.make === "Wingtra" ? "Wingtra " : "PX4 ") + d.fw : "";
     case "sbf": return (d.receiver || "") + " " + (d.fw || "");
     case "bbz": case "bb3": return d.receiver ? "eBee X " + d.receiver + " " + (d.fw || "") : L.encrypted || L.notes.includes("bb3-encrypted-part") ? "encrypted" : "";
-    case "mica-gpslog": case "tlmb": case "lidar-service": case "wingtra-json": return d.fw || "";
+    case "mica-gpslog": case "tlmb": case "lidar-service": case "lidar-data": case "wingtra-json": case "wingtra-obc": return d.fw || "";
     case "novatel": return "NovAtel";
     case "ardupilot-bin": case "ardupilot-log": case "tlog": return d.fw || fm;
     case "nmea": case "gpx": case "csv-geotags": return fm;
@@ -449,7 +456,7 @@ async function pULog(src, L, h) {
     }
     out._size = off; return (lay[name] = out);
   }
-  const gps = [], att = [], navs = [];
+  const gps = [], att = [], navs = [], wtrig = [], wgeo = [];
   while (p + 3 <= b.length) {
     const ty = String.fromCharCode(b[p + pre + 2]);
     if (!decided && p > 16) { if (T.includes(String.fromCharCode(b[p + 2]))) pre = 0; else if (T.includes(String.fromCharCode(b[p + 4]))) pre = 2; decided = true; continue; }
@@ -473,6 +480,9 @@ async function pULog(src, L, h) {
         gps.push({ topic: s.name, ts, utc: g("time_utc_usec"), lat, lon, h: alt, fix: g("fix_type"), eph: g("eph"), epv: g("epv"), sv: g("satellites_used") });
       }
       if (s && s.name === "vehicle_status" && !s.multi) { const Lf = layout(s.name); if (Lf.nav_state) { const v = rd(dvOf(m.subarray(2)), Lf.nav_state.t, Lf.nav_state.o); if (!navs.length || navs[navs.length - 1].v !== v) navs.push({ ts, v }); } }
+      // WingtraPilot 2.20 logs the trigger in camera_trigger_wingtra (time, sequence) and the autopilot geotag in geotag_dataman_item; there is no camera_capture
+      if (s && (s.name === "camera_trigger_wingtra" || s.name === "geotag_dataman_item")) { const Lf = layout(s.name), body = dvOf(m.subarray(2)), g = k => Lf[k] ? rd(body, Lf[k].t, Lf[k].o) : null;
+        if (s.name === "camera_trigger_wingtra") wtrig.push({ ts, utc: g("timestamp_utc"), seq: g("seq") }); else wgeo.push({ ts, utc: g("time_utc_usec"), lat: g("lat"), lon: g("lon"), h: g("alt"), ok: g("is_valid") }); }
       if (s && s.name === "camera_capture") { const Lf = layout(s.name), body = dvOf(m.subarray(2)), g = (k, sc) => Lf[k] ? rd(body, Lf[k].t, Lf[k].o) * (sc || 1) : null; att.push({ ts, utc: g("timestamp_utc"), seq: g("seq"), lat: g("lat"), lon: g("lon"), h: g("alt"), ok: g("result") }); }
     } else if (ty === "L") { logs.push({ ts: rd(md, "uint64_t", 1), lvl: m[0], msg: asc(m, 9, sz - 9) }); }
     else if (ty === "C") { const w = pre ? 1 : 2; logs.push({ ts: rd(md, "uint64_t", 1 + w), lvl: m[0], msg: asc(m, 9 + w, sz - 9 - w) }); }   // tag: uint16 in PX4, one byte in the Wingtra variant (WingtraPilot 2.20)
@@ -487,17 +497,26 @@ async function pULog(src, L, h) {
   const toUtc = ts => off == null ? null : ts / 1000 + off;
   L.trajectory = use.filter(g => g.fix >= 2 && g.lat).map(g => ({ t: toUtc(g.ts), lat: g.lat, lon: g.lon, h: g.h, q: fixName(g.fix) }));
   L.exposures = att.map((c, k) => ({ n: c.seq != null ? c.seq : k, t: c.utc > 1e15 ? c.utc / 1000 : toUtc(c.ts), _tc: toUtc(c.ts), lat: c.lat, lon: c.lon, h: c.h, q: "log" }));
+  if (!att.length && wtrig.length) {
+    // Wingtra: the trigger has a time but no position. The autopilot geotag (geotag_dataman_item) is logged about 0.2 s after the trigger and its
+    // height is not ellipsoidal (about 38 m below the GNSS ellipsoidal height in the field log), so it is not joined: the position is interpolated
+    // from the GNSS trajectory (ellipsoidal) and marked as an estimate. The exposure time of record is the PPK event in the geotaglog.
+    L.exposures = wtrig.map((c, k) => ({ n: c.seq != null ? c.seq : k, t: c.utc > 1e15 ? c.utc / 1000 : toUtc(c.ts), _tc: toUtc(c.ts), lat: null, lon: null, h: null, q: "log" }));
+    L._wt = "camera_trigger_wingtra " + wtrig.length + " · geotag_dataman_item " + wgeo.length;
+  }
+  // WingtraPilot numbers nav_state its own way (the survey runs in state 5, AUTO_RTL in PX4), so for Wingtra the state is shown by number and not rated
+  const wingtra = /wingtra/i.test((info.sys_name || "") + (info.vehicle_name || "") + JSON.stringify(info));
   // state at the exposures (atExposure): GNSS quality, navigation state, logged messages of level warning or worse (levels are ASCII digits 0–7)
-  L._aux = { gq: use.map(g => ({ t: toUtc(g.ts), sv: g.sv, eph: g.eph, fix: g.fix })), modes: navs.map(x => ({ t: toUtc(x.ts), name: PX4_NAV[x.v] || "nav_state " + x.v, auto: x.v === 3 })),
+  L._aux = { gq: use.map(g => ({ t: toUtc(g.ts), sv: g.sv, eph: g.eph, fix: g.fix })), modes: navs.map(x => ({ t: toUtc(x.ts), name: wingtra ? "nav_state " + x.v : PX4_NAV[x.v] || "nav_state " + x.v, auto: wingtra ? null : x.v === 3 })),
     ev: logs.map(x => ({ t: toUtc(x.ts), lvl: x.lvl >= 48 ? x.lvl - 48 : x.lvl, msg: x.msg })).filter(x => x.lvl <= 4) };
   if (tmin != null && off != null) { L.startMs = toUtc(tmin); L.endMs = toUtc(tmax); L.timeSource = "boot time + GPS time_utc_usec"; }
   const sysName = info.sys_name || info.vehicle_name || ""; L.device.make = /wingtra/i.test(sysName + JSON.stringify(info)) ? "Wingtra" : "PX4";
   L.device.model = info.vehicle_name || info.sys_name || null; L.device.fw = info.ver_sw_release_wingtra != null ? relVer(info.ver_sw_release_wingtra) : info.ver_sw_release ? relVer(info.ver_sw_release) : info.ver_sw || null;
   L.device.camera = info.camera_serial_number || null;
   // a header count of images without camera_capture messages: a reduced log (the ULog that WingtraHub keeps next to the geotags has 9 topics)
-  if (+info.camera_image_count > 0 && !att.length) L.notes.push("ulog-no-captures");
+  if (+info.camera_image_count > 0 && !att.length && !wtrig.length) L.notes.push("ulog-no-captures");
   fact(L, "fFormat", "ULog" + (pre ? " (Wingtra variant, 2-byte prefix)" : ""));
-  fact(L, "fVehicle", L.device.model); fact(L, "fFirmware", L.device.fw); fact(L, "fCameraSerial", L.device.camera); fact(L, "fCameraCount", info.camera_image_count);
+  fact(L, "fVehicle", L.device.model); fact(L, "fFirmware", L.device.fw); fact(L, "fCameraSerial", L.device.camera); fact(L, "fCameraCount", info.camera_image_count); fact(L, "fCameraTriggers", L._wt); delete L._wt;
   fact(L, "fDuration", tmin != null ? ((tmax - tmin) / 1e6).toFixed(0) + " s" : null);
   fact(L, "fTopics", Object.entries(topics).filter(x => x[1]).sort((a, b) => b[1] - a[1]).map(x => x[0] + ": " + x[1]).join(", "));
   if (use.length) {
@@ -811,13 +830,80 @@ async function pUBX(src, L, h, o) {
   if (!pts.length && rt0 != null) { L.startMs = rt0; L.endMs = rt1; L.timeSource = "RXM raw measurement time (GPS − leap seconds)"; }
   if (raw > 1 && rt0 != null) { L.raw.interval = Math.round((rt1 - rt0) / (raw - 1)) / 1000; fact(L, "fInterval", L.raw.interval + " s"); }
 }
-async function pNovatel(src, L) {
-  const cnt = {}; let n = 0;
-  await scan(src, (b, fin) => { let i = 0; const dv = dvOf(b);
-    while (i + 28 <= b.length) { if (b[i] !== 0xaa || b[i + 1] !== 0x44 || b[i + 2] !== 0x12) { i++; continue; } const hl = b[i + 3], id = dv.getUint16(i + 4, true), ml = dv.getUint16(i + 8, true); if (i + hl + ml + 4 > b.length) { if (fin) break; return i; } cnt[id] = (cnt[id] || 0) + 1; n++; i += hl + ml + 4; }
-    return fin ? b.length : i; });
-  L.device.make = "NovAtel"; L.raw = { format: "NovAtel OEM", type: cnt[43] || cnt[140] ? "raw observations (RANGE)" : "messages", epochs: (cnt[43] || 0) + (cnt[140] || 0) };
-  fact(L, "fFormat", "NovAtel OEM binary (recognised; positions not decoded yet)"); fact(L, "fMessages", n); fact(L, "fMsgTypes", Object.entries(cnt).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([k, v]) => ({ 43: "RANGE", 140: "RANGECMP", 42: "BESTPOS", 7: "GPSEPHEM", 8: "IONUTC" }[k] || k) + ": " + v).join(", "));
+/* NovAtel OEM binary: sync AA 44 12, header length at +3, message id +4, body length +8, GPS week +14, ms of week +16, CRC32 after the body.
+   novScan(b, fin, cb) calls cb(id, b, bodyStart, bodyLength, week, towMs) for each whole message and returns the bytes consumed. */
+const NOV_NAMES = { 7: "GPSEPHEM", 8: "IONUTC", 41: "RAWEPHEM", 42: "BESTPOS", 43: "RANGE", 140: "RANGECMP", 241: "BESTXYZ", 723: "GLOEPHEMERIS", 2050: "RANGECMP4" };
+const NOV_POS = { 0: "none", 1: "fixed position", 16: "single", 17: "dgps", 18: "sbas", 19: "propagated", 32: "float", 33: "float", 34: "float", 48: "fixed", 49: "fixed", 50: "fixed", 52: "single", 53: "single", 54: "dgps", 55: "float", 56: "fixed", 68: "float", 69: "ppp" };
+function novScan(b, fin, cb) {
+  let i = 0; const dv = dvOf(b);
+  while (i + 28 <= b.length) { if (b[i] !== 0xaa || b[i + 1] !== 0x44 || b[i + 2] !== 0x12) { i++; continue; } const hl = b[i + 3], id = dv.getUint16(i + 4, true), ml = dv.getUint16(i + 8, true); if (i + hl + ml + 4 > b.length) { if (fin) break; return i; } cb(id, b, i + hl, ml, dv.getUint16(i + 14, true), dv.getUint32(i + 16, true)); i += hl + ml + 4; }
+  return fin ? b.length : i;
+}
+/* collects message counts, BESTPOS positions and the time of raw observations */
+function novState() {
+  const S = { cnt: {}, n: 0, pos: [], wk: null, raw: 0, r0: null, r1: null };
+  S.cb = (id, b, a, ml, wk, ms) => { S.cnt[id] = (S.cnt[id] || 0) + 1; S.n++; if (wk > 1000 && wk < 5000 && S.wk == null) S.wk = wk;
+    if (id === 43 || id === 140 || id === 2050) { S.raw++; const t = gpsToUtc(wk, ms); if (S.r0 == null) S.r0 = t; S.r1 = t; }
+    else if (id === 42 && ml >= 66) { const dv = dvOf(b), pt = dv.getUint32(a + 4, true), lat = dv.getFloat64(a + 8, true), lon = dv.getFloat64(a + 16, true);
+      if (pt && Math.abs(lat) <= 90 && Math.abs(lon) <= 180 && (lat || lon)) S.pos.push({ t: gpsToUtc(wk, ms), lat, lon, h: dv.getFloat64(a + 24, true) + dv.getFloat32(a + 32, true), sH: Math.hypot(dv.getFloat32(a + 40, true), dv.getFloat32(a + 44, true)), sV: dv.getFloat32(a + 48, true), q: NOV_POS[pt] || "type " + pt, sv: b[a + 65] }); } };
+  return S;
+}
+function novFacts(S, L) {
+  fact(L, "fMessages", S.n); fact(L, "fMsgTypes", Object.entries(S.cnt).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([k, v]) => (NOV_NAMES[k] || k) + ": " + v).join(", "));
+  if (S.pos.length) { fact(L, "fPvtModes", Object.entries(countBy(S.pos, p => p.q)).map(([k, v]) => k + ": " + v).join(", ")); fact(L, "fHacc", median(S.pos.map(p => p.sH)).toFixed(2) + " m"); fact(L, "fSats", median(S.pos.map(p => p.sv))); }
+  if (S.raw) { const iv = S.raw > 1 ? Math.round((S.r1 - S.r0) / (S.raw - 1)) / 1000 : null; L.raw = { format: "NovAtel OEM", type: "raw observations (" + [43, 140, 2050].filter(k => S.cnt[k]).map(k => NOV_NAMES[k]).join(", ") + ")", epochs: S.raw, interval: iv }; fact(L, "fRawObs", S.raw + (iv != null ? " (" + iv + " s)" : "")); }
+}
+async function pNovatel(src, L, h, o) {
+  const S = novState(); await scan(src, (b, fin) => novScan(b, fin, S.cb), o);
+  L.device.make = "NovAtel"; if (!S.raw) L.raw = { format: "NovAtel OEM", type: "messages", epochs: 0 };
+  fact(L, "fFormat", "NovAtel OEM binary"); novFacts(S, L);
+  L.trajectory = thin(S.pos); for (const p of S.pos) span(L, p.t); if (S.pos.length) L.timeSource = "GPS week + ms of week in message headers − leap seconds";
+  else if (S.r0 != null) { L.startMs = S.r0; L.endMs = S.r1; L.timeSource = "raw observation time (GPS − leap seconds)"; }
+}
+
+/* ---------------------------------------------------------------- Wingtra LiDAR recording WINGTRA-<date>-<time>-NNN.data (firmware 5.4).
+   Part 001 starts with a 1 KiB header: u32 0, u32 1024, then text fields: payload name (+8), firmware (+24), GNSS receiver (+40), scanner (+104).
+   Then records <u32 stream><u32 length><payload>: stream 1 IMU (f64 GPS time of week first, 32 B, 200 Hz), stream 2 NovAtel OEM binary,
+   stream 4 Hesai scanner packets, stream 0 empty markers. The first record of a stream can be its definition ("$IMURAW", "$HSAI").
+   The recording is cut into parts of 256 MiB regardless of records: the next part begins with the rest of the cut record. */
+const LIDAR_PART = /(^|\/)WINGTRA-\d{4}(?:-\d\d){5}-(\d{3})\.data$/i;
+/* a plausible chain of records from offset a: zero bytes also read as empty records, so the chain must hold mostly non-empty ones */
+function lidarChain(b, a, need) { let i = a, full = 0, empty = 0; const dv = dvOf(b); while (i + 8 <= b.length && full < need) { const st = dv.getUint32(i, true), ln = dv.getUint32(i + 4, true); if (st > 15 || ln > 65536 || (i === a && !ln)) return false; if (ln) { full++; empty = 0; } else if (++empty > 8) return false; i += 8 + ln; } return full >= need || (i + 8 > b.length && full >= 3); }
+async function pLidarData(src, L, h, o) {
+  const head = h.length >= 168 && dvOf(h).getUint32(0, true) === 0 && dvOf(h).getUint32(4, true) === 1024 && startsWith(h.subarray(8), "WINGTRA-");
+  const pm = LIDAR_PART.exec(L.name || ""), part = pm ? +pm[2] : head ? 1 : null;
+  let lead = head ? 1024 : null;
+  if (!head) { const b0 = await slice(src, 0, 1 << 18); for (let a = 0; a < Math.min(b0.length, 1 << 16); a++) if (lidarChain(b0, a, 50)) { lead = a; break; } }
+  L.device.make = "Wingtra"; L.device.model = "WingtraOne LiDAR"; fact(L, "fFormat", "Wingtra LiDAR recording (.data)");
+  if (head) { L.device.serial = asc(h, 8, 16) || null; L.device.fw = asc(h, 24, 16) || null; L.device.receiver = asc(h, 40, 64) || null;
+    fact(L, "fFirmware", L.device.fw); fact(L, "fReceiver", L.device.receiver); fact(L, "fScanner", asc(h, 104, 32)); fact(L, "fSerial", L.device.serial); }
+  if (lead == null) { L.notes.push("lidar-data-unreadable"); L.lidar = { file: (L.name || "").split("/").pop(), part, lead: null, need: null }; return; }
+  const cnt = {}, bytes = {}, defs = {}, N = novState(), imu = []; let nov = new Uint8Array(0), skip = lead, stop = null, tail = 0, need = null, pos = 0;
+  const rec = (st, p) => { cnt[st] = (cnt[st] || 0) + 1; bytes[st] = (bytes[st] || 0) + p.length;
+    if (cnt[st] === 1 && p[0] === 0x24) defs[st] = new TextDecoder("latin1").decode(p.subarray(0, 200)).match(/[A-Z][\w-]{2,}/g).slice(0, 2).join(" · ");
+    else if (st === 1 && p.length >= 8) { const t = dvOf(p).getFloat64(0, true); if (t >= 0 && t < 604800) imu.push(t); }
+    else if (st === 2) { nov = cat(nov, p); if (nov.length > 1 << 16) nov = nov.subarray(novScan(nov, false, N.cb)); } };
+  await scan(src, (b, fin) => {
+    let i = 0; if (skip) { i = Math.min(skip, b.length); skip -= i; }
+    if (stop != null) return b.length;
+    const dv = dvOf(b);
+    while (i + 8 <= b.length) { const st = dv.getUint32(i, true), ln = dv.getUint32(i + 4, true); if (st > 15 || ln > 65536) { stop = pos + i; return b.length; } if (i + 8 + ln > b.length) { if (fin) need = 8 + ln - (b.length - i); break; } rec(st, b.subarray(i + 8, i + 8 + ln)); i += 8 + ln; }
+    if (fin) tail = b.length - i; pos += i; return i;
+  }, o);
+  novScan(nov, true, N.cb);
+  // GPS week: from the NovAtel headers, else from the UTC date and time in the file name
+  const nm = /(\d{4})-(\d\d)-(\d\d)-(\d\d)-(\d\d)-(\d\d)/.exec(L.name || ""), wk = N.wk != null ? N.wk : nm ? Math.floor((Date.UTC(+nm[1], nm[2] - 1, +nm[3], +nm[4], +nm[5], +nm[6]) + 18000 - GPS0) / WEEK) : null;
+  if (imu.length && wk != null) { span(L, gpsToUtc(wk, imu[0] * 1000)); span(L, gpsToUtc(wk, imu[imu.length - 1] * 1000)); L.timeSource = "IMU GPS time of week + GPS week " + (N.wk != null ? "(NovAtel)" : "(file name)") + " − leap seconds"; }
+  else if (N.pos.length) { for (const p of N.pos) span(L, p.t); L.timeSource = "NovAtel BESTPOS (GPS − leap seconds)"; }
+  L.trajectory = thin(N.pos.map(p => ({ t: p.t, lat: p.lat, lon: p.lon, h: p.h, q: p.q })));
+  const dur = imu.length > 1 ? imu[imu.length - 1] - imu[0] : null, rate = n => dur && n / dur >= 1 ? " (" + Math.round(n / dur) + "/s)" : "", DEF = { 1: "IMU", 2: "NovAtel", 4: "scanner" };
+  fact(L, "fPart", (part != null ? String(part).padStart(3, "0") : "?") + (head ? " · header 1 KiB" : lead ? " · begins with " + lead + " B of a record cut at the end of the previous part" : "") + (need != null ? " · last record continues in the next part (" + need + " B)" : tail ? " · " + tail + " B after the last whole record" : ""));
+  fact(L, "fStreams", Object.keys(cnt).sort((a, b) => a - b).map(k => k + (defs[k] ? " " + defs[k] : DEF[k] ? " " + DEF[k] : "") + ": " + cnt[k] + rate(cnt[k]) + (bytes[k] ? ", " + (bytes[k] >= 1048576 ? (bytes[k] / 1048576).toFixed(1) + " MiB" : Math.ceil(bytes[k] / 1024) + " KiB") : "")).join(" · "));
+  fact(L, "fDuration", dur != null ? Math.round(dur) + " s" : null);
+  if (N.n) novFacts(N, L); if (L.raw) L.raw.role = "rover";
+  if (N.pos.length >= 10) { const a = N.pos[0], d = Math.max(...N.pos.map(r => Math.hypot((r.lat - a.lat) * 111320, (r.lon - a.lon) * 111320 * Math.cos(a.lat / R2D)))); fact(L, "fMoved", d.toFixed(1) + " m"); if (d < 50) L.notes.push("lidar-static"); }
+  if (stop != null) { L.notes.push("lidar-data-broken"); fact(L, "fBrokenAt", stop); }
+  L.lidar = { file: (L.name || "").split("/").pop(), part, lead: head ? 0 : lead, need };
 }
 
 /* ---------------------------------------------------------------- Parrot Sequoia TLMB: header key/values, then u32-length zlib blocks;
@@ -942,6 +1028,53 @@ async function pPcmp(src, L) {
   const ant = [...s.matchAll(/<(priAnt|secAnt)\s+x="([^"]+)"\s+y="([^"]+)"\s+z="([^"]+)"/g)].map(m => (m[1] === "priAnt" ? "primary" : "secondary") + " (" + m[2] + ", " + m[3] + ", " + m[4] + ") m");
   fact(L, "fAntennaOffsets", ant.length ? ant.join(" · ") : null);
   L.lidar = { data: all.filter(m => m[1] === "data").map(m => m[2].split("/").pop()), inputs: all.filter(m => m[1] !== "data").map(m => m[2]) };
+}
+
+/* ---------------------------------------------------------------- Wingtra payload computer (OBC) log: obclogs/NNNNN_YYYYMMDD_hhmmss.txt (WingtraPilot 2.19+)
+   "2026-Mar-18 13:18:45.627804|NOTICE|MAIN|text", older YYYYMMDD_hhmmss_NNNNN.xml "<severity level=".." timestamp="..">[MOD]: text</severity>".
+   The OBC clock is not set from GNSS: its time is shown as written, and moved to UTC only by the PPK triggers ("Found Trigger! TOW, WNc, …"),
+   whose GPS time equals the event time in the WingtraHub geotaglog. */
+const MON = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+async function pObc(src, L, h, o) {
+  const lv = {}, warn = new Map(), trig = [], geo = [], sweeps = [], kv = {}; let first = null, last = null, n = 0;
+  const RX_T = /^(\d{4})-([A-Z][a-z]{2})-(\d\d) (\d\d):(\d\d):(\d\d(?:\.\d+)?)\|\s*(\w*)\s*\|\s*(\w*)\s*\|(.*)$/, RX_X = /<severity level="(\w+)" timestamp="(\d{4})-([A-Z][a-z]{2})-(\d\d) (\d\d):(\d\d):(\d\d(?:\.\d+)?)">(?:\[\s*(\w*)\]: )?(.*?)(?:<\/severity>|$)/;
+  const ent = x => x.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+  await eachLine(src, line => {
+    line = line.replace(/\0/g, ""); let m = RX_T.exec(line), y, mo, d, hh, mi, ss, lev, mod, msg;
+    if (m) [, y, mo, d, hh, mi, ss, lev, mod, msg] = m; else if ((m = RX_X.exec(line))) { [, lev, y, mo, d, hh, mi, ss, mod, msg] = m; msg = ent(msg); } else return;
+    if (!lev || MON[mo] == null) return;
+    const t = Date.UTC(+y, MON[mo], +d, +hh, +mi) + parseFloat(ss) * 1000; lev = lev.toUpperCase(); n++; lv[lev] = (lv[lev] || 0) + 1; if (first == null) first = t; last = t; msg = msg.trim();
+    if (/^(WARN|WARNING|ERROR|ERR|CRITICAL|FATAL)$/.test(lev)) { const pre = mod ? mod + ": " : "", k = pre + msg.replace(/-?\d+(?:\.\d+)?(?:e[-+]?\d+)?/gi, "#"), g = warn.get(k) || { msg: pre + msg, n: 0, err: false }; g.n++; if (lev !== "WARN" && lev !== "WARNING") g.err = true; warn.set(k, g); }
+    let x;
+    if ((x = /^Found Trigger! TOW, WNc, Offset, ClkBias: (\d+), (\d+), ([-\d.e+]+), [-\d.e+]+, ppkFixType (\d+)/.exec(msg))) trig.push({ tl: t, t: gpsToUtc(+x[2], +x[1]), fix: x[4] });
+    else if ((x = /^New geotag item: (\d+)/.exec(msg))) geo.push({ tl: t, k: +x[1] });
+    else if ((x = /^Sweep started with height above ground (-?[\d.]+)/.exec(msg))) sweeps.push(+x[1]);
+    else if ((x = /^GIT_TAG: "?([^"\s]+)"?(?: GIT_HASH: "?(\w+))?/.exec(msg))) { if (!kv.fw) { kv.fw = x[1]; kv.hash = x[2]; } }
+    else if ((x = /^Camera Software\s*: (.+)/.exec(msg))) kv.cam = x[1].trim();
+    else if ((x = /^Found (Sony|MicaSense|Phase One|\w+) camera (\S+)/.exec(msg))) { if (!kv.cam0) kv.cam0 = x[1] + " " + x[2]; }
+    else if ((x = /^Running on RPi HW_VER=(\S+)/.exec(msg))) kv.hw = x[1];
+    else if (/^PPK RfStatus, Interference: Yes/.test(msg)) kv.rf = (kv.rf || 0) + 1;
+    else if (/^SBF parser failures/.test(msg)) kv.sbf = (kv.sbf || 0) + 1;
+    else if (/^PPK ReceiverStatus ExtError/.test(msg)) kv.ext = (kv.ext || 0) + 1;
+    else if ((x = /^BUILD TYPE: (\S+)/.exec(msg))) kv.build = x[1];
+  }, o);
+  // the trigger logged nearest to a geotag item (within 1.5 s of OBC time) belongs to it; with geotag items present, only those triggers are exposures
+  const used = new Set(); for (const g of geo) { let k = -1; trig.forEach((tr, i) => { if (!used.has(i) && Math.abs(tr.tl - g.tl) < 1500 && (k < 0 || Math.abs(tr.tl - g.tl) < Math.abs(trig[k].tl - g.tl))) k = i; }); if (k >= 0) used.add(k); }
+  const ex = geo.length ? trig.filter((_, i) => used.has(i)) : trig;
+  L.exposures = ex.map((e, k) => ({ n: k + 1, t: e.t, _tc: e.t, lat: null, lon: null, h: null, q: "log" }));
+  const off = trig.length ? median(trig.map(e => e.tl - e.t)) : null;
+  if (off != null) { span(L, first - off); span(L, last - off); L.timeSource = "OBC clock − median offset to the PPK trigger GPS time"; }
+  L.device.make = "Wingtra"; L.device.model = "WingtraOne payload computer (OBC)"; L.device.fw = kv.fw || null; L.device.camera = kv.cam || kv.cam0 || null;
+  fact(L, "fFormat", "Wingtra payload computer log (OBC)"); fact(L, "fFirmware", kv.fw ? kv.fw + (kv.hash ? " (" + kv.hash + ")" : "") + (kv.build ? " · " + kv.build : "") : null); fact(L, "fHardware", kv.hw ? "Raspberry Pi HW_VER=" + kv.hw : null);
+  fact(L, "fCamera", [kv.cam0, kv.cam].filter(Boolean).join(" · "));
+  fact(L, "fCameraTriggers", trig.length ? trig.length + " PPK triggers (" + Object.entries(countBy(trig, e => "ppkFixType " + e.fix)).map(([k, v]) => k + ": " + v).join(", ") + ")" + (geo.length ? " · " + geo.length + " geotag items · triggers without a geotag item: " + (trig.length - used.size) : "") : null);
+  fact(L, "fSweeps", sweeps.length || null);
+  fact(L, "fPpkHealth", kv.rf || kv.sbf || kv.ext ? ["RF interference: " + (kv.rf || 0), "SBF parser failures: " + (kv.sbf || 0), "receiver ExtError: " + (kv.ext || 0)].join(" · ") : null);
+  fact(L, "fLogClock", first != null ? iso(first).replace("Z", "") + " … " + iso(last).replace("Z", "") + " (OBC clock, zone not stated)" : null);
+  if (off != null) fact(L, "fClockVsGnss", (off >= 0 ? "+" : "−") + (Math.abs(off) / 1000).toFixed(1) + " s (" + Math.floor(Math.abs(off) / 3600000) + " h " + Math.floor(Math.abs(off) % 3600000 / 60000) + " min)");
+  fact(L, "fLogLevels", Object.entries(lv).sort((a, b) => b[1] - a[1]).map(([k, v]) => k + ": " + v).join(", "));
+  const top = [...warn.values()].sort((a, b) => b.err - a.err || b.n - a.n).slice(0, 6); fact(L, "fWarnings", top.length ? top.map(g => (g.err ? "[error] " : "") + g.msg.slice(0, 140) + (g.n > 1 ? " ×" + g.n : "")).join(" | ") : null);
+  if (n && off == null) L.notes.push("obc-clock-unset");
 }
 
 /* ---------------------------------------------------------------- encrypted or undocumented logs */
@@ -1925,7 +2058,7 @@ async function pMetashape(src, L, h) {
 
 const PARSERS = { "dji-mrk": pMRK, rinex: pRINEX, rtcm3: pRTCM, ulog: pULog, sbf: pSBF, bb3: pBB3, "sf-geoinfo": pGeoinfo, kml: pKML, jxl: pJXL,
   "wingtra-geotaglog": pWGeotaglog, "wingtra-json": pWJson, "wingtra-ini": pWIni, "wingtra-geotags": pWGeotags, "mica-paramlog": pParamlog, "mica-gpslog": pGpslog,
-  tlmb: pTLMB, ubx: pUBX, novatel: pNovatel, "lidar-service": pService, pcmp: pPcmp, encrypted: pEncrypted,
+  tlmb: pTLMB, ubx: pUBX, novatel: pNovatel, "lidar-service": pService, "lidar-data": pLidarData, "wingtra-obc": pObc, pcmp: pPcmp, encrypted: pEncrypted,
   "ardupilot-bin": pDataFlash, "ardupilot-log": pAPText, tlog: pTlog, nmea: pNMEA, gpx: pGPX, "csv-geotags": pCSV, "csv-columns": pCSVCols, "dji-fr-csv": pDjiCsv, "thermotiff-log": pThermoLog, "thermotiff-record": pThermoRecord, "dji-fr": pDjiFR, "emotion-transcript": pEmTranscript, "ebeex-afpu": pAfpu, "pix4dcapture-log": pP4dCaptureLog, bbz: pBBZ, "pix4dcapture-mission": pP4dMission, bbx: pBBX, "dji-events": pDjiEvents, "dji-dat": pDjiDat, jeti: pJeti, efl: pEfl, "pix4d-project": pP4D, metashape: pMetashape };
 
 /* ---------------------------------------------------------------- joining images with logs, checks */
@@ -2016,10 +2149,13 @@ function combine(logs, images, solar) {
     const cen = l => { const v = l.exposures.filter(e => e.lat != null && isFinite(e.lat)); return v.length ? { lat: median(v.map(e => e.lat)), lon: median(v.map(e => e.lon)) } : null; }, c0 = cen(main);
     const keys0 = main.exposures[0] && main.exposures[0].name ? new Set(main.exposures.map(e => shotKey(e.name))) : null;
     // two files of one kind naming entirely different images belong to different flights (e.g. the RGB and the multispectral geotags.csv of one day)
+    // exposure windows that do not overlap in time belong to different flights (two WingtraOne flights of one day, each with its own ULog)
+    const win = l => { const t = l.exposures.map(e => e.t).filter(x => x != null && isFinite(x)); return t.length ? [Math.min(...t), Math.max(...t)] : null; }, w0 = win(main);
+    const apart = l => { const w = w0 && win(l); return !!w && (w[0] > w0[1] + 60000 || w[1] < w0[0] - 60000); };
     const disjoint = l => keys0 && l.kind === main.kind && l.exposures.length && l.exposures[0].name && !l.exposures.some(e => keys0.has(shotKey(e.name)));
     for (const l of src.slice(1)) {
       const c = cen(l), far = c && c0 && Math.hypot((c.lat - c0.lat) * 111320, (c.lon - c0.lon) * 111320 * Math.cos(c0.lat / R2D)) > 5000;
-      const other = far || (l.session && main.session && l.session !== main.session) || (l.startMs != null && main.startMs != null && (l.startMs > main.endMs + 3600000 || l.endMs < main.startMs - 3600000)) || (l.kind === main.kind && (l.startMs == null) !== (main.startMs == null)) || disjoint(l);
+      const other = far || (l.session && main.session && l.session !== main.session) || (l.startMs != null && main.startMs != null && (l.startMs > main.endMs + 3600000 || l.endMs < main.startMs - 3600000)) || (l.kind === main.kind && (l.startMs == null) !== (main.startMs == null)) || disjoint(l) || apart(l);
       if (other) { add("info", "cOtherFlight", l.name + (l.startMs != null ? " · " + isoS(l.startMs) : "")); l._other = true; continue; } const n2 = l.exposures[0] && l.exposures[0].name ? new Set(l.exposures.map(e => shotKey(e.name))).size : l.exposures.length; if (Math.abs(n2 - shots) > Math.max(2, 0.01 * shots)) add("warn", "cCountMismatch", main.name + " " + shots + " ≠ " + l.name + " " + n2); }
   } else add("info", "cNoExposures", "");
   if (images.length && src.length) { const ok = F.matches.filter(m => m.log).length; add(ok === images.length ? "ok" : ok ? "warn" : "bad", "cMatched", ok + " / " + images.length + (ok ? " · " + Object.entries(countBy(F.matches.filter(m => m.log), m => m.how)).map(([k, v]) => k + ": " + v).join(", ") : ""));
@@ -2034,7 +2170,8 @@ function combine(logs, images, solar) {
   const dxy = F.matches.map(m => m.dxy).filter(x => x != null);
   if (dxy.length) { const md = median(dxy); add(md <= 1 ? "ok" : md <= 10 ? "info" : "warn", "cPosDiff", md.toFixed(2) + " m (max " + Math.max(...dxy).toFixed(Math.max(...dxy) < 10 ? 2 : 0) + " m)", md); }
   // 4 solution quality of exposures
-  if (main && main.exposures.some(e => e.q && e.q !== "log")) {
+  const solQ = e => e.q && e.q !== "log" && e.q !== "event";   // "event": the receiver logged only the event time, no solution at it (raw rover)
+  if (main && main.exposures.some(solQ)) {
     const c = countBy(main.exposures, e => e.q || "–"), n = main.exposures.length, good = (c.fixed || 0) + (c.ppk || 0);
     add(good === n ? "ok" : good > 0.95 * n ? "info" : "warn", "cSolution", Object.entries(c).map(([k, v]) => k + ": " + v).join(", "), good / n);
     const sH = median(main.exposures.map(e => e.sH != null ? e.sH : e.sN != null ? Math.max(e.sN, e.sE) : null)); if (sH != null) add(sH <= 0.05 ? "ok" : sH <= 0.5 ? "info" : "warn", "cSigma", sH.toFixed(3) + " m", sH);
@@ -2091,6 +2228,15 @@ function combine(logs, images, solar) {
   { const rec = logs.filter(l => l.lidar && l.lidar.recorded), prj = logs.filter(l => l.lidar && l.lidar.data);
     if (rec.length && prj.length) { const a = new Set(rec.flatMap(l => l.lidar.recorded)), b = new Set(prj.flatMap(l => l.lidar.data)), miss = [...b].filter(x => !a.has(x)), extra = [...a].filter(x => !b.has(x));
       add(miss.length || extra.length ? "warn" : "ok", "cLidarFiles", a.size + " / " + b.size + (miss.length ? " · not recorded: " + miss.join(", ") : "") + (extra.length ? " · not in project: " + extra.join(", ") : "")); } }
+  // Wingtra LiDAR .data parts: each part must begin with exactly the bytes of the record cut at the end of the previous one
+  { const parts = logs.filter(l => l.lidar && l.lidar.file && l.lidar.part != null), groups = {};
+    for (const l of parts) (groups[l.lidar.file.replace(/-\d{3}\.data$/i, "")] = groups[l.lidar.file.replace(/-\d{3}\.data$/i, "")] || []).push(l);
+    for (const [base, g] of Object.entries(groups)) { if (g.length < 2 && g[0].lidar.part === 1 && g[0].lidar.need == null) continue;
+      g.sort((x, y) => x.lidar.part - y.lidar.part); const bad = [];
+      if (g[0].lidar.part !== 1) bad.push("first part " + String(g[0].lidar.part).padStart(3, "0"));
+      for (let k = 1; k < g.length; k++) { const a = g[k - 1].lidar, b = g[k].lidar; if (b.part !== a.part + 1) bad.push("missing " + String(a.part + 1).padStart(3, "0")); else if ((a.need || 0) !== (b.lead || 0)) bad.push(String(a.part).padStart(3, "0") + " → " + String(b.part).padStart(3, "0") + ": " + (a.need || 0) + " ≠ " + (b.lead || 0) + " B"); }
+      const last = g[g.length - 1].lidar; if (last.need != null) bad.push("after " + String(last.part).padStart(3, "0") + " a further part is expected");
+      add(bad.length ? "warn" : "ok", "cLidarParts", base.split("/").pop() + " · " + g.length + (bad.length ? " · " + bad.join("; ") : "")); } }
   for (const l of logs) { const v = l.verify || {};
     if (v.state === "new") add(v.standard ? "info" : "warn", "cUnverified", l.name + ": " + (v.key || "?") + (v.known ? " · ✓ " + v.known : ""));
     if (l.notes.includes("implausible")) add("warn", "cImplausible", l.name + ": " + factOf(l, "fImplausible"));
