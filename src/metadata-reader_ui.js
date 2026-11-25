@@ -481,8 +481,8 @@ function cardRad(e) {
   const S = e.res.summary;
   if (S.thermal) {
     const p = S.thermal.parts || {}, bd = S.thermal.band, k = S.thermal.kind || "";
-    const note = k === "ThermoTIFF" ? "thermalNoteTt" : /^temperature TIFF/.test(k) ? "thermalNoteConv" : /^thermal TIFF, 16-bit/.test(k) ? (bd && bd.wrap ? "thermalNoteWrap" : "thermalNote16") : "thermalNote";
-    return '<article class="card"><h3>' + esc(t("cThermal")) + "</h3>" + kv([[t("kKind"), esc(S.thermal.kind)], bd ? [t("kValues"), esc(dec(String(+bd.min.toFixed(3)) + " … " + String(+bd.max.toFixed(3)) + (bd.mean != null ? " (" + t("kMean") + " " + (+bd.mean.toFixed(3)) + ")" : "")) + (bd.kind === "float32" ? "" : " (" + bd.kind + ")"))] : null, p.app3 ? ["APP3 ThermalData", fmtBytes(p.app3)] : null, p.app4 ? ["APP4 ThermalParams", fmtBytes(p.app4)] : null, p.app5 ? ["APP5 ThermalCalibration", fmtBytes(p.app5)] : null, p.flir ? ["APP1 FLIR", String(p.flir)] : null]) +
+    const note = k === "ThermoTIFF" ? "thermalNoteTt" : /^temperature TIFF/.test(k) ? "thermalNoteConv" : /^radiometric TIFF/.test(k) ? "thermalNoteCam" : /raw counts/.test(k) ? "thermalNoteRaw" : /^thermal TIFF, 16-bit/.test(k) ? (bd && bd.wrap ? "thermalNoteWrap" : "thermalNote16") : "thermalNote", tr = S.thermal.tempRange;
+    return '<article class="card"><h3>' + esc(t("cThermal")) + "</h3>" + kv([[t("kKind"), esc(S.thermal.kind)], bd ? [t("kValues"), esc(dec(String(+bd.min.toFixed(3)) + " … " + String(+bd.max.toFixed(3)) + (bd.mean != null ? " (" + t("kMean") + " " + (+bd.mean.toFixed(3)) + ")" : "")) + (bd.kind === "float32" ? "" : " (" + bd.kind + ")"))] : null, tr ? [t("kTempRange"), esc(dec((+tr[0].toFixed(2)) + " … " + (+tr[1].toFixed(2)) + " °C" + (tr[2] != null ? " (" + t("kMean") + " " + (+tr[2].toFixed(2)) + ")" : "")))] : null, p.app3 ? ["APP3 ThermalData", fmtBytes(p.app3)] : null, p.app4 ? ["APP4 ThermalParams", fmtBytes(p.app4)] : null, p.app5 ? ["APP5 ThermalCalibration", fmtBytes(p.app5)] : null, p.flir ? ["APP1 FLIR", String(p.flir)] : null]) +
       '<p class="callout' + (note === "thermalNoteTt" ? "" : " w") + '">' + t(note) + "</p></article>";
   }
   if (!S.band && !S.irradiance) return "";
@@ -655,12 +655,12 @@ function oslRules(e, B) {
   }
   if (th) {
     const T0 = S.thermal || {}, P0 = T0.params, TT = T0.thermotiff;
-    if (S.sensorTemp != null) F("thermal.fpa_temperature", S.sensorTemp, "XMP:Camera:SensorTemperature", "nFpaXmp"); else X("thermal.fpa_temperature", "", /^DJI|^ThermoTIFF|^(temperature|thermal) TIFF/.test(T0.kind || "") ? "nFpaDji" : "nSdk");
+    if (S.sensorTemp != null) F("thermal.fpa_temperature", S.sensorTemp, "XMP:Camera:SensorTemperature", "nFpaXmp"); else X("thermal.fpa_temperature", "", /^radiometric TIFF|raw counts/.test(T0.kind || "") ? "nFpaCamTiff" : /^DJI|^ThermoTIFF|^(temperature|thermal) TIFF/.test(T0.kind || "") ? "nFpaDji" : "nSdk");
     if (P0) {
       const p = {}; for (const [k, v] of Object.entries(P0)) if (k !== "src" && v != null) p[k] = v;
       F("thermal.capture_measurement_params", p, P0.src, "nCamSet");
       if (P0.emissivity != null) D("reference.emissivity_setting", P0.emissivity, P0.src, "nEmisCam");
-    } else X("thermal.capture_measurement_params", "", TT ? "nTtCap" : /^(temperature|thermal) TIFF/.test(T0.kind || "") ? "nConvCap" : "nApp4");
+    } else X("thermal.capture_measurement_params", "", TT ? "nTtCap" : /^radiometric TIFF|raw counts/.test(T0.kind || "") ? "nCamTiffCap" : /^(temperature|thermal) TIFF/.test(T0.kind || "") ? "nConvCap" : "nApp4");
     if (T0.encoding) D("thermal.image_encoding", T0.encoding, T0.encodingSrc, TT ? "nEncTt" : "nEnc");
     if (T0.planck) { const q = T0.planck; F("thermal.planck_constants", { R1: q.R1, B: q.B, F: q.F, O: q.O, R2: q.R2 }, q.src + ": PlanckR1, B, F, O, R2", "nPlanck"); }
     if (S.band && S.band.wl > 3000 && S.band.fwhm) D("thermal.spectral_range", [+((S.band.wl - S.band.fwhm / 2) / 1000).toFixed(2), +((S.band.wl + S.band.fwhm / 2) / 1000).toFixed(2)], "XMP:Camera:CentralWavelength, WavelengthFWHM", "nSpecRange");

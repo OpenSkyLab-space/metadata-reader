@@ -114,7 +114,14 @@ const gpsMs = utc => utc + 18000; // after 2017
   { const ubx = (c, i, p) => { const b = new Uint8Array(8 + p.length); b[0] = 0xb5; b[1] = 0x62; b[2] = c; b[3] = i; b[4] = p.length & 255; b[5] = p.length >> 8; b.set(p, 6); let A = 0, B = 0; for (let k = 2; k < 6 + p.length; k++) { A = (A + b[k]) & 255; B = (B + A) & 255; } b[6 + p.length] = A; b[7 + p.length] = B; return b; };
     const pvt = k => { const p = new Uint8Array(92), d = new DataView(p.buffer); d.setUint16(4, 2026, true); p[6] = 5; p[7] = 14; p[8] = 10; p[9] = 0; p[10] = k; p[11] = 3; p[20] = 3; p[21] = 0x81; d.setInt32(24, 140000000, true); d.setInt32(28, 490000000, true); d.setInt32(32, 500000, true); d.setUint32(40, 15, true); return ubx(1, 7, p); };
     const L = await F.parse(cat(pvt(0), pvt(1)), "syn.ubx");
-    ok(L && L.kind === "ubx" && L.trajectory.length === 2 && L.trajectory[0].q === "fixed" && L.startMs === Date.UTC(2026, 4, 14, 10), "ubx NAV-PVT"); }
+    ok(L && L.kind === "ubx" && L.trajectory.length === 2 && L.trajectory[0].q === "fixed" && L.startMs === Date.UTC(2026, 4, 14, 10), "ubx NAV-PVT");
+    /* TOPODRONE PPK style: NAV-POSLLH + RXM-RAWX, no NAV-PVT: positions on GPS week from RAWX */
+    const utc = Date.UTC(2026, 4, 14, 10, 0, 0), g = gpsMs(utc) - GPS0, wk = Math.floor(g / WEEK), tow = g % WEEK;
+    const rawx = k => { const p = new Uint8Array(16), d = new DataView(p.buffer); d.setFloat64(0, (tow + k * 100) / 1000, true); d.setUint16(8, wk, true); return ubx(2, 0x15, p); };
+    const llh = k => { const p = new Uint8Array(28), d = new DataView(p.buffer); d.setUint32(0, tow + k * 100, true); d.setInt32(4, 164453205, true); d.setInt32(8, 781951119, true); d.setInt32(12, 156128, true); d.setInt32(16, 120000, true); d.setUint32(20, 1500, true); d.setUint32(24, 2500, true); return ubx(1, 2, p); };
+    const T = await F.parse(cat(rawx(0), llh(0), ubx(1, 4, new Uint8Array(18)), rawx(1), llh(1), ubx(0x0d, 1, new Uint8Array(16))), "syn_rover.ubx"), pk = (T.facts.find(f => f[0] === "fPackets") || [])[1] || "";
+    ok(T.trajectory.length === 2 && T.trajectory[0].t === utc && T.trajectory[1].t === utc + 100 && near(T.trajectory[0].lat, 78.1951119, 1e-9) && T.trajectory[0].sH === 1.5 && /NAV-POSLLH/.test(T.timeSource), "ubx NAV-POSLLH without NAV-PVT: track on the RAWX GPS week");
+    ok(/NAV-DOP: 1/.test(pk) && /TIM-TP: 1/.test(pk), "ubx packet names NAV-DOP, TIM-TP"); }
 
   /* Parrot Sequoia TLMB: header, zlib block, section/variable/sample records */
   { const kv = (k, v) => cat(new Uint8Array([k.length + 1]), u8(k), new Uint8Array([0, v.length + 1]), u8(v), new Uint8Array([0]));
@@ -294,6 +301,7 @@ const gpsMs = utc => utc + 18000; // after 2017
     const A = L.atExp; ok(A.vib.over60 === 1 && A.vib.clip === 3 && A.modes.out === 1 && A.ev.err === 1 && /ERR GPS, code 2/.test(A.ev.first[0]) && A.interp === 0, "ardupilot summary: vibration, clipping, mode, ERR in the imaging window");
     const R = F.combine([L], []), c = R.checks.find(x => x.key === "cAtExposure");
     ok(c && c.state === "warn" && /outside the automatic mission: 1 \(FBWA\)/.test(c.det) && /vibration max 65/.test(c.det) && /HDOP max 1\.2/.test(c.det), "check: flight state at the exposures in one row");
+    ok((L.facts.find(f => f[0] === "fModes") || [])[1] === "AUTO → FBWA" && /^1: ERR GPS, code 2/.test((L.facts.find(f => f[0] === "fLogEvents") || [])[1]) && /^65 m\/s², clipping 3$/.test((L.facts.find(f => f[0] === "fVibMax") || [])[1]), "ardupilot log-wide: modes, ERR, vibration");
     const csv = F.exposuresCSV([L], R).split("\r\n"); ok(/,position,satellites,hdop,eph_m,vibration_m_s2,flight_mode$/.test(csv[0]) && /,log,14,1\.2,,65,AUTO$/.test(csv[1]), "exposures CSV: state columns"); }
   /* ArduPilot text log, older column names (TimeMS + Week as GPS time) */
   { const utc = Date.UTC(2015, 4, 14, 10, 0, 0), g = utc + 16000 - GPS0, wk = Math.floor(g / WEEK), tow = g % WEEK;
@@ -380,6 +388,14 @@ const gpsMs = utc => utc + 18000; // after 2017
     ok(c && c.exposures[0].lat === 49.5 && c.exposures[0].h === 300.1 && c.exposures[0].t === Date.UTC(2026, 4, 14, 10) && c.exposures[0].q === "fixed", "csv semicolon, decimal comma, time, status");
     const d = await F.parse(u8("name,lat,lon,h\nA,5540000.1,-750000.2,300\n"), "sjtsk.csv"); ok(d && d.notes.includes("csv-projected") && !d.exposures.length, "csv projected coordinates recognised, not converted");
     ok(F.sniff("notes.csv", u8("a,b,c\n1,2,3\n")) === null, "csv without coordinate columns is not a log");
+    const cr = await F.parse(u8("file,datetime_original,lon,lat,height,accuracy_east,accuracy_north,accuracy_vertical,accuracy_class\nSYN_0001.JPG,2026:10:10 11:57:35,16.4453,78.1951,156.12,0.03,0.04,0.1,fix_local\n"), "syn_camera_reference.csv"), e0 = cr.exposures[0];
+    ok(e0.name === "SYN_0001.JPG" && e0.t === Date.UTC(2026, 9, 10, 11, 57, 35) && near(e0.sH, 0.05, 1e-12) && e0.sV === 0.1 && e0.q === "fixed" && /camera clock/.test(cr.timeSource), "csv: file, EXIF date, east/north accuracy, accuracy class");
+    const pm = await F.parse(u8("source,datetime_original,lat,lon,width,height,AbsoluteAltitude,RelativeAltitude\nSYN_0001.JPG,2026-10-10 11:57:35,78.1951,16.4453,5472,3648,119.56,49.1\n"), "syn_manifest.csv");
+    ok(pm.exposures[0].h === 119.56 && pm.exposures[0].hRel === 49.1 && pm.exposures[0].name === "SYN_0001.JPG", "csv: image height in px is not the altitude");
+    const bp = await F.parse(u8("lat,lon,height,sigma_east,sigma_north,sigma_up\n78.1945,16.4466,110.177,0.3,0.4,0.25\n"), "syn_base_position.csv");
+    ok(!bp.exposures.length && bp.position && /^78\.19450000, 16\.44660000, 110\.177 m \(σH 0\.5 m, σV 0\.25 m\)$/.test((bp.facts.find(f => f[0] === "fPosition") || [])[1]) && !bp.notes.includes("nothing-read"), "csv: one row without name or time is a position");
+    const ev = await F.parse(u8("image_name,gps_timestamp,gps_week,yaw,pitch,roll\nSYN_0007.JPG,552471.5,2234,-84.8,5.1,-7.5\n"), "syn_events.csv");
+    ok(ev && ev.kind === "csv-geotags" && ev.exposures.length === 1 && ev.exposures[0].lat === null && ev.exposures[0].t === Date.UTC(2022, 10, 5, 9, 27, 33, 500), "csv: camera event times as GPS week + seconds, no positions");
     const raw = u8("Snimek;Sirka;Delka;Vyska\nIMG_1.JPG;49,1234567;14,7654321;300,5\nIMG_2.JPG;49,1234667;14,7654321;300,6\n");
     const u = await F.parse(raw, "export.csv"), R0 = F.combine([u], []);
     ok(u && u.kind === "csv-columns" && u.csv.cols.join() === "snimek,sirka,delka,vyska" && u.csv.guess.lat === 1 && u.csv.guess.lon === 2 && u.notes.includes("csv-unmapped") && !u.notes.includes("nothing-read"), "csv with unknown column names: columns offered, first two degree-like guessed");

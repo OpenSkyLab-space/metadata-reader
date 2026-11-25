@@ -143,7 +143,7 @@ async function parse(src, name, o) {
   L.trajectory = thin(L.trajectory);
   L.verify = verify(L);
   if (L.verify.state === "new") L.notes.push("unverified");
-  if (!L.error && !L.encrypted && !L.listOnly && L.size && L.startMs == null && !L.exposures.length && !L.trajectory.length && !L.raw && !L.panels && !L.notes.some(n => /encrypted|undocumented|empty|no-positions|plan|processing|project-pointer|unmapped|clock-unset/.test(n)) && !L.facts.some(f => /^(fBase|fFiles|fMessages|fPackets|fTopics|fParams|fPlacemarks|fPoints)/.test(f[0]) && f[1])) L.notes.push("nothing-read");
+  if (!L.error && !L.encrypted && !L.listOnly && L.size && L.startMs == null && !L.exposures.length && !L.trajectory.length && !L.raw && !L.panels && !L.notes.some(n => /encrypted|undocumented|empty|no-positions|plan|processing|project-pointer|unmapped|clock-unset/.test(n)) && !L.facts.some(f => /^(fBase|fFiles|fMessages|fPackets|fTopics|fParams|fPlacemarks|fPoints|fPosition)/.test(f[0]) && f[1])) L.notes.push("nothing-read");
   return L;
 }
 
@@ -197,6 +197,10 @@ function atExposure(L) {
     const f = b === a ? 0 : (t - a.t) / (b.t - a.t);
     e.lat = a.lat + f * (b.lat - a.lat); e.lon = a.lon + f * (b.lon - a.lon); if (e.h == null && a.h != null && b.h != null) e.h = a.h + f * (b.h - a.h); e.interp = true; interp++; }
   const gq = byT(A.gq), vib = byT(A.vib), modes = byT(A.modes), evs = byT(A.ev);
+  /* log-wide summary (also without exposures): mode sequence, warnings and errors, largest vibration */
+  if (!L.facts.some(f => f[0] === "fModes") && modes.length) { const seq = []; for (const m of modes) { const nm = m.name || "?"; if (!seq.length || seq[seq.length - 1].n !== nm) seq.push({ n: nm, c: 1 }); } fact(L, "fModes", seq.slice(0, 10).map(x => x.n).join(" → ") + (seq.length > 10 ? " … (" + seq.length + " changes)" : "")); }
+  if (evs.length && !L.facts.some(f => f[0] === "fWarnings")) { const g = new Map(); for (const e of evs) { const k = e.msg; g.set(k, (g.get(k) || 0) + 1); } fact(L, "fLogEvents", evs.length + ": " + [...g].slice(0, 6).map(([k, n]) => k.slice(0, 120) + (n > 1 ? " ×" + n : "")).join(" | ") + (g.size > 6 ? " …" : "")); }
+  if (vib.length) { let mx = 0, clip = 0; for (const v of vib) { if (isFinite(v.v) && v.v > mx) mx = v.v; if (isFinite(v.clip) && v.clip > clip) clip = v.clip; } if (mx > 0) fact(L, "fVibMax", (Math.round(mx * 10) / 10) + " m/s²" + (clip ? ", clipping " + clip : "")); }
   if (!ex.length || !(gq.length || vib.length || modes.length || evs.length || interp)) { for (const e of L.exposures) delete e._tc; return; }
   for (const e of ex) { const t = tc(e);
     if (gq.length) { const g = nearest(gq, t); if (Math.abs(g.t - t) <= AT_GAP) { e.sv = g.sv; if (g.hdop != null) e.hdop = +(+g.hdop).toFixed(2); if (g.eph != null) e.eph = +(+g.eph).toFixed(2); e.fix = g.fix; } }
@@ -240,7 +244,7 @@ const VERIFIED = [
   { kind: "jxl", re: /JobXML 5\.7/, ver: "JobXML 5.7 (eMotion)", src: "internal" },
   { kind: "mica-gpslog", re: /^v7\.|^v1\.3\./, ver: "RedEdge-MX v7.x, RedEdge-P v1.3.x", src: "internal" },
   { kind: "mica-paramlog", re: /./, ver: "RedEdge-M, RedEdge-MX v7.x, RedEdge-P v1.3.x", src: "internal" },
-  { kind: "ubx", re: /./, ver: "u-blox 5–M8 (NAV-PVT, NAV-SOL, RXM-RAW/RAWX)", src: "internal + RTKLIB", standard: true },
+  { kind: "ubx", re: /./, ver: "u-blox 5–M8 (NAV-PVT, NAV-SOL, RXM-RAW/RAWX); ZED-F9P (TOPODRONE PPK, NAV-POSLLH + RXM-RAWX), Emlid Reach RS", src: "internal + RTKLIB + public (Zenodo 23322043)", standard: true },
   { kind: "tlmb", re: /^1\.7\./, ver: "Sequoia 1.7.x", src: "internal" },
   { kind: "wingtra-geotaglog", re: /v1$/, ver: "geotaglog v1 (WingtraPilot 2.20)", src: "internal" },
   { kind: "wingtra-json", re: /^v?2\.20\./, ver: "WingtraPilot 2.20.x", src: "internal" },
@@ -253,7 +257,7 @@ const VERIFIED = [
   { kind: "novatel", re: /./, ver: "OEMV (RTKLIB); OEM7 BESTPOS, RANGECMP4 inside Wingtra LiDAR .data", src: "RTKLIB + internal" },
   { kind: "encrypted", re: /./, ver: "–", src: "internal" },
   // read from the published format descriptions; NMEA, GPX and CSV checked only on synthetic files so far
-  { kind: "ardupilot-bin", re: /^Ardu(Plane 4\.4\.|Copter 4\.6\.)/, ver: "ArduPlane 4.4.x, ArduCopter 4.6.x", src: "public (Zenodo 12107372, 22310050)", standard: true },
+  { kind: "ardupilot-bin", re: /^Ardu(Plane 4\.4\.|Copter 4\.[56]\.)/, ver: "ArduPlane 4.4.x, ArduCopter 4.5.x–4.6.x", src: "public (Zenodo 12107372, 22310050, 20373816)", standard: true },
   { kind: "ardupilot-log", re: /^ArduCopter 4\.3\./, ver: "ArduCopter 4.3.x", src: "public (Zenodo 8199999)", standard: true },
   { kind: "tlog", re: /^ArduCopter V?4\.6\./, ver: "ArduCopter 4.6.x", src: "public (Zenodo 22310050)", standard: true },
   { kind: "nmea", re: /(?!)/, ver: "", src: "synthetic", standard: true },
@@ -811,18 +815,23 @@ async function pGpslog(src, L, h, o) {
 }
 
 /* ---------------------------------------------------------------- u-blox UBX (raw receiver log) and NovAtel OEM binary (recognised, counted) */
-const UBX_NAMES = { "1/2": "NAV-POSLLH", "1/3": "NAV-STATUS", "1/6": "NAV-SOL", "1/7": "NAV-PVT", "1/12": "NAV-VELNED", "1/21": "NAV-TIMEUTC", "1/30": "NAV-SVINFO", "1/35": "NAV-SAT", "2/10": "RXM-RAW", "2/11": "RXM-SFRB", "2/13": "RXM-SFRBX", "2/15": "RXM-RAWX", "13/3": "TIM-TM2", "a/9": "MON-HW", "a/4": "MON-VER" };
+const UBX_NAMES = { "1/2": "NAV-POSLLH", "1/3": "NAV-STATUS", "1/6": "NAV-SOL", "1/7": "NAV-PVT", "1/12": "NAV-VELNED", "1/21": "NAV-TIMEUTC", "1/30": "NAV-SVINFO", "1/35": "NAV-SAT", "2/10": "RXM-RAW", "2/11": "RXM-SFRB", "2/13": "RXM-SFRBX", "2/15": "RXM-RAWX", "1/4": "NAV-DOP", "1/14": "NAV-HPPOSLLH", "1/20": "NAV-TIMEGPS", "1/3c": "NAV-RELPOSNED", "d/1": "TIM-TP", "d/3": "TIM-TM2", "a/9": "MON-HW", "a/4": "MON-VER" };
 async function pUBX(src, L, h, o) {
-  const cnt = {}, pts = [], fix = {}; let raw = 0, wk = null, rt0 = null, rt1 = null; const ev = [], ver = [];
+  const cnt = {}, pts = [], fix = {}, llh = []; let raw = 0, wk = null, rt0 = null, rt1 = null; const ev = [], ver = [];
   await scan(src, (b, fin) => ubxScan(b, fin, (c, i, p) => { const k = c.toString(16) + "/" + i.toString(16); cnt[k] = (cnt[k] || 0) + 1; const dv = dvOf(p);
     if (c === 1 && i === 7 && p.length >= 84) { const valid = p[11], ft = p[20], fl = p[21], carr = fl >> 6; fix[ft === 3 ? (carr === 2 ? "fixed" : carr === 1 ? "float" : "single") : "fix " + ft] = (fix[ft === 3 ? (carr === 2 ? "fixed" : carr === 1 ? "float" : "single") : "fix " + ft] || 0) + 1;
       if ((valid & 3) === 3 && ft >= 2) { const t = Date.UTC(dv.getUint16(4, true), p[6] - 1, p[7], p[8], p[9], p[10]) + dv.getInt32(16, true) / 1e6; pts.push({ t, lon: dv.getInt32(24, true) * 1e-7, lat: dv.getInt32(28, true) * 1e-7, h: dv.getInt32(32, true) / 1e3, sH: dv.getUint32(40, true) / 1e3, q: carr === 2 ? "fixed" : carr === 1 ? "float" : "single" }); } }
     else if (c === 1 && i === 6 && p.length >= 52) { const f = p[10]; fix["gpsFix " + f] = (fix["gpsFix " + f] || 0) + 1; if (wk == null && p[11] & 4) wk = dv.getInt16(8, true); }
     else if (c === 2 && (i === 0x10 || i === 0x15) && p.length >= 8) { raw++; const w = i === 0x10 ? dv.getInt16(4, true) : dv.getUint16(8, true), tow = i === 0x10 ? dv.getInt32(0, true) : dv.getFloat64(0, true) * 1000;
       if (w > 1000 && w < 5000 && isFinite(tow)) { const t = gpsToUtc(w, tow); if (rt0 == null || t < rt0) rt0 = t; if (rt1 == null || t > rt1) rt1 = t; if (wk == null) wk = w; } }
+    else if (c === 1 && i === 2 && p.length >= 28) llh.push({ tow: dv.getUint32(0, true), lon: dv.getInt32(4, true) * 1e-7, lat: dv.getInt32(8, true) * 1e-7, h: dv.getInt32(12, true) / 1e3, sH: dv.getUint32(20, true) / 1e3, sV: dv.getUint32(24, true) / 1e3 });
     else if (c === 0x0d && i === 3 && p.length >= 28) ev.push(p);
     else if (c === 0x0a && i === 4 && !ver.length) ver.push(asc(p, 0, 30), asc(p, 30, 10)); }), o);
-  L.trajectory = pts; for (const q of pts) span(L, q.t); L.timeSource = pts.length ? "NAV-PVT UTC" : null;
+  /* without NAV-PVT (TOPODRONE PPK logs NAV-POSLLH + RXM-RAWX): positions from NAV-POSLLH, time = GPS week (from RXM-RAWX or NAV-SOL) + iTOW;
+     POSLLH carries no fix type: these are the receiver's real-time solutions, marked single */
+  if (!pts.length && llh.length && wk != null) { let w = wk, prev = null; for (const q of llh) { if (prev != null && q.tow + 302400000 < prev) w++; prev = q.tow; if (Math.abs(q.lat) < 1e-9 && Math.abs(q.lon) < 1e-9) continue; pts.push({ t: gpsToUtc(w, q.tow), lat: q.lat, lon: q.lon, h: q.h, sH: q.sH, q: "single" }); }
+    if (pts.length) { fact(L, "fPosSource", "NAV-POSLLH (" + pts.length + "), real-time solution, fix type not logged; height ellipsoidal"); } }
+  L.trajectory = pts; for (const q of pts) span(L, q.t); L.timeSource = pts.length ? (llh.length && !cnt["1/7"] ? "NAV-POSLLH iTOW + GPS week − leap seconds" : "NAV-PVT UTC") : null;
   L.raw = { format: "UBX", type: raw ? "raw observations (RXM-RAW/RAWX)" : "no raw observations", epochs: raw };
   L.device.make = "u-blox"; L.device.fw = ver.filter(Boolean).join(" · ") || null;
   fact(L, "fFormat", "u-blox UBX"); fact(L, "fFirmware", L.device.fw); fact(L, "fPackets", Object.entries(cnt).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([k, v]) => (UBX_NAMES[k] || k) + ": " + v).join(", "));
@@ -1287,14 +1296,17 @@ async function pGPX(src, L) {
 /* ---------------------------------------------------------------- CSV / TXT geotags from processing software (Pix4D, Metashape, Emlid Studio, eMotion, own exports)
    Columns are found by name; the delimiter (, ; tab) is detected; projected coordinates are recognised and not converted. */
 const CSV_COL = {
-  name: /^(label|image ?name|imagename|image|file ?name|filename|photo|photo ?name|name|camera|#?label)$/,
+  name: /^(label|image ?name|imagename|image|file ?name|filename|file|photo|photo ?name|name|camera|#?label|source)$/,
   lat: /^(lat|latitude|y\/latitude|gps ?lat(itude)?|latitude ?\(?deg.*|lat ?\(?deg.*|lat_deg)$/,
   lon: /^(lon|lng|long|longitude|x\/longitude|gps ?lon(gitude)?|longitude ?\(?deg.*|lon ?\(?deg.*|lon_deg)$/,
-  h: /^(alt|altitude|height|ele|elevation|h|z|z\/altitude|ellipsoidal ?height|alt(itude)? ?\(?m.*|height ?\(?m.*|h_m|altitude_wgs84|gps ?alt(itude)?)$/,
+  h: /^(alt|altitude|height|ele|elevation|h|z|z\/altitude|ellipsoidal ?height|alt(itude)? ?\(?m.*|height ?\(?m.*|h_m|altitude_wgs84|gps ?alt(itude)?|absolute ?altitude)$/,
+  hRel: /^(relative ?altitude|rel(ative)? ?alt|height above take-?off)$/,
   sH: /^(accuracy ?(xy|horizontal|h)|acc(uracy)?_?xy|sigma ?(xy|h)|horizontal ?accuracy|h_?acc|std ?(xy|horizontal)|sigma_h(_m)?|x\/y ?accuracy)$/,
-  sV: /^(accuracy ?(z|vertical|v)|acc(uracy)?_?z|sigma ?(z|v)|vertical ?accuracy|v_?acc|std ?(z|vertical)|sigma_v(_m)?|z ?accuracy)$/,
-  t: /^(time|timestamp|utc|time ?utc|time_utc|gps ?time|datetime|date ?time|date_time)$/,
-  q: /^(solution|quality|q|fix|status|rtk ?status|solution ?status)$/
+  sE: /^(accuracy|sigma|std) ?(east|e|x)$/, sN: /^(accuracy|sigma|std) ?(north|n|y)$/,
+  sV: /^(accuracy ?(z|vertical|v|up)|acc(uracy)?_?z|sigma ?(z|v|up)|vertical ?accuracy|v_?acc|std ?(z|vertical|up)|sigma_v(_m)?|z ?accuracy)$/,
+  t: /^(time|timestamp|utc|time ?utc|time_utc|gps ?time|datetime|date ?time|date_time|date ?time ?original|datetimeoriginal)$/,
+  q: /^(solution|quality|q|fix|status|rtk ?status|solution ?status|accuracy ?class)$/,
+  wk: /^(gps ?week|week)$/, sow: /^(gps ?(timestamp|seconds|sow|tow)|seconds ?of ?week|sow|tow)$/
 };
 function csvSplit(line, d) { const out = []; let cur = "", q = false; for (let i = 0; i < line.length; i++) { const c = line[i]; if (q) { if (c === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; } else if (c === '"') q = true; else if (c === d) { out.push(cur); cur = ""; } else cur += c; } out.push(cur); return out.map(x => x.trim()); }
 const csvDelim = l => [",", ";", "\t"].sort((a, b) => l.split(b).length - l.split(a).length)[0];
@@ -1304,8 +1316,9 @@ function csvHeader(s, map) {
   const lines = s.split(/\r?\n/).slice(0, 30);
   for (let i = 0; i < lines.length; i++) { const l = lines[i].replace(/^\uFEFF/, "").replace(/^#\s*(?=label|name|image)/i, ""); if (!l.trim() || /^#/.test(l)) continue;
     const d = csvDelim(l), cols = csvCols(l, d);
-    const idx = {}; for (const k in CSV_COL) idx[k] = map ? (map[k] != null ? cols.indexOf(map[k]) : -1) : cols.findIndex(c => CSV_COL[k].test(c));
-    if (idx.lat >= 0 && idx.lon >= 0) return { line: i, d, idx, cols };
+    const px = cols.includes("width"), hit = (k, c) => !(k === "h" && px && c === "height") && (CSV_COL[k].test(c) || CSV_COL[k].test(c.replace(/_/g, " ")));
+    const idx = {}; for (const k in CSV_COL) idx[k] = map ? (map[k] != null ? cols.indexOf(map[k]) : -1) : cols.findIndex(c => hit(k, c));
+    if ((idx.lat >= 0 && idx.lon >= 0) || (!map && idx.name >= 0 && idx.wk >= 0 && idx.sow >= 0)) return { line: i, d, idx, cols };
     return null; }
   return null;
 }
@@ -1328,13 +1341,19 @@ async function pCSV(src, L, h, o) {
   const map = o && o.csvMap, s = await text(src), H = csvHeader(s, map); if (!H) return; if (map) L.notes.push("csv-mapped"); const { d, idx } = H; let proj = 0, row = 0;
   const num = v => { if (v == null || v === "") return null; const x = +String(v).replace(d === ";" ? "," : /(?!)/, "."); return isFinite(x) ? x : null; };
   s.split(/\r?\n/).slice(H.line + 1).forEach(l => { if (!l.trim() || /^#/.test(l)) return; const p = csvSplit(l, d); row++;
+    /* camera event times as GPS week + seconds of week, without positions (PPPH-UAV input) */
+    if (idx.lat < 0) { const w = num(p[idx.wk]), sw = num(p[idx.sow]); if (w == null || sw == null || !(w > 1000 && w < 5000)) return; L.exposures.push({ n: L.exposures.length + 1, name: idx.name >= 0 ? p[idx.name] || null : null, t: gpsToUtc(w, sw * 1000), lat: null, lon: null, h: null, q: "log" }); return; }
     const lat = num(p[idx.lat]), lon = num(p[idx.lon]); if (lat == null || lon == null) return; if (Math.abs(lat) > 90 || Math.abs(lon) > 180) { proj++; return; }
-    const tq = idx.q >= 0 ? String(p[idx.q] || "").toLowerCase() : "", t = idx.t >= 0 && p[idx.t] ? Date.parse(String(p[idx.t]).replace(" ", "T").replace(/(\d\d:\d\d:\d\d(\.\d+)?)$/, "$1Z")) : null;
-    L.exposures.push({ n: L.exposures.length + 1, name: idx.name >= 0 ? p[idx.name] || null : null, t: isNaN(t) ? null : t, lat, lon, h: idx.h >= 0 ? num(p[idx.h]) : null, sH: idx.sH >= 0 ? num(p[idx.sH]) : null, sV: idx.sV >= 0 ? num(p[idx.sV]) : null,
+    const tq = idx.q >= 0 ? String(p[idx.q] || "").toLowerCase() : "", t = idx.t >= 0 && p[idx.t] ? Date.parse(String(p[idx.t]).replace(/^(\d{4}):(\d\d):(\d\d)/, "$1-$2-$3").replace(" ", "T").replace(/(\d\d:\d\d:\d\d(\.\d+)?)$/, "$1Z")) : null;
+    const sE = idx.sE >= 0 ? num(p[idx.sE]) : null, sN = idx.sN >= 0 ? num(p[idx.sN]) : null, sH = idx.sH >= 0 ? num(p[idx.sH]) : sE != null && sN != null ? Math.hypot(sE, sN) : null;
+    L.exposures.push({ n: L.exposures.length + 1, name: idx.name >= 0 ? p[idx.name] || null : null, t: isNaN(t) ? null : t, lat, lon, h: idx.h >= 0 ? num(p[idx.h]) : null, hRel: idx.hRel >= 0 ? num(p[idx.hRel]) : undefined, sH, sV: idx.sV >= 0 ? num(p[idx.sV]) : null,
       q: /fix/.test(tq) ? "fixed" : /float/.test(tq) ? "float" : /single|autonom|3d/.test(tq) ? "single" : /ppk/.test(tq) ? "ppk" : "log" }); });
-  for (const e of L.exposures) span(L, e.t); if (L.startMs != null) L.timeSource = "time column (read as UTC)";
+  for (const e of L.exposures) span(L, e.t); if (L.startMs != null) L.timeSource = idx.lat < 0 ? "GPS week + seconds of week − leap seconds" : /original/.test(H.cols[idx.t]) ? "column " + H.cols[idx.t] + " (camera clock, time zone not stated; read as UTC)" : "time column (read as UTC)";
   if (proj) L.notes.push("csv-projected");
-  fact(L, "fFormat", "CSV geotags (" + ({ ",": "comma", ";": "semicolon", "\t": "tab" })[d] + ")"); fact(L, "fColumns", Object.entries(idx).filter(x => x[1] >= 0).map(([k, v]) => k + " = " + H.cols[v]).join(", ") + (map ? " (assigned by hand)" : ""));
+  /* one row, no image name and no time: a single position (e.g. a base station), not geotags */
+  if (L.exposures.length === 1 && idx.name < 0 && idx.t < 0) { const e = L.exposures[0]; L.exposures = []; L.position = e; fact(L, "fFormat", "CSV, one position (" + ({ ",": "comma", ";": "semicolon", "\t": "tab" })[d] + ")");
+    fact(L, "fPosition", e.lat.toFixed(8) + ", " + e.lon.toFixed(8) + (e.h != null ? ", " + (Math.round(e.h * 1000) / 1000) + " m" : "") + (e.sH != null ? " (σH " + (Math.round(e.sH * 1000) / 1000) + " m" + (e.sV != null ? ", σV " + (Math.round(e.sV * 1000) / 1000) + " m" : "") + ")" : "")); fact(L, "fHeight", idx.h >= 0 ? "column " + H.cols[idx.h] + ": datum not stated in the file" : null); return; }
+  fact(L, "fFormat", (idx.lat < 0 ? "CSV camera event times, no positions (" : "CSV geotags (") + ({ ",": "comma", ";": "semicolon", "\t": "tab" })[d] + ")"); fact(L, "fColumns", Object.entries(idx).filter(x => x[1] >= 0).map(([k, v]) => k + " = " + H.cols[v]).join(", ") + (map ? " (assigned by hand)" : ""));
   fact(L, "fImages", L.exposures.length); fact(L, "fProjected", proj || null);
   fact(L, "fHeight", idx.h >= 0 ? "column " + H.cols[idx.h] + ": datum not stated in the file" : null);
 }

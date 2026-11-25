@@ -145,6 +145,14 @@ function thermalTiff(kind, pixels, opts) {
   const len = tiffBlock(ifd(0), [dto("2030:06:01 12:00:00")], gps).length;
   return Buffer.concat([tiffBlock(ifd(len), [dto("2030:06:01 12:00:00")], gps), data]);
 }
+function camTiff(o) { /* single-band uint16 TIFF written by a camera (FLIR, MicaSense) or re-saved by ImageJ */
+  const W = o.w || 64, H = o.h || 64, raw = Buffer.alloc(W * H * 2); for (let i = 0; i < W * H; i++) raw.writeUInt16LE(o.px(i), i * 2);
+  const ifd = off => [[0x100, 3, [W]], [0x101, 3, [H]], [0x102, 3, [16]], [0x103, 3, [1]], [0x106, 3, [1]]].concat(o.desc ? [[0x10e, 2, o.desc]] : []).concat(o.make ? [[0x10f, 2, o.make], [0x110, 2, o.model]] : [])
+    .concat([[0x111, 4, [off]], [0x115, 3, [1]], [0x116, 3, [H]], [0x117, 4, [raw.length]]]);
+  const exif = o.make ? [dto("2030:06:01 12:00:00"), [0x920a, 5, [[13, 1]]]].concat(o.fpx ? [[0xa20e, 5, [[1088, 100]]], [0xa20f, 5, [[870, 100]]], [0xa210, 3, [4]]] : []) : null, opts = o.xmp ? { xmp: o.xmp } : {};
+  const len = tiffBlock(ifd(0), exif, null, opts).length; return Buffer.concat([tiffBlock(ifd(len), exif, null, opts), raw]);
+}
+function h20tApp4() { const b = Buffer.alloc(128); Buffer.from([0xaa, 0x55, 0x12, 0x06]).copy(b, 0); b.writeUInt16LE(5, 0x44); b.writeUInt16LE(70, 0x46); b.writeUInt16LE(100, 0x48); b.writeUInt16LE(230, 0x4a); b.writeUInt16LE(21, 0x4c); return b; }
 const CASES = [
   ["dls2_irradiance.tif", () => tiffBlock([[0x10f, 2, "MicaSense"], [0x110, 2, "RedEdge-P"]], [dto("2030:06:01 10:00:00")], null,
     { xmp: xmpPacket({ Camera: CAMNS, DLS: DLSNS }, { "Camera:BandName": "Blue", "Camera:CentralWavelength": "475", "Camera:Irradiance": "50.5", "DLS:HorizontalIrradiance": "48.0", "DLS:SpectralIrradiance": "50.5" }) }),
@@ -177,6 +185,23 @@ const CASES = [
     r => { const P = r.summary.thermal.params; return P.relative_humidity_pct === 70 && P.object_distance_m === 12.5 && P.emissivity === 0.9 && Math.abs(P.reflected_temperature_c - 23.4) < 1e-9 && P.ambient_temperature_c == null && r.summary.lrf.measured === true && r.summary.lrf.distance === 61.25; }],
   ["dji_rjpeg_params_sdk_limits.jpg", () => djiThermalJpeg(djiApp4v3({ rh: 10, dist: 12, e: 0.05, refl: 600 }), {}),
     r => { const C = r.summary.thermal.checks.map(c => c[0]); return C.includes("relative_humidity_pct") && C.includes("emissivity") && C.includes("reflected_temperature_c"); }],
+  ["flir_tlinear.tiff", () => camTiff({ make: "FLIR", model: "Vue Pro R 640 13mm", fpx: true, w: 640, h: 512, px: i => 7000 + i % 100, xmp: xmpPacket({ Camera: CAMNS }, { "Camera:BandName": "LWIR", "Camera:CentralWavelength": "10000", "Camera:TlinearGain": "0.04" }) }),
+    r => { const T = r.summary.thermal; return T && T.kind === "radiometric TIFF (FLIR TLinear)" && Math.abs(T.tempRange[0] - 6.85) < 1e-6 && Math.abs(T.tempRange[1] - (7099 * 0.04 - 273.15)) < 1e-6 && r.summary.sensorType === "thermal_LWIR"
+      && Math.abs(r.summary.pixelPitch - 17) < 1e-6 && r.warnings.some(w => w.code === "focal-plane-width"); }],
+  ["flir_raw_counts.tiff", () => camTiff({ make: "FLIR", model: "Vue Pro R 640 13mm", px: i => 2500 + i % 7 }),
+    r => r.summary.thermal && /raw counts/.test(r.summary.thermal.kind) && r.summary.sensorType === "thermal_LWIR"],
+  ["micasense_lwir.tif", () => camTiff({ make: "MicaSense", model: "Altum", px: i => 29000 + i % 50, xmp: xmpPacket({ Camera: CAMNS }, { "Camera:BandName": "LWIR", "Camera:CentralWavelength": "11000" }) }),
+    r => { const T = r.summary.thermal; return T && T.kind === "radiometric TIFF (MicaSense LWIR)" && Math.abs(T.tempRange[0] - 16.85) < 1e-6 && r.summary.sensorType === "thermal_LWIR"; }],
+  ["imagej_resave.tif", () => camTiff({ desc: "ImageJ=1.54f\nunit= \nmin=4581.0\nmax=4707.0\n", px: i => 4600 + i % 9 }),
+    r => (r.groups.find(g => g.id === "Derived") || { tags: [] }).tags.some(t => t.name === "ImageJ" && /1\.54f/.test(t.display)) && !r.summary.thermal],
+  ["dji_zh20t_params.jpg", () => jpegSegs(tiffBlock([[0x10f, 2, "DJI"], [0x110, 2, "ZH20T"]], [dto("2030:06:01 12:00:00"), [0x927c, 7, Buffer.from("[sensor_id:SYNH20T0001]\0", "latin1")]], null),
+      xmpPacket(DJINS, { "drone-dji:RelativeAltitude": "+50.000" }), [[0xe3, Buffer.alloc(32)], [0xe4, h20tApp4()]]),
+    r => { const P = r.summary.thermal && r.summary.thermal.params; return P && P.object_distance_m === 5 && P.relative_humidity_pct === 70 && P.emissivity === 1 && P.reflected_temperature_c === 23 && /inferred/.test(P.src)
+      && r.summary.thermal.sensorId === "SYNH20T0001" && !r.warnings.some(w => w.code === "ifd-entries"); }],
+  ["dji_m3m_irradiance.tif", () => tiffBlock([[0x10f, 2, "DJI"], [0x110, 2, "M3M"]], [dto("2030:06:01 10:00:00")], null, { xmp: xmpPacket(Object.assign({ Camera: CAMNS }, DJINS), { "Camera:BandName": "Green", "Camera:CentralWavelength": "560", "Camera:Irradiance": "7787.33" }) }),
+    r => r.summary.irradiance && r.summary.irradiance.value === 7787.33 && r.summary.irradiance.unit === null],
+  ["dji_clock_off.jpg", () => jpeg(tiffBlock([[0x10f, 2, "DJI"], [0x110, 2, "M3M"]], [dto("2030:06:01 13:18:35")], null), xmpPacket(DJINS, { "drone-dji:UTCAtExposure": "2030-06-01T12:00:18.000000" })),
+    r => r.summary.tz == null && r.warnings.some(w => w.code === "clock" && /78\.6 min/.test(w.text)) && (r.groups.find(g => g.id === "Derived") || { tags: [] }).tags.some(t => t.name === "LocalMinusUTC" && t.display === "+1:18:35")],
   ["flir_fff.jpg", flirJpeg,
     r => { const T = r.summary.thermal, P = T && T.params; return T.kind === "FLIR radiometric JPEG" && P.emissivity === 0.97 && P.object_distance_m === 30 && P.reflected_temperature_c === 15 && P.atmospheric_temperature_c === 18 && P.relative_humidity_pct === 60
       && T.planck.B === 1400 && T.planck.O === -500 && T.planck.R2 === 0.5 && T.range[0] === -25 && T.range[1] === 150 && /4 x 2/.test(T.encoding)
