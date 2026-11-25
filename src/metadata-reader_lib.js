@@ -14,7 +14,7 @@
    DecompressionStream (zlib) are used when available, with a built-in XML parser as fallback. Never throws on bad input. */
 (function (G) {
 "use strict";
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const LIM = { whole: 64 * 1048576, ifdEntries: 1000, arr: 4096, offs: 262144, str: 1048576, bin: 16 * 1048576, warnings: 300, structure: 3000, tags: 20000, boxes: 20000 };
 
 /* ---------------------------------------------------------------- small helpers */

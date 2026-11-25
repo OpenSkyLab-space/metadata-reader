@@ -10,7 +10,7 @@
    Nothing leaves the browser. Large files are read in blocks. */
 const OSLFlight = (() => {
 "use strict";
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 
 /* ---------------------------------------------------------------- bytes and blocks */
 const isBlob = s => typeof Blob !== "undefined" && s instanceof Blob;

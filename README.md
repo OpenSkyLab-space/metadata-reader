@@ -4,7 +4,7 @@ Reads the metadata of drone images, multispectral bands, GeoTIFF orthomosaics an
 It joins images with logs, checks the result against the [OpenSkyLab metadata specification](https://openskylab.space/metadata.html) field by field, with the source of every value,
 and exports `metadata.json`, `image_log.csv`, `provenance.json`, camera positions for Metashape, PIX4Dmatic and OpenDroneMap, GeoJSON for QGIS and a flight report.
 
-**Reader 1.4.0** · parser OSLMeta 1.0.0 · flight logs OSLFlight 0.3.0 · checks against specification v0.3 · [use it online](https://openskylab.space/reader) · [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24373002.svg)](https://doi.org/10.5281/zenodo.24373002)
+**Reader 1.5.0** · parser OSLMeta 1.1.0 · flight logs OSLFlight 0.4.0 · checks against specification v0.3 · [use it online](https://openskylab.space/reader) · [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24373002.svg)](https://doi.org/10.5281/zenodo.24373002)
 
 ## Use
 

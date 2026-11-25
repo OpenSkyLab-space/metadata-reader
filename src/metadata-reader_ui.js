@@ -983,7 +983,7 @@ function odmGeo(F) {
   return lines.join("\n") + "\n";
 }
 // metadata.json and, beside it, where each value came from (provenance.json); one pass so the two always agree
-const READER = { name: "OpenSkyLab metadata reader", version: "1.4.0", url: "https://openskylab.space/reader" };
+const READER = { name: "OpenSkyLab metadata reader", version: "1.5.0", url: "https://openskylab.space/reader" };
 function metaBuild(F) {
   // slots to fill in: "" for free text, [] for lists; numbers, enumerations and objects are left out until known, so that the draft never carries a value of the wrong type
   const empty = blk => { const o = {}; for (const r of OSL_STD.rows) if (r[0] === blk) { if (/^array/.test(r[7])) o[r[1]] = []; else if (r[7] === "string" && !/ \| /.test(r[6])) o[r[1]] = ""; } return o; };

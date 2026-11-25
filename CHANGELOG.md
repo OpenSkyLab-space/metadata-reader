@@ -4,7 +4,9 @@ All notable changes are recorded here. The format follows [Keep a Changelog](htt
 The reader has its own version numbers (SemVer); a release `vX.Y.Z` is the reader version `X.Y.Z`.
 Each entry names the versions of the parser (OSLMeta), the flight log module (OSLFlight) and the OpenSkyLab metadata specification it checks against.
 
-## [Unreleased]
+## [1.5.0] - 2026-11-25
+
+Parser OSLMeta 1.1.0, flight log module OSLFlight 0.4.0, checks against the OpenSkyLab metadata specification v0.3.
 
 - The "Why it matters" paragraph under the title is folded behind a button with a light-bulb icon; it opens on click (native `<details>`, no script, keyboard accessible). The header is shorter.
 - The four cards under the title ("What sets this reader apart") sit in one row, two by two or one column, never three plus a lone fourth; the links under the tool header do not break inside.
@@ -70,7 +72,6 @@ Each entry names the versions of the parser (OSLMeta), the flight log module (OS
   - Flight logs with modes, errors and vibration (ArduPilot, PX4, tlog) list them for the whole log, also without exposures: mode sequence, warnings and errors, largest vibration and clipping. ArduCopter 4.5 is verified.
 - JPEG: DJI M3T R-JPEGs from 2026 declare a length of MPF image 1 that reaches a few hundred to a few thousand bytes past its EOI, with the preview right after; these bytes were reported as an unknown trailer and are now shown as part of MPF image 1.
 - Czech view: version numbers with one dot (such as `v1.00`) are no longer written with a decimal comma.
-- Component versions to set at the release: parser OSLMeta and flight log module OSLFlight both changed (new decoded groups `APP4:DJI`, `APP7:DJI`, `APP1:FLIR`; new kinds `thermotiff-log`, `thermotiff-record`, `csv-columns`; flight state at the exposures).
 
 ## [1.4.0] - 2026-11-19
 
