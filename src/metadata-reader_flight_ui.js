@@ -46,7 +46,7 @@ function renderFlight() {
   const FS = flightState(), imgs = FS.imgs, F = FS.F, checks = unread.concat(F.checks);
   const main = logs.find(l => l.exposures === F.exposures) || null;
   let h = '<p class="note small">' + esc(t("fltIntro", logs.length, imgs.length)) + (busy ? " " + esc(t("fltReading")) : "") + "</p>";
-  h += '<h3 class="sub">' + esc(t("fltChecksH")) + '</h3><ul class="checks">' + checks.map(chk).join("") + "</ul>" + geomHtml(FS.G);
+  h += '<h3 class="sub">' + esc(t("fltChecksH")) + '</h3><ul class="checks">' + checks.map(chk).join("") + "</ul>" + csvMapHtml() + geomHtml(FS.G);
   h += '<h3 class="sub">' + esc(t("fltMapH")) + '</h3><div class="plot"><canvas id="fltCv" role="img" aria-label="' + esc(t("fltMapAria")) + '"></canvas></div>';
   h += '<div class="legend">' + ["fixed", "ppk", "float", "single", "none"].map(k => '<span><span aria-hidden="true" style="color:var(--' + RTK_ST[k][0] + ')">' + RTK_ST[k][1] + "</span> " + esc(t("rtk_" + k)) + "</span>").join("") + '<span><span aria-hidden="true">—</span> ' + esc(t("fltLegendTrk")) + '</span><span><span aria-hidden="true">◯</span> ' + esc(t("fltLegendImg")) + "</span></div>";
   h += '<h3 class="sub">' + esc(t("fltLogsH")) + "</h3>" + logs.map(l => {
@@ -58,11 +58,27 @@ function renderFlight() {
     const N = 200, byN = new Map(F.matches.filter(m => m.log === main.name).map(m => [m.n, m]));
     h += '<h3 class="sub">' + esc(t("fltExpH")) + " · " + esc(main.name) + '</h3><div class="tw"><table class="bt"><thead><tr><th>#</th><th>' + esc(t("thFile")) + "</th><th>" + esc(t("fltTime")) + "</th><th>" + esc(t("thLatLon")) + "</th><th>h</th><th>σH / σV</th><th>" + esc(t("fltSolution")) + "</th><th>" + esc(t("fltImage")) + "</th></tr></thead><tbody>" +
       main.exposures.slice(0, N).map(e => { const m = byN.get(e.n), sH = e.sH != null ? e.sH : e.sN != null ? Math.max(e.sN, e.sE) : null, q = e.q || "–", k = RTK_ST[q] ? q : "other";
-        return '<tr><td class="n">' + esc(e.n) + '</td><td class="fn0">' + esc(e.name || e.captureId || "–") + '</td><td class="n">' + esc(e.t != null ? fltTime(e.t) : "–") + '</td><td class="n">' + (e.lat != null ? fmt(e.lat, 7, false) + "<br>" + fmt(e.lon, 7, false) : "–") + '</td><td class="n">' + (e.h != null ? fmt(+e.h, 2) : "–") + '</td><td class="n">' + (sH != null ? fmt(sH, 3) : "–") + " / " + (e.sV != null ? fmt(e.sV, 3) : "–") + '</td><td><span class="chip s-' + ({ ok: "file", warn: "missing", bad: "bad", info: "derived", na: "na" })[(RTK_ST[k] || RTK_ST.other)[0]] + '"><i>' + (RTK_ST[k] || RTK_ST.other)[1] + "</i>" + esc(RTK_ST[q] ? t("rtk_" + q) : q) + "</span></td><td>" + (m ? esc(m.image) : "–") + "</td></tr>"; }).join("") + "</tbody></table></div>" +
+        return '<tr><td class="n">' + esc(e.n) + '</td><td class="fn0">' + esc(e.name || e.captureId || "–") + '</td><td class="n">' + esc(e.t != null ? fltTime(e.t) : "–") + '</td><td class="n"' + (e.interp ? ' title="' + esc(t("fltInterp")) + '"' : "") + ">" + (e.lat != null ? (e.interp ? "≈ " : "") + fmt(e.lat, 7, false) + "<br>" + (e.interp ? "≈ " : "") + fmt(e.lon, 7, false) : "–") + '</td><td class="n">' + (e.h != null ? fmt(+e.h, 2) : "–") + '</td><td class="n">' + (sH != null ? fmt(sH, 3) : "–") + " / " + (e.sV != null ? fmt(e.sV, 3) : "–") + '</td><td><span class="chip s-' + ({ ok: "file", warn: "missing", bad: "bad", info: "derived", na: "na" })[(RTK_ST[k] || RTK_ST.other)[0]] + '"><i>' + (RTK_ST[k] || RTK_ST.other)[1] + "</i>" + esc(RTK_ST[q] ? t("rtk_" + q) : q) + "</span></td><td>" + (m ? esc(m.image) : "–") + "</td></tr>"; }).join("") + "</tbody></table></div>" +
       (main.exposures.length > N ? '<p class="note small">' + esc(t("fltExpNote", N)) + "</p>" : "");
   }
   h += '<div class="toolbar"><button class="btn" id="x-fcsv">' + esc(t("fltCsv")) + '</button><button class="btn" id="x-fjson">' + esc(t("fltJson")) + '</button></div><p class="note small">' + esc(t("fltXNote")) + "</p>";
   P.innerHTML = h; drawFlight();
+}
+// a CSV with coordinates under unrecognised column names: the user assigns the columns, the file is read again with that assignment
+const CSV_MAP_KEYS = ["lat", "lon", "t", "h", "name"];
+function csvMapHtml() {
+  const L0 = (st.logs || []).map((e, i) => [e, i]).filter(([e]) => e.L && e.L.kind === "csv-columns"); if (!L0.length) return "";
+  return '<h3 class="sub">' + esc(t("csvMapH")) + "</h3>" + L0.map(([e, i]) => '<div class="toolbar csvmap"><b>' + esc(e.name) + "</b>" + CSV_MAP_KEYS.map(k => "<label>" + esc(t("csvMap_" + k)) + ' <select data-cm="' + i + '" data-ck="' + k + '"><option value="">–</option>' +
+    e.L.csv.cols.map((c, j) => '<option value="' + j + '"' + (e.L.csv.guess[k] === j ? " selected" : "") + ">" + esc(c || "#" + (j + 1)) + "</option>").join("") + "</select></label>").join("") +
+    '<button class="btn" data-cmgo="' + i + '">' + esc(t("csvMapGo")) + "</button></div>").join("");
+}
+async function csvRemap(i, b) {
+  const e = st.logs[i], map = {}; if (!e || !e.L || !e.L.csv) return;
+  for (const s of document.querySelectorAll('select[data-cm="' + i + '"]')) if (s.value !== "") map[s.dataset.ck] = e.L.csv.cols[+s.value];
+  if (map.lat == null || map.lon == null) { b.textContent = t("csvMapNeed"); return; }
+  e.busy = true; renderFiles(); afterLogs();
+  try { const L2 = await OSLFlight.parse(e.src, e.name, { csvMap: map }); if (L2) e.L = L2; } catch (err) { e.err = String(err && err.message || err); }
+  e.busy = false; st._fk = null; renderFiles(); afterLogs();
 }
 function geomHtml(G) {
   if (!G || !G.checks || !G.checks.length) return "";
@@ -95,6 +111,7 @@ function drawFlight() {
 function median(a) { const v = a.filter(x => x != null && isFinite(x)).sort((x, y) => x - y); if (!v.length) return null; const m = v.length >> 1; return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2; }
 function flightClick(b) {
   if (b.dataset.lg != null) { setTab("flt"); return true; }
+  if (b.dataset.cmgo != null) { csvRemap(+b.dataset.cmgo, b); return true; }
   if (b.dataset.rml != null) { st.logs.splice(+b.dataset.rml, 1); renderFiles(); afterLogs(); return true; }
   if (b.id === "x-fcsv") { download("flight_exposures.csv", "﻿" + OSLFlight.exposuresCSV(flightLogs(), st.flight), "text/csv;charset=utf-8"); return true; }
   if (b.id === "x-fjson") { download("flight_summary.json", OSLFlight.flightJSON(flightLogs(), st.flight), "application/json"); return true; }

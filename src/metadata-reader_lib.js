@@ -14,7 +14,7 @@
    DecompressionStream (zlib) are used when available, with a built-in XML parser as fallback. Never throws on bad input. */
 (function (G) {
 "use strict";
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const LIM = { whole: 64 * 1048576, ifdEntries: 1000, arr: 4096, offs: 262144, str: 1048576, bin: 16 * 1048576, warnings: 300, structure: 3000, tags: 20000, boxes: 20000 };
 
 /* ---------------------------------------------------------------- small helpers */
@@ -113,7 +113,7 @@ c61a BlackLevel c61b BlackLevelDeltaH c61c BlackLevelDeltaV c61d WhiteLevel c61e
 c622 ColorMatrix2 c623 CameraCalibration1 c624 CameraCalibration2 c625 ReductionMatrix1 c626 ReductionMatrix2 c627 AnalogBalance c628 AsShotNeutral
 c629 AsShotWhiteXY c62a BaselineExposure c62b BaselineNoise c62c BaselineSharpness c62d BayerGreenSplit c62e LinearResponseLimit c62f CameraSerialNumber
 c630 DNGLensInfo c631 ChromaBlurRadius c632 AntiAliasStrength c633 ShadowScale c634 DNGPrivateData c635 MakerNoteSafety c640 RawImageSegmentation
-c65a CalibrationIlluminant1 c65b CalibrationIlluminant2 c65c BestQualityScale c65d RawDataUniqueID c660 AliasLayerMetadata c68b OriginalRawFileName
+c65a CalibrationIlluminant1 c65b CalibrationIlluminant2 c65c BestQualityScale c65d RawDataUniqueID c660 AliasLayerMetadata c68b OriginalRawFileName c696 IJMetadataByteCounts c697 IJMetadata
 c68c OriginalRawFileData c68d ActiveArea c68e MaskedAreas c68f AsShotICCProfile c690 AsShotPreProfileMatrix c691 CurrentICCProfile c692 CurrentPreProfileMatrix
 c6bf ColorimetricReference c6c5 SRawType c6d2 PanasonicTitle c6d3 PanasonicTitle2 c6f3 CameraCalibrationSig c6f4 ProfileCalibrationSig c6f5 ProfileIFD
 c6f6 AsShotProfileName c6f7 NoiseReductionApplied c6f8 ProfileName c6f9 ProfileHueSatMapDims c6fa ProfileHueSatMapData1 c6fb ProfileHueSatMapData2
@@ -460,6 +460,8 @@ async function readMakerNote(ctx, T, gid, t, voff, total) {
   const make = (ctx.info.make || "").toUpperCase();
   let vendor = null, name = "MakerNoteUnknown", decode = null;
   if (s.startsWith("[ae_dbg_info:")) { vendor = "DJI (debug info)"; name = "MakerNoteDJIInfo"; }
+  else if (make.startsWith("DJI") && /^\[sensor_id:/.test(s)) { vendor = "DJI (sensor ID text)"; name = "MakerNoteDJIInfo"; /* ZH20T: "[sensor_id:<serial>]" as text, not an IFD */
+    const m = /^\[sensor_id:([^\]\0]*)/.exec(latin1(await ctx.src.read(voff, Math.min(total, 128)))); if (m && m[1].trim()) { ctx.add(gid, { name: "SensorID", id: "-", value: m[1].trim(), type: "string", offset: voff + 11, note: "from the text MakerNote" }); ctx.info.djiSensorIdText = m[1].trim(); } }
   else if (make.startsWith("DJI") && !/^(...@AMBA|DJI)/.test(s)) { vendor = "DJI"; name = "MakerNoteDJI"; decode = "DJI"; }
   else if (make.startsWith("DJI")) { vendor = "DJI"; name = "MakerNoteUnknown"; }
   else if (s.startsWith("Nikon\0")) { vendor = "Nikon"; name = "MakerNoteNikon"; }
@@ -838,6 +840,8 @@ async function parseJPEG(ctx) {
     for (const c of iccChunks) { buf.set(c.data, p); p += c.data.length; }
     parseICC(ctx, buf, iccChunks[0].offset);
   }
+  /* FLIR FFF in APP1 */
+  if (ctx.flirChunks) { try { flirFFF(ctx); } catch (e) { ctx.warn("flir", "FFF: " + ((e && e.message) || e), null); } }
   /* JUMBF / C2PA in APP11 */
   if (ctx.jpJUMBF) { try { await jpegJUMBF(ctx); } catch (e) { ctx.warn("jumbf", "APP11: " + ((e && e.message) || e), null); } }
   /* Extended XMP */
@@ -864,10 +868,20 @@ async function parseJPEG(ctx) {
   }
   if (end < src.size) {
     const tl = src.size - end, head = await src.read(end, 16);
-    const inMPF = mpf && mpf.images.some(im => im.start && mpf.base + im.start === end);
-    let note = "";
+    // an MPF image may follow zero padding: WingtraHub rewrites APP1 of Sony JPEGs and pads, so that the MPF offsets of the preview stay valid
+    const nextMP = mpf ? mpf.images.filter(im => im.start).map(im => mpf.base + im.start).filter(o => o > end && o - end <= 65536).sort((a, b) => a - b)[0] : null;
+    let pad = 0; if (nextMP != null) { const z = await src.read(end, nextMP - end); if (z.length === nextMP - end && z.every(x => x === 0)) pad = nextMP - end; }
+    // DJI M3T (2026): the declared length of MPF image 1 reaches past its EOI, and the next MPF image starts right after that length;
+    // the bytes between are part of image 1 by the MPF list, not an unknown trailer
+    const len1 = mpf && mpf.images[0] && !mpf.images[0].start ? mpf.images[0].length : 0;
+    const inside = !pad && nextMP != null && len1 && end < len1 && nextMP >= len1 && nextMP - len1 <= 16 ? nextMP - end : 0;
+    const inMPF = mpf && (pad > 0 || inside > 0 || mpf.images.some(im => im.start && mpf.base + im.start === end));
+    if (pad) ctx.seg("zero padding before MPF image", "trailer", end, pad, pad + " zero bytes");
+    if (inside) ctx.seg("data after EOI within MPF image 1", "trailer", end, inside, inside + " bytes, counted in the MPF length of image 1");
+    let note = pad ? "MPF image after " + pad + " zero bytes" : inside ? "MPF image after " + inside + " bytes within the MPF length of image 1" : "";
     let jo = -1; for (let i = 0; i + 2 < head.length; i++) if (head[i] === 0xff && head[i + 1] === 0xd8 && head[i + 2] === 0xff) { jo = i; break; }
-    if (head[0] === 0xff && head[1] === 0xd8) note = inMPF ? "MPF image" : "JPEG";
+    if (pad || inside) { /* note set above */ }
+    else if (head[0] === 0xff && head[1] === 0xd8) note = inMPF ? "MPF image" : "JPEG";
     else if (jo > 0) note = "JPEG at +" + jo;
     else if (latin1(head, 4, 4) === "ftyp") note = "MP4 video (EmbeddedVideo)";
     else note = hexstr(head, 8);
@@ -903,7 +917,14 @@ async function jpegSegment(ctx, m, d, dOff, iccChunks, seen) {
       ctx.extXMP.get(guid).parts.push({ off, data: d.subarray(o + 40), offset: dOff + o + 40 });
       return { label: "APP1 ExtendedXMP", kind: "xmp", note: "GUID " + guid.slice(0, 8) + "…, offset " + off };
     }
-    if (s16.startsWith("FLIR\0")) { ctx.info.flir = (ctx.info.flir || 0) + 1; return { label: "APP1 FLIR", kind: "thermal", note: "FLIR FFF radiometric data (not decoded)" }; }
+    if (s16.startsWith("FLIR\0") && d.length >= 8) {
+      ctx.info.flir = (ctx.info.flir || 0) + 1;
+      const k = d[6], tot = d[7] + 1; /* chunk number and count - 1 (ExifTool) */
+      if (!ctx.flirChunks) ctx.flirChunks = { total: tot, parts: [] };
+      if (ctx.flirChunks.total === tot && k < tot && !ctx.flirChunks.parts[k]) ctx.flirChunks.parts[k] = { data: d.subarray(8), offset: dOff + 8 };
+      else ctx.warn("flir", "FLIR chunk " + (k + 1) + " of " + tot + " ignored (duplicate or inconsistent count)", dOff - 4);
+      return { label: "APP1 FLIR", kind: "thermal", note: "FFF chunk " + (k + 1) + "/" + tot };
+    }
     return { label: "APP1 " + s16.slice(0, 12).replace(/[\0-\x1f].*/, ""), note: "not decoded" };
   }
   if (m === 0xe2) {
@@ -914,8 +935,9 @@ async function jpegSegment(ctx, m, d, dOff, iccChunks, seen) {
       const mpf = { base, images: [] };
       const g = ctx.gmap.get("MPF"), ent = g && g.tags.find(t => t.name === "MPImageList");
       const le = latin1(d, 4, 2) === "II";
-      if (ent && ent.binary) {
-        const nb = await ctx.src.read(ent.binary.offset, ent.binary.length);
+      // up to 64 bytes (4 images) the list is stored as a value array, not as a binary reference
+      const nb = !ent ? null : ent.binary ? await ctx.src.read(ent.binary.offset, ent.binary.length) : Array.isArray(ent.value) ? Uint8Array.from(ent.value) : null;
+      if (nb) {
         for (let k = 0; k * 16 + 16 <= nb.length && k < 64; k++) {
           const dv = DV(nb), attr = dv.getUint32(k * 16, le), size = dv.getUint32(k * 16 + 4, le), start = dv.getUint32(k * 16 + 8, le);
           const im = { flags: attr >>> 27 & 0x1f, format: attr >>> 24 & 7, type: attr & 0xffffff, length: size, start, dep1: dv.getUint16(k * 16 + 12, le), dep2: dv.getUint16(k * 16 + 14, le) };
@@ -949,11 +971,11 @@ async function jpegSegment(ctx, m, d, dOff, iccChunks, seen) {
     const n = m - 0xe0;
     seen.app[n] = (seen.app[n] || 0) + 1;
     if (n === 3 && dji) { ctx.info.djiThermal = Object.assign(ctx.info.djiThermal || {}, { app3: ((ctx.info.djiThermal || {}).app3 || 0) + d.length }); return { label: "APP3 ThermalData", kind: "thermal", note: "DJI raw thermal data (not decoded)" }; }
-    if (n === 4 && dji) { ctx.info.djiThermal = Object.assign(ctx.info.djiThermal || {}, { app4: d.length }); return { label: "APP4 ThermalParams", kind: "thermal", note: "DJI thermal parameters (not decoded)" }; }
-    if (n === 5 && dji) { ctx.info.djiThermal = Object.assign(ctx.info.djiThermal || {}, { app5: d.length }); return { label: "APP5 ThermalCalibration", kind: "thermal", note: "DJI (not decoded)" }; }
+    if (n === 4 && dji) { const P = djiThermalParams(ctx, d, dOff); ctx.info.djiThermal = Object.assign(ctx.info.djiThermal || {}, { app4: d.length, params: P }); return { label: "APP4 " + (P.variant || "ThermalParams"), kind: "thermal", note: P.variant ? "DJI measurement parameters" + (P.prefix ? ", prefix \"" + P.prefix + "\"" : "") : "DJI, layout not recognised (not decoded)" }; }
+    if (n === 5 && dji) { ctx.info.djiThermal = Object.assign(ctx.info.djiThermal || {}, { app5: d.length }); return { label: "APP5 ThermalCalibration", kind: "thermal", note: "DJI calibration (not decoded; used by the DJI Thermal SDK)" }; }
     if (n === 6 && s16.startsWith("DJI_DTAT")) return { label: "APP6 DJI_DTAT", kind: "thermal", note: "DJI (not decoded)" };
     if (n === 6 && s16.startsWith("GoPro")) return { label: "APP6 GoPro", note: "GoPro GPMF (not decoded)" };
-    if (n === 7 && s16.startsWith("DJI-DBG")) return { label: "APP7 DJI-DBG", note: "DJI debug info (not decoded)" };
+    if (n === 7 && s16.startsWith("DJI-DBG")) { const k = djiDebugInfo(ctx, d, dOff); return { label: "APP7 DJI-DBG", note: "DJI debug info, " + k + " entries" }; }
     return { label: "APP" + n + " " + s16.slice(0, 8).replace(/[\0-\x1f].*/, ""), note: "not decoded" };
   }
   if (m === 0xeb && d.length >= 8 && d[0] === 0x4a && d[1] === 0x50) { /* JPEG-XT box (ISO/IEC 18477-3): CI "JP", En, Z, then box data */
@@ -991,6 +1013,153 @@ async function jpegSegment(ctx, m, d, dOff, iccChunks, seen) {
   return { label: mName(m), kind: "header" };
 }
 
+/* ---------------------------------------------------------------- thermal: DJI R-JPEG APP4 / APP7, FLIR FFF in APP1 */
+/* DJI APP4 holds the measurement parameters set in the camera. Three layouts, told apart as ExifTool does (DJI.pm, ExifTool.pm):
+   "ThermalParams" (ZH20T, magic aa551206, int16u values, scale not documented), "ThermalParams2" (M3T and others: floats, after an optional 32-byte prefix,
+   recognised by 2c 01 20 00 at +32), "ThermalParams3" (magic aa553800 after a 32-byte prefix, int16u scaled by 10 or 100). */
+function djiThermalParams(ctx, d, dOff) {
+  const g = "APP4:DJI", dv = DV(d), L = d.length;
+  const f32 = o => o + 4 <= L ? dv.getFloat32(o, true) : null, u16 = o => o + 2 <= L ? dv.getUint16(o, true) : null;
+  const put = (name, o, value, display, type) => { if (value != null) ctx.add(g, { name, id: hex(o, 2), value, display: display == null ? undefined : display, type, offset: dOff + o }); };
+  const at = (o, s) => s.every((x, k) => d[o + k] === x);
+  const P = { variant: null, emissivity: null, distance: null, rh: null, reflected: null, ambient: null, prefix: null };
+  const prefix = b => { if (b !== 32) return; const s = latin1(d, 4, 4); if (/^[a-z]{4}$/.test(s)) { P.prefix = s; ctx.add(g, { name: "ThermalParamsPrefix", id: "0x00", value: s, display: hexstr(d, 4) + ' "' + s + '"', type: "undef", count: 32, offset: dOff, note: "32-byte prefix before the parameters; meaning not documented" }); } };
+  if (L >= 0x4e && at(0, [0xaa, 0x55, 0x12, 0x06])) {
+    P.variant = "ThermalParams";
+    for (const [o, n] of [[0x24, "K1"], [0x28, "K2"], [0x2c, "K3"], [0x30, "K4"], [0x34, "KF"], [0x38, "B1"], [0x3c, "B2"]]) put(n, o, f32(o), null, "float");
+    /* scales inferred from two real ZH20T images whose values (5, 70, 100, 230) equal the DJI Thermal SDK defaults 5 m, 70 %, 1.00, 23 °C;
+       0x4c (21 in those images) is shown unscaled */
+    P.distance = u16(0x44); P.rh = u16(0x46); const e0 = u16(0x48), r0 = u16(0x4a); P.emissivity = e0 != null ? e0 / 100 : null; P.reflected = r0 != null ? r0 / 10 : null; P.inferred = true;
+    put("ObjectDistance", 0x44, P.distance, P.distance != null ? num(P.distance) + " m" : null, "int16u"); put("RelativeHumidity", 0x46, P.rh, P.rh != null ? P.rh + " %" : null, "int16u");
+    put("Emissivity", 0x48, P.emissivity, P.emissivity != null ? P.emissivity.toFixed(2) : null, "int16u"); put("Reflection", 0x4a, P.reflected, P.reflected != null ? P.reflected.toFixed(1) + " C" : null, "int16u");
+    put("AmbientTemperature", 0x4c, u16(0x4c), null, "int16u");
+  } else if ((L >= 68 && at(64, [0x2c, 0x01, 0x20, 0x00])) || (L >= 36 && at(32, [0x2c, 0x01, 0x20, 0x00]))) {
+    const b = L >= 68 && at(64, [0x2c, 0x01, 0x20, 0x00]) ? 32 : 0; P.variant = "ThermalParams2"; prefix(b);
+    P.ambient = f32(b); P.distance = f32(b + 4); P.emissivity = f32(b + 8); const rh = f32(b + 12); P.rh = rh != null ? rh * 100 : null; P.reflected = f32(b + 16);
+    put("AmbientTemperature", b, P.ambient, P.ambient != null ? P.ambient.toFixed(1) + " C" : null, "float");
+    put("ObjectDistance", b + 4, P.distance, P.distance != null ? P.distance.toFixed(1) + " m" : null, "float");
+    put("Emissivity", b + 8, P.emissivity, P.emissivity != null ? P.emissivity.toFixed(2) : null, "float");
+    put("RelativeHumidity", b + 12, rh, rh != null ? num(rnd(rh * 100, 4)) + " %" : null, "float");
+    put("ReflectedTemperature", b + 16, P.reflected, P.reflected != null ? P.reflected.toFixed(1) + " C" : null, "float");
+    if (b + 0x65 + 16 <= L) { const s = cstr(d.subarray(b + 0x65, b + 0x65 + 16)); if (s) put("IDString", b + 0x65, s, s, "string"); }
+  } else if (L >= 44 && at(32, [0xaa, 0x55, 0x38, 0x00])) {
+    const b = 32; P.variant = "ThermalParams3"; prefix(b);
+    P.rh = u16(b + 4); P.distance = u16(b + 6) / 10; P.emissivity = u16(b + 8) / 100; P.reflected = u16(b + 10) / 10;
+    put("RelativeHumidity", b + 4, P.rh, P.rh + " %", "int16u"); put("ObjectDistance", b + 6, P.distance, num(P.distance) + " m", "int16u");
+    put("Emissivity", b + 8, P.emissivity, P.emissivity.toFixed(2), "int16u"); put("ReflectedTemperature", b + 10, P.reflected, P.reflected.toFixed(1) + " C", "int16u");
+  }
+  for (const k of ["emissivity", "distance", "rh", "reflected", "ambient"]) if (P[k] != null && !isFinite(P[k])) P[k] = null;
+  return P;
+}
+/* DJI APP7 "DJI-DBG\0" followed by [key:value] pairs (the M3T writes only sensor_id) */
+function djiDebugInfo(ctx, d, dOff) {
+  const s = latin1(d, 8), re = /\[([^:\]]{1,64}):([^\]]*)\]/g, NAMES = { sensor_id: "SensorID" }; let m, n = 0;
+  while ((m = re.exec(s)) && n++ < 64) {
+    const raw = m[2], v = raw.replace(/\0+$/, ""), printable = /^[\x20-\x7e]*$/.test(v);
+    ctx.add("APP7:DJI", { name: NAMES[m[1]] || m[1].replace(/[^A-Za-z0-9]/g, "_"), id: m[1], value: printable ? v : null, display: printable ? v : "(binary, " + raw.length + " bytes)", type: "string", offset: dOff + 8 + m.index + m[1].length + 2 });
+  }
+  return n;
+}
+/* FLIR FFF: the APP1 "FLIR\0" chunks are joined in chunk order, then the FFF header, the record directory and the RawData and CameraInfo records are read
+   (layout as in ExifTool FLIR.pm). Temperatures are not computed; the Planck constants and measurement parameters are the inputs for that. */
+function flirFFF(ctx) {
+  const F = ctx.flirChunks; if (!F || !F.parts.length) return;
+  let have = 0; for (let i = 0; i < F.total; i++) if (F.parts[i]) have++;
+  if (have !== F.total) { ctx.warn("flir", "FLIR chunks " + have + " of " + F.total + ": FFF not read", (F.parts.find(Boolean) || {}).offset); return; }
+  const len = F.parts.reduce((a, p) => a + p.data.length, 0), b = new Uint8Array(len); let p0 = 0;
+  for (const p of F.parts) { p.start = p0; b.set(p.data, p0); p0 += p.data.length; }
+  const fileOff = o => { for (const p of F.parts) if (o >= p.start && o < p.start + p.data.length) return p.offset + (o - p.start); return null; };
+  const g = "APP1:FLIR";
+  if (len < 0x40 || !/^[AF]FF\0/.test(latin1(b, 0, 4))) { ctx.warn("flir", "FLIR data without FFF header", F.parts[0].offset); return; }
+  const dv = DV(b); let le = false;
+  const ver = dv.getUint32(0x14, false); if (!(ver >= 100 && ver < 200)) { le = true; const v2 = dv.getUint32(0x14, true); if (!(v2 >= 100 && v2 < 200)) { ctx.warn("flir", "unsupported FFF version", F.parts[0].offset); return; } }
+  const creator = cstr(b.subarray(4, 20)); if (creator) ctx.add(g, { name: "CreatorSoftware", id: "4", value: creator, type: "string", offset: fileOff(4) });
+  const dirOff = dv.getUint32(0x18, le), nRec = dv.getUint32(0x1c, le);
+  if (nRec > 1024 || dirOff + nRec * 32 > len) { ctx.warn("flir", "FFF record directory out of range", fileOff(0x18)); return; }
+  const out = { creator, records: [] };
+  for (let i = 0; i < nRec; i++) {
+    const e = dirOff + i * 32, type = dv.getUint16(e, le); if (!type) continue;
+    const ro = dv.getUint32(e + 12, le), rl = dv.getUint32(e + 16, le); out.records.push(type);
+    if (ro + rl > len) { ctx.warn("flir", "FFF record " + hex(type, 2) + " out of range", fileOff(e)); continue; }
+    const r = b.subarray(ro, ro + rl), rv = DV(r);
+    if (type === 0x01 && rl >= 32) { /* RawData */
+      const rle = rv.getUint16(0, true) < 0x100, w = rv.getUint16(2, rle), h = rv.getUint16(4, rle), data = r.subarray(32);
+      const kind = latin1(data, 0, 8) === "\x89PNG\r\n\x1a\n" ? "PNG" : data[0] === 0xff && data[1] === 0xd8 ? "JPG" : data.length === w * h * 2 ? (rle ? "TIFF" : "raw big-endian") : "DAT";
+      ctx.add(g, { name: "RawThermalImageWidth", id: "RawData.1", value: w, type: "int16u", offset: fileOff(ro + 2) });
+      ctx.add(g, { name: "RawThermalImageHeight", id: "RawData.2", value: h, type: "int16u", offset: fileOff(ro + 4) });
+      ctx.add(g, { name: "RawThermalImageType", id: "RawData.16", value: kind, display: kind === "TIFF" ? "TIFF (16-bit raw, little-endian; ExifTool adds a TIFF header)" : kind, type: "undef" });
+      ctx.add(g, { name: "RawThermalImage", id: "RawData.16.1", value: null, display: "(binary, " + data.length + " bytes)", type: "undef", count: data.length, offset: fileOff(ro + 32) });
+      out.raw = { w, h, kind, bytes: data.length };
+    } else if (type === 0x20 && rl >= 0x100) { /* CameraInfo */
+      const cle = rv.getUint16(0, true) < 0x100, has = (o, n) => o + n <= rl;
+      const fl = o => has(o, 4) ? rv.getFloat32(o, cle) : null, K = o => { const v = fl(o); return v == null ? null : v - 273.15; };
+      const C = {}, put = (name, o, value, display, type) => { if (value == null || (typeof value === "number" && !isFinite(value))) return; C[name] = value; ctx.add(g, { name, id: "CameraInfo." + hex(o, 3), value, display: display == null ? undefined : display, type, offset: fileOff(ro + o) }); };
+      const kel = (n, o) => { const v = K(o); put(n, o, v, v != null ? v.toFixed(1) + " C" : null, "float"); };
+      put("Emissivity", 0x20, fl(0x20), fl(0x20) != null ? fl(0x20).toFixed(2) : null, "float");
+      put("ObjectDistance", 0x24, fl(0x24), fl(0x24) != null ? fl(0x24).toFixed(2) + " m" : null, "float");
+      kel("ReflectedApparentTemperature", 0x28); kel("AtmosphericTemperature", 0x2c); kel("IRWindowTemperature", 0x30);
+      put("IRWindowTransmission", 0x34, fl(0x34), fl(0x34) != null ? fl(0x34).toFixed(2) : null, "float");
+      { let rh = fl(0x3c); if (rh != null && rh > 2) rh /= 100; put("RelativeHumidity", 0x3c, rh, rh != null ? (rh * 100).toFixed(1) + " %" : null, "float"); }
+      for (const [o, n] of [[0x58, "PlanckR1"], [0x5c, "PlanckB"], [0x60, "PlanckF"]]) put(n, o, fl(o), fl(o) != null ? num(fl(o), 8) : null, "float");
+      for (const [o, n] of [[0x70, "AtmosphericTransAlpha1"], [0x74, "AtmosphericTransAlpha2"], [0x78, "AtmosphericTransBeta1"], [0x7c, "AtmosphericTransBeta2"], [0x80, "AtmosphericTransX"]]) put(n, o, fl(o), fl(o) != null ? fl(o).toFixed(6) : null, "float");
+      kel("CameraTemperatureRangeMax", 0x90); kel("CameraTemperatureRangeMin", 0x94);
+      for (const [o, n, k] of [[0xd4, "CameraModel", 32], [0xf4, "CameraPartNumber", 16], [0x104, "CameraSerialNumber", 16], [0x114, "CameraSoftware", 16], [0x170, "LensModel", 32]]) if (has(o, k)) { const s = cstr(r.subarray(o, o + k)); if (s) put(n, o, s, s, "string"); }
+      if (has(0x1b4, 4) && fl(0x1b4)) put("FieldOfView", 0x1b4, fl(0x1b4), fl(0x1b4).toFixed(1) + " deg", "float");
+      if (has(0x308, 4)) put("PlanckO", 0x308, rv.getInt32(0x308, cle), null, "int32s");
+      if (has(0x30c, 4)) put("PlanckR2", 0x30c, fl(0x30c), num(fl(0x30c), 8), "float");
+      if (has(0x33c, 2)) { put("RawValueMedian", 0x338, rv.getUint16(0x338, cle), null, "int16u"); put("RawValueRange", 0x33c, rv.getUint16(0x33c, cle), null, "int16u"); }
+      if (has(0x464, 2)) put("FrameRate", 0x464, rv.getUint16(0x464, cle), null, "int16u");
+      out.cam = C;
+    }
+  }
+  ctx.info.flirFFF = out;
+}
+
+/* ---------------------------------------------------------------- TIFF LZW (TIFF 6.0 section 13, MSB-first codes, early change) */
+function lzwDecode(d, max) {
+  const out = new Uint8Array(max); let o = 0, bit = 0, w = 9, prev = -1; const nbits = d.length * 8;
+  let tab = []; const reset = () => { tab = []; for (let i = 0; i < 256; i++) tab.push(Uint8Array.of(i)); tab.push(null, null); w = 9; };
+  reset();
+  while (bit + w <= nbits && o < max) {
+    const b0 = bit >> 3, v = ((d[b0] << 16) | ((d[b0 + 1] || 0) << 8) | (d[b0 + 2] || 0)) >>> 0, code = (v >>> (24 - (bit & 7) - w)) & ((1 << w) - 1); bit += w;
+    if (code === 256) { reset(); prev = -1; continue; } if (code === 257) break;
+    let e;
+    if (prev < 0) e = tab[code];
+    else if (code < tab.length) { e = tab[code]; const p = tab[prev], n = new Uint8Array(p.length + 1); n.set(p); n[p.length] = e[0]; tab.push(n); }
+    else { const p = tab[prev]; e = new Uint8Array(p.length + 1); e.set(p); e[p.length] = p[0]; tab.push(e); }
+    if (!e) break;
+    out.set(e.subarray(0, Math.min(e.length, max - o)), o); o += e.length; prev = code;
+    if (tab.length + 1 >= (1 << w) && w < 12) w++;
+  }
+  return out.subarray(0, Math.min(o, max));
+}
+/* statistics of a single-band 16-bit integer or 32-bit float TIFF (thermal images converted to TIFF); strips only, at most 64 Mpx */
+async function bandStats(ctx) {
+  const R = ctx.raster; if (!R || R.tiled || R.samplesPerPixel !== 1 || !R.offsets || !R.offsets.length || !R.complete) return null;
+  const bits = Array.isArray(R.bitsPerSample) ? R.bitsPerSample[0] : R.bitsPerSample, sf = R.sampleFormat;
+  const kind = bits === 16 && sf !== 3 ? (sf === 2 ? "int16" : "uint16") : bits === 32 && sf === 3 ? "float32" : null;
+  if (!kind || !(R.compression === 1 || R.compression === 5 || R.compression === 8 || R.compression === 32946) || !(R.predictor === 1 || (R.predictor === 2 && kind !== "float32"))) return null;
+  const W = R.width, H = R.height, bpp = bits / 8; if (!W || !H || W * H > 64e6) return null;
+  const buf = new Uint8Array(W * H * bpp); let o = 0;
+  for (let k = 0; k < R.offsets.length && o < buf.length; k++) {
+    let d = await ctx.src.read(R.offsets[k], R.byteCounts[k]);
+    if (R.compression === 8 || R.compression === 32946) { d = await inflate(d); if (!d) return null; }
+    else if (R.compression === 5) d = lzwDecode(d, Math.min(buf.length - o, (R.rowsPerStrip || H) * W * bpp));
+    buf.set(d.subarray(0, Math.min(d.length, buf.length - o)), o); o += d.length;
+  }
+  if (o < buf.length) return null;
+  const dv = new DataView(buf.buffer), le = R.littleEndian, n = W * H; let mn = Infinity, mx = -Infinity, sum = 0, nan = 0; const hist = new Array(16).fill(0);
+  let prevRow = 0;
+  for (let i = 0; i < n; i++) {
+    let v = kind === "float32" ? dv.getFloat32(i * 4, le) : kind === "int16" ? dv.getInt16(i * 2, le) : dv.getUint16(i * 2, le);
+    if (R.predictor === 2) { if (i % W) { v = (v + prevRow) & 0xffff; if (kind === "int16" && v > 32767) v -= 65536; dv.setUint16(i * 2, v & 0xffff, le); } prevRow = v & 0xffff; }
+    if (!isFinite(v)) { nan++; continue; }
+    if (v < mn) mn = v; if (v > mx) mx = v; sum += v; if (kind === "uint16") hist[v >> 12]++;
+  }
+  const st = { kind, width: W, height: H, min: mn, max: mx, mean: n - nan ? sum / (n - nan) : null, nan };
+  if (kind === "uint16") { st.hist = hist; const f = a => a.reduce((x, y) => x + y, 0) / n; st.wrap = f(hist.slice(0, 2)) > 0.02 && f(hist.slice(14)) > 0.02 && f(hist.slice(5, 11)) < 0.005; }
+  return st;
+}
 /* ---------------------------------------------------------------- zlib inflate via DecompressionStream */
 async function inflate(b) {
   if (typeof G.DecompressionStream !== "function") return null;
@@ -1769,6 +1938,7 @@ async function parse(input, fileName, opts) {
   if (oldFile) { fg.tags.push(...oldFile.tags); result.groups.splice(result.groups.indexOf(oldFile), 1); }
   result.groups.unshift(fg);
   if (ext && type !== "unknown") { const extType = ({ jpg: "JPEG", jpeg: "JPEG", jpe: "JPEG", tif: "TIFF", tiff: "TIFF", png: "PNG", webp: "WEBP", heic: "HEIC", heif: "HEIF", avif: "AVIF", mp4: "MP4", mov: "MOV", dng: "DNG", cr2: "CR2", cr3: "CR3" })[ext]; if (extType && extType !== type && !(extType === "TIFF" && /DNG|BigTIFF|NEF|ARW/.test(type)) && !(extType === "HEIC" && type === "HEIF") && !(extType === "MP4" && type === "MOV") && !(extType === "MOV" && type === "MP4")) result.warnings.push({ code: "ext-mismatch", text: "extension ." + ext + " but content is " + type, offset: 0 }); }
+  if (/^(TIFF|BigTIFF)$/.test(type)) { try { const st = await bandStats(ctx); if (st) ctx.info.band = st; } catch (e) { /* pixel statistics are optional */ } }
   try { derive(result, opts, ctx.pendingComposite); } catch (e) { result.warnings.push({ code: "derive", text: e.message, offset: null }); }
   return result;
 }
@@ -1849,6 +2019,8 @@ function derive(result, opts, pending) {
   S.width = W; S.height = H;
   const EW = V("ExifImageWidth", EX) || V("ExifImageWidth", /^XMP:exif$/), EH = V("ExifImageHeight", EX) || V("ExifImageHeight", /^XMP:exif$/);
   S.sensorPxW = toNum(EW) || W; S.sensorPxH = toNum(EH) || H;
+  /* DNG: IFD0 is a small preview; the raw image is in the SubIFD marked as full resolution (DefaultCropSize gives the image area) */
+  if (result.file.type === "DNG") { const fr = result.groups.find(g => /^EXIF:SubIFD\d*$/.test(g.id) && g.tags.some(t => t.name === "SubfileType" && t.value === 0)); if (fr) { const tv = n => { const t = fr.tags.find(x => x.name === n); return t ? t.value : null; }, dc = tv("DefaultCropSize"), fw = toNum(Array.isArray(dc) ? dc[0] : tv("ImageWidth")), fh = toNum(Array.isArray(dc) ? dc[1] : tv("ImageHeight")); if (isNum(fw) && isNum(fh) && fw > (toNum(W) || 0)) { S.sensorPxW = fw; S.sensorPxH = fh; S.rawSize = [fw, fh]; D("RawImageSize", fw + "x" + fh, fw + " x " + fh + " px", [fr.id + ":" + (Array.isArray(dc) ? "DefaultCropSize" : "ImageWidth")], "DNG: size of the full-resolution raw image (IFD0 holds a preview)"); } } }
   const bps = V("BitsPerSample", /^(EXIF:IFD0|File)$/) || V("BitDepth", /^PNG$/); S.bitDepth = Array.isArray(bps) ? bps[0] : bps; S.channels = V("SamplesPerPixel", /^EXIF:IFD0$/) || V("ColorComponents", /^File$/) || null;
   /* exposure */
   const t = V("ExposureTime", EX), N = V("FNumber", EX), ssv = V("ShutterSpeedValue", EX), av = V("ApertureValue", EX);
@@ -1865,7 +2037,9 @@ function derive(result, opts, pending) {
   let pitch = null, pitchSrc = null, pitchNote = "";
   const fpx = toNum(V("FocalPlaneXResolution", EX)), fpu = V("FocalPlaneResolutionUnit", EX), unitMM = { 2: 25.4, 3: 10, 4: 1, 5: 0.001 }[fpu];
   const cfpx = toNum(V("CalibratedFocalLength", DJI));
-  if (isNum(fpx) && fpx > 0 && unitMM) { pitch = unitMM / fpx * 1000; pitchSrc = [ID("FocalPlaneXResolution", EX), ID("FocalPlaneResolutionUnit", EX)]; pitchNote = "pitch = unit / FocalPlaneXResolution"; }
+  if (isNum(fpx) && fpx > 0 && unitMM) { pitch = unitMM / fpx * 1000; pitchSrc = [ID("FocalPlaneXResolution", EX), ID("FocalPlaneResolutionUnit", EX)]; pitchNote = "pitch = unit / FocalPlaneXResolution";
+    /* FLIR (Vue Pro R, XT2) writes the sensor width in mm there (10.88 = 640 x 17 um), not pixels per unit */
+    if (pitch > 50 && isNum(S.sensorPxW) && S.sensorPxW >= 100) { const alt = fpx * unitMM / S.sensorPxW * 1000; if (alt >= 1 && alt <= 30) { pitch = alt; pitchNote = "FocalPlaneXResolution holds the sensor width (" + num(fpx) + " " + ({ 2: "in", 3: "cm", 4: "mm", 5: "um" })[fpu] + "), not pixels per unit: pitch = width / image width"; result.warnings.push({ code: "focal-plane-width", text: "FocalPlaneXResolution (" + num(fpx) + ") is the sensor width, not a resolution: read as such (pixel pitch " + num(rnd(alt, 2)) + " um)", offset: null }); } } }
   else if (isNum(cfpx) && cfpx > 0 && isNum(f) && f > 0) { pitch = f / cfpx * 1000; pitchSrc = [ID("FocalLength", EX), "XMP:drone-dji:CalibratedFocalLength"]; pitchNote = "pitch = FocalLength [mm] / CalibratedFocalLength [px]"; }
   else if (S.focal35 && isNum(f) && f > 0 && isNum(S.sensorPxW) && S.sensorPxW >= 100) { const crop = S.focal35 / f; pitch = 36 / crop / S.sensorPxW * 1000; pitchSrc = [ID("FocalLength", EX), ID("FocalLengthIn35mmFormat", EX), ID("ExifImageWidth", EX) || "Composite:ImageSize"]; pitchNote = "sensor width = 36 mm / (FocalLengthIn35mmFormat / FocalLength); estimate"; }
   if (S.focal35 && isNum(f) && f > 0) { const sc = S.focal35 / f; C("ScaleFactor35efl", rnd(sc, 3), sc.toFixed(1), [ID("FocalLength", EX), ID("FocalLengthIn35mmFormat", EX)]); C("FocalLength35efl", rnd(S.focal35, 1), f.toFixed(1) + " mm (35 mm equivalent: " + S.focal35.toFixed(1) + " mm)", [ID("FocalLength", EX), "Composite:ScaleFactor35efl"]); S.crop = sc; }
@@ -1922,7 +2096,7 @@ function derive(result, opts, pending) {
   S.rtk = { flag: rf != null ? toNum(rf) : null, gpsStatus: gs || null, sx: n2("RtkStdLon", DJI), sy: n2("RtkStdLat", DJI), sz: n2("RtkStdHgt", DJI), diffAge: n2("RtkDiffAge", DJI), state: null, src: rf != null ? "XMP:drone-dji:RtkFlag" : null };
   if (S.rtk.flag != null && isNum(S.rtk.flag)) { const fl = S.rtk.flag; S.rtk.state = fl === 50 ? "fixed" : fl === 48 || fl === 49 ? "int" : fl >= 32 && fl <= 34 ? "float" : fl === 16 ? "single" : fl === 0 ? (lat != null && S.rtk.sx == null ? "single" : "none") : "other"; if (fl === 0 && S.rtk.state === "single") S.rtk.noRtk = true; }
   else if (gs) S.rtk.state = /rtk/i.test(gs) ? "rtk" : /normal/i.test(gs) ? "single" : /invalid/i.test(gs) ? "none" : null;
-  if (S.rtk.sx == null && n2("GPSXYAccuracy", CAM) != null) { S.rtk.sx = S.rtk.sy = n2("GPSXYAccuracy", CAM); S.rtk.sz = n2("GPSZAccuracy", CAM); S.rtk.sigmaSrc = "XMP:Camera"; } else if (S.rtk.sx == null && n2("GPSXYAccuracy", SF) != null) { S.rtk.sx = S.rtk.sy = n2("GPSXYAccuracy", SF); S.rtk.sz = n2("GPSZAccuracy", SF); S.rtk.sigmaSrc = "XMP:sensefly"; } else if (S.rtk.sx != null) S.rtk.sigmaSrc = "XMP:drone-dji";
+  if (S.rtk.sx == null && n2("GPSXYAccuracy", CAM) != null && !(n2("GPSXYAccuracy", CAM) === 0 && S.lat == null)) { S.rtk.sx = S.rtk.sy = n2("GPSXYAccuracy", CAM); S.rtk.sz = n2("GPSZAccuracy", CAM); S.rtk.sigmaSrc = "XMP:Camera"; } else if (S.rtk.sx == null && n2("GPSXYAccuracy", SF) != null) { S.rtk.sx = S.rtk.sy = n2("GPSXYAccuracy", SF); S.rtk.sz = n2("GPSZAccuracy", SF); S.rtk.sigmaSrc = "XMP:sensefly"; } else if (S.rtk.sx != null) S.rtk.sigmaSrc = "XMP:drone-dji";
   if (S.rtk.state) D("GNSSSolution", S.rtk.state, S.rtk.state + (S.rtk.flag != null ? " (RtkFlag " + S.rtk.flag + ")" : ""), [S.rtk.src, gs ? "XMP:drone-dji:GpsStatus" : null, S.rtk.noRtk ? "Composite:GPSLatitude" : null], "DJI: 0 none, 16 single point, 32-34 float, 48-49 lower-grade integer, 50 fixed (narrow-lane integer)" + (S.rtk.noRtk ? "; RtkFlag 0 with a valid position = drone without RTK, standalone GNSS" : ""));
   const hpe = n2("GPSHPositioningError", GPS); if (hpe != null) S.rtk.hpe = hpe;
   /* time */
@@ -1947,14 +2121,21 @@ function derive(result, opts, pending) {
   if (utcMs == null && local && /^(sensefly|parrot)$/i.test(S.make)) { utcMs = local.ms; utcSrc = "DateTimeOriginal (" + S.make + " writes UTC)"; tz = 0; tzSrc = S.make + " convention (checked against GPS time and the eMotion flight log)"; }
   if (utcMs == null && result.info && result.info.qtCreate) { utcMs = result.info.qtCreate; utcSrc = "QuickTime:CreateDate (UTC)"; }
   const refMs = utcMs != null && utcSrc && !/^DateTimeOriginal/.test(utcSrc) ? utcMs : null;
-  if (tz == null && local && refMs != null) { const dmin = Math.round((local.ms - refMs) / 60000 / 15) * 15; if (Math.abs(dmin) <= 14 * 60 && Math.abs(local.ms - refMs - dmin * 60000) < 300000) { tz = dmin; tzSrc = "DateTimeOriginal - UTC (" + (djiUtc ? "UTCAtExposure" : "GPS time") + ")"; } }
-  if (local && refMs != null && tz != null) { const off = (local.ms - refMs - tz * 60000) / 1000; S.clockOffset = off; D("CameraClockOffset", rnd(off, 1), (off >= 0 ? "+" : "") + num(rnd(off, 1)) + " s", [ID("DateTimeOriginal", EX), utcSrc], "DateTimeOriginal - time zone - UTC; DateTimeOriginal has whole seconds unless SubSecTimeOriginal is set"); }
+  if (tz == null && local && refMs != null) { const dmin = Math.round((local.ms - refMs) / 60000 / 15) * 15, realTz = m => m % 60 === 0 || [-570, -210, 210, 270, 330, 390, 570, 630, 345, 525, 765].includes(m);
+    if (Math.abs(dmin) <= 14 * 60 && realTz(dmin) && Math.abs(local.ms - refMs - dmin * 60000) < 300000) { tz = dmin; tzSrc = "DateTimeOriginal - UTC (" + (djiUtc ? "UTCAtExposure" : "GPS time") + ")"; }
+    else if (Math.abs(local.ms - refMs) < 15 * 3600000) { const dd = (local.ms - refMs) / 1000, a = Math.abs(dd); D("LocalMinusUTC", rnd(dd, 1), (dd < 0 ? "-" : "+") + Math.floor(a / 3600) + ":" + String(Math.floor(a % 3600 / 60)).padStart(2, "0") + ":" + String(Math.round(a % 60)).padStart(2, "0"), [ID("DateTimeOriginal", EX), utcSrc], "not a time-zone offset: the camera clock is off, so neither the time zone nor the clock offset can be told apart"); result.warnings.push({ code: "clock", text: "DateTimeOriginal differs from UTC by " + num(rnd(dd / 60, 1)) + " min, which is no time-zone offset: the camera clock was not set from GNSS", offset: null }); } }
+  // a reference in whole seconds (GPSTimeStamp rewritten without a fraction, e.g. by WingtraHub) is compared in whole seconds, so a sub-second part of DateTimeOriginal does not show up as an offset
+  if (local && refMs != null && tz != null) { const whole = refMs % 1000 === 0, lms = whole ? Math.floor(local.ms / 1000) * 1000 : local.ms, off = (lms - refMs - tz * 60000) / 1000; S.clockOffset = off; D("CameraClockOffset", rnd(off, 1), (off >= 0 ? "+" : "") + num(rnd(off, 1)) + " s", [ID("DateTimeOriginal", EX), utcSrc], "DateTimeOriginal - time zone - UTC; whole seconds when either time has no fraction (DateTimeOriginal without SubSecTimeOriginal, GPSTimeStamp without decimals)"); }
   S.localTime = local ? iso(local.ms).replace(/Z$/, "") : null; S.utc = utcMs != null ? iso(utcMs) : null; S.utcMs = utcMs; S.utcSrc = utcSrc; S.tz = tz; S.tzSrc = tzSrc;
   if (utcMs != null) D("DateTimeUTC", S.utc, S.utc, [utcSrc], tzSrc ? "time zone: " + tzStr(tz || 0) + " (" + tzSrc + ")" : "");
   else if (local) D("DateTimeUTC", null, "(unknown: local time without time zone)", [ID("DateTimeOriginal", EX)], "no OffsetTimeOriginal, no GPS time, no UTC tag");
   if (tz != null && tzSrc) D("TimeZone", tzStr(tz), tzStr(tz), [tzSrc]);
   if (local) { const ld = new Date(local.ms), yr = ld.getUTCFullYear(), reset = ld.getUTCMonth() === 0 && ld.getUTCDate() === 1 && ld.getUTCHours() < 6, gpsOff = gpsMs != null && Math.abs(local.ms - gpsMs) > 86400000;
-    if (reset || yr < 2005 || gpsOff) { S.clockSuspect = reset ? "reset" : yr < 2005 ? "old" : "gps-mismatch"; D("ClockCheck", S.clockSuspect, reset ? "camera clock probably not set (1 January, early morning)" : yr < 2005 ? "camera clock probably not set (year " + yr + ")" : "DateTimeOriginal differs from GPS time by more than one day", [ID("DateTimeOriginal", EX), gpsMs != null ? "Composite:GPSDateTime" : null], "take the time from the flight log"); result.warnings.push({ code: "clock", text: "camera clock suspect: DateTimeOriginal " + S.localTime, offset: null }); } }
+    // cameras write DateTimeOriginal and CreateDate from one clock; a difference of more than a day means one was rewritten after capture
+    // (WingtraHub 2.20 rewrites DateTimeOriginal of Sony a6100 photos and keeps CreateDate from an unset camera clock, 2019-01-01)
+    const cd = parseDT(dtc), rew = cd && Math.abs(local.ms - cd.ms) > 86400000;
+    if (!(reset || yr < 2005 || gpsOff) && rew) { S.clockSuspect = "rewritten"; D("ClockCheck", S.clockSuspect, "DateTimeOriginal differs from CreateDate (" + dtc + ") by more than one day: one of them was rewritten after capture", [ID("DateTimeOriginal", EX), ID("CreateDate", EX)], "take the time from the flight log"); result.warnings.push({ code: "clock", text: "DateTimeOriginal " + S.localTime + " and CreateDate " + dtc + " differ by more than one day", offset: null }); }
+    else if (reset || yr < 2005 || gpsOff) { S.clockSuspect = reset ? "reset" : yr < 2005 ? "old" : "gps-mismatch"; D("ClockCheck", S.clockSuspect, reset ? "camera clock probably not set (1 January, early morning)" : yr < 2005 ? "camera clock probably not set (year " + yr + ")" : "DateTimeOriginal differs from GPS time by more than one day", [ID("DateTimeOriginal", EX), gpsMs != null ? "Composite:GPSDateTime" : null], "take the time from the flight log"); result.warnings.push({ code: "clock", text: "camera clock suspect: DateTimeOriginal " + S.localTime, offset: null }); } }
   /* sun position */
   if (utcMs != null && lat != null) { const sp = solarPosition(utcMs, lat, lon); S.sun = sp; D("SunElevation", rnd(sp.elevation, 2), num(rnd(sp.elevation, 1)) + " deg", ["Derived:DateTimeUTC", "Composite:GPSLatitude"], "NOAA solar position algorithm, with refraction"); D("SunAzimuth", rnd(sp.azimuth, 2), num(rnd(sp.azimuth, 1)) + " deg", ["Derived:DateTimeUTC", "Composite:GPSLongitude"], "clockwise from north"); }
   /* GSD */
@@ -1972,6 +2153,7 @@ function derive(result, opts, pending) {
     D("Band", S.band.name, S.band.name + (S.band.wl ? " " + S.band.wl + " nm" : "") + (S.band.fwhm ? " (FWHM " + S.band.fwhm + " nm)" : S.band.halfWidth ? " (+/-" + S.band.halfWidth + " nm)" : ""), [S.band.src, S.band.wlSrc]); }
   const ird = toNum(V("Irradiance", DJI)), cirr = toNum(V("Irradiance", CAM)), hirr = toNum(V("HorizontalIrradiance", DLS)), sirr = toNum(V("SpectralIrradiance", DLS));
   if (isNum(cirr) && isNum(hirr)) S.irradiance = { value: cirr, raw: cirr, unit: "uW/cm2/nm", src: "XMP:Camera:Irradiance", note: "DLS2 (XMP:DLS:HorizontalIrradiance present): Camera:Irradiance is already in uW/cm2/nm (= W/m2/nm x 100)" };
+  else if (isNum(cirr) && /^DJI/i.test(S.make)) S.irradiance = { value: cirr, raw: cirr, unit: null, src: "XMP:Camera:Irradiance", note: "DJI sunlight sensor (Mavic 3M, P4 Multispectral): unit not stated; used as a relative value with the sensor gain and exposure in DJI's reflectance formula" };
   else if (isNum(cirr)) S.irradiance = { value: cirr * 100, raw: cirr, unit: "uW/cm2/nm", src: "XMP:Camera:Irradiance", note: "DLS1: Camera:Irradiance in W/m2/nm x 100" };
   else if (isNum(hirr)) S.irradiance = { value: hirr, raw: hirr, unit: "uW/cm2/nm", src: "XMP:DLS:HorizontalIrradiance", note: "DLS2 raw x 0.01 = W/m2/nm = x100 uW/cm2/nm" };
   else if (isNum(ird)) S.irradiance = { value: ird, raw: ird, unit: null, src: "XMP:drone-dji:Irradiance", note: "unit not stated by DJI" };
@@ -1981,7 +2163,7 @@ function derive(result, opts, pending) {
   if (typeof irl === "string" && irl.trim()) { const sq = sequoiaIrradiance(irl.trim()); if (sq) { S.sunshine = sq; D("SunshineSamples", sq.n, sq.n + " samples, " + num(rnd(sq.span, 2)) + " s; CH0 mean " + num(rnd(sq.ch0, 1)) + ", gain " + sq.gains.join("/") + ", integration " + sq.times.join("/") + " ms", ["XMP:Camera:IrradianceList"], "Parrot Sequoia sunshine sensor, 28-byte records: timestamp us, CH0, CH1, gain index, integration ms, yaw, pitch, roll");
     if (!S.irradiance) S.irradiance = { value: rnd(sq.rel, 6), raw: sq.rel, unit: null, src: "XMP:Camera:IrradianceList", note: "relative: mean CH0 / (gain index x integration time [ms]); not calibrated" }; } }
   const cpic = toNum(V("CalibrationPicture", CAM)); if (cpic === 1) { S.panel = { src: "XMP:Camera:CalibrationPicture" }; D("CalibrationImage", true, "yes (camera flags this image as a calibration picture)", ["XMP:Camera:CalibrationPicture"]); }
-  const stc = toNum(V("SensorTemperature", CAM)); if (isNum(stc) && stc >= 6553) { S.sensorTempInvalid = true; D("SensorTemperatureCheck", "invalid", num(stc) + " = no measurement (0xFFFF / 10)", ["XMP:Camera:SensorTemperature"]); }
+  const stc = toNum(V("SensorTemperature", CAM)); S.sensorTemp = isNum(stc) && stc < 6553 ? stc : null; if (isNum(stc) && stc >= 6553) { S.sensorTempInvalid = true; D("SensorTemperatureCheck", "invalid", num(stc) + " = no measurement (0xFFFF / 10)", ["XMP:Camera:SensorTemperature"]); }
   if (!S.band && /^mapir$/i.test(S.make)) { const fm = /_(RGN|OCN|NGB|NIR|RE|RGB)$/i.exec(S.model); const MB = { RGN: ["Red,Green,NIR", "660/550/850"], OCN: ["Orange,Cyan,NIR", "615/490/808"], NGB: ["NIR,Green,Blue", "850/550/475"], NIR: ["NIR", 850], RE: ["Red edge", 725] };
     if (fm && MB[fm[1].toUpperCase()]) { const b = MB[fm[1].toUpperCase()]; S.band = { name: b[0], src: "EXIF:IFD0:Model (MAPIR filter suffix)", wl: typeof b[1] === "number" ? b[1] : null, fwhm: null, wlSrc: typeof b[1] === "number" ? "MAPIR filter table" : null }; D("Band", b[0], b[0] + " " + b[1] + " nm", ["EXIF:IFD0:Model"], "MAPIR Survey3: band from the filter code in the model name (vendor filter table)"); } }
   const sg = toNum(V("SensorGain", DJI)); const isoMS = toNum(V("ISOSpeed", EX));
@@ -1996,10 +2178,95 @@ function derive(result, opts, pending) {
   /* sensor type */
   const info = result.info || {};
   S.thermal = null;
-  if (info.djiThermal) S.thermal = { kind: "DJI R-JPEG", parts: info.djiThermal };
-  else if (info.flir) S.thermal = { kind: "FLIR radiometric JPEG", parts: { flir: info.flir } };
-  if (S.thermal) D("RadiometricJPEG", S.thermal.kind, S.thermal.kind + " (temperatures not decoded; use the vendor SDK)", ["JPEG APP segments"]);
-  S.sensorType = S.thermal ? "thermal_LWIR" : S.band ? "multispectral" : (S.channels === 3 || result.file.type === "JPEG" || result.file.type === "HEIC") ? "RGB" : null;
+  const r6 = x => x == null ? null : rnd(x, 6), r2 = x => x == null ? null : rnd(x, 2); /* float32 Kelvin - 273.15 carries noise below 0.01 K */
+  if (info.djiThermal) {
+    const P = info.djiThermal.params, a3 = info.djiThermal.app3;
+    S.thermal = { kind: "DJI R-JPEG", parts: info.djiThermal, encoding: "radiometric JPEG (DJI R-JPEG): 16-bit raw values in APP3" + (a3 && S.width && S.height && a3 === S.width * S.height * 2 ? " (" + S.width + " x " + S.height + ")" : "") + ", converted to temperature only by the DJI Thermal SDK", encodingSrc: "JPEG APP3 ThermalData, APP4 " + ((P && P.variant) || "ThermalParams") };
+    if (P && P.variant && !P.raw) S.thermal.params = { emissivity: r6(P.emissivity), object_distance_m: r6(P.distance), relative_humidity_pct: P.rh == null ? null : rnd(P.rh, 3), reflected_temperature_c: r2(P.reflected), ambient_temperature_c: r2(P.ambient), src: "APP4:DJI (" + P.variant + (P.inferred ? "; scales inferred from the DJI defaults" : "") + ")" };
+    const sid = V("SensorID", /^APP7:DJI$/) || info.djiSensorIdText; if (sid) S.thermal.sensorId = sid;
+  } else if (info.flirFFF && info.flirFFF.cam) {
+    const C = info.flirFFF.cam, R = info.flirFFF.raw;
+    S.thermal = { kind: "FLIR radiometric JPEG", parts: { flir: info.flir }, encoding: "radiometric JPEG (FLIR FFF in APP1): " + (R ? (R.kind === "TIFF" ? "16-bit raw" : R.kind) + " thermal image " + R.w + " x " + R.h : "raw thermal image") + ", converted to temperature with the Planck constants of the record", encodingSrc: "APP1:FLIR RawData, CameraInfo",
+      params: { emissivity: r6(C.Emissivity), object_distance_m: r6(C.ObjectDistance), relative_humidity_pct: C.RelativeHumidity != null ? rnd(C.RelativeHumidity * 100, 3) : null, reflected_temperature_c: r2(C.ReflectedApparentTemperature), atmospheric_temperature_c: r2(C.AtmosphericTemperature), ir_window_temperature_c: r2(C.IRWindowTemperature), ir_window_transmission: r6(C.IRWindowTransmission), src: "APP1:FLIR CameraInfo" } };
+    if (C.PlanckR1 != null && C.PlanckB != null) S.thermal.planck = { R1: +num(C.PlanckR1, 8), B: +num(C.PlanckB, 8), F: +num(C.PlanckF, 8), O: C.PlanckO, R2: +num(C.PlanckR2, 8), src: "APP1:FLIR CameraInfo" };
+    if (C.CameraTemperatureRangeMin != null) S.thermal.range = [rnd(C.CameraTemperatureRangeMin, 2), rnd(C.CameraTemperatureRangeMax, 2)];
+    if (C.PlanckB) D("PeakSpectralSensitivity", rnd(14387.6515 / C.PlanckB, 3), (14387.6515 / C.PlanckB).toFixed(1) + " um", ["APP1:FLIR:PlanckB"], "14387.6515 / PlanckB (ExifTool composite)");
+  } else if (info.flir) S.thermal = { kind: "FLIR radiometric JPEG", parts: { flir: info.flir } };
+  /* temperature TIFF written by ThermoTIFF (J. Rous): Software "ThermoTIFF x", float32 degC, conversion parameters in ImageDescription */
+  const sw0 = String(V("Software", /^EXIF:IFD0$/) || ""), desc0 = String(V("ImageDescription", /^EXIF:IFD0$/) || ""), gdm = String(V("GDALMetadata", /^EXIF:IFD0$/) || "");
+  if (!S.thermal && /^(TIFF|BigTIFF)$/.test(result.file.type) && (/^ThermoTIFF\b/.test(sw0) || / by ThermoTIFF \S+ using DJI Thermal SDK/.test(desc0))) {
+    const m = /Converted from (.+?) by ThermoTIFF (\S+) using DJI Thermal SDK API (\S+?)\.\s/.exec(desc0) || [], pv = k => { const x = new RegExp("(?:^|[;.]\\s*)" + k + "=([-+]?[\\d.]+(?:[eE][-+]?\\d+)?)").exec(desc0); return x ? +x[1] : null; };
+    S.thermal = { kind: "ThermoTIFF", encoding: "TIFF float32, degrees Celsius" + (/UNITTYPE[^>]*>\s*degC/.test(gdm) ? " (GDAL_METADATA UNITTYPE degC)" : "") + ", converted from a DJI R-JPEG by ThermoTIFF" + (m[2] ? " " + m[2] : "") + " with the DJI Thermal SDK" + (m[3] ? " (API " + m[3] + ")" : ""), encodingSrc: "EXIF:IFD0:ImageDescription, Software, GDALMetadata",
+      thermotiff: { version: m[2] || (/^ThermoTIFF\s+(\S+)/.exec(sw0) || [])[1] || null, sdk_api: m[3] || null, source: m[1] || null,
+        params: { emissivity: pv("emissivity"), object_distance_m: pv("distance"), relative_humidity_pct: pv("humidity"), reflected_temperature_c: pv("reflection"), ambient_temperature_c: pv("ambient") } } };
+    S.thermal.params = null; /* the TIFF holds the parameters used in the conversion, not those set at capture */
+    D("TemperatureTIFF", "ThermoTIFF", "degrees Celsius, float32; ThermoTIFF " + (S.thermal.thermotiff.version || "?") + ", DJI Thermal SDK API " + (S.thermal.thermotiff.sdk_api || "?"), ["EXIF:IFD0:Software", "EXIF:IFD0:ImageDescription"]);
+  }
+  /* thermal TIFFs from converters that do not name themselves (checked: DJI Image Processor 1.7.5 by Miro Rava, float32 LZW; ThermoConverter 1.8 by VantageUAV,
+     uint16 Deflate). Both copy Software (camera firmware) and ImageDescription (palette name) from the R-JPEG, and store no measurement parameters. */
+  const band = info.band, dSrc = String(V("ImageSource", DJI) || "");
+  if (!S.thermal && band && /^(TIFF|BigTIFF)$/.test(result.file.type) && /^DJI/i.test(S.make) && (/infrared/i.test(dSrc) || /^(WhiteHot|BlackHot|Arctic|Ironbow\d?|Fulgurite|Hotiron|HotIron|Medical|Rainbow\d?|Tint|GreenHot|RedHot|Lava|Rain)$/i.test(desc0.trim()) || /_T(_tiff)?\.tiff?$/i.test(result.file.name))) {
+    const r2_ = x => x == null ? "?" : num(rnd(x, 2)), rng = r2_(band.min) + " … " + r2_(band.max) + (band.mean != null ? " (mean " + r2_(band.mean) + ")" : "");
+    const cel = band.kind === "float32" && band.min > -100 && band.max < 2000, copied = /^\d+(\.\d+){2,}$/.test(String(sw0).trim()) ? " Software (" + sw0 + ") and ImageDescription are copied from the camera." : "";
+    if (band.kind === "float32") {
+      S.thermal = { kind: "temperature TIFF (converter not named)", encoding: "TIFF float32, one band, values " + rng + (cel ? ", in the range of degrees Celsius" : ", unit not stated") + "; converted from a DJI R-JPEG by a program that does not name itself." + copied + " The measurement parameters used are not stored.", encodingSrc: "EXIF:IFD0 BitsPerSample, SampleFormat; pixel values", params: null, checks: [], band };
+      D("TemperatureTIFF", "float32", "float32, " + rng + (cel ? " (degrees Celsius, probably)" : "") + "; converter and its parameters not stated", ["EXIF:IFD0:SampleFormat", "pixel values"]);
+    } else {
+      S.thermal = { kind: "thermal TIFF, 16-bit (scale not stated)", encoding: "TIFF " + band.kind + ", one band, values " + rng + "; the scale from values to temperature is not stored." + copied + " ThermoConverter (VantageUAV) writes (T − minimum temperature) × factor, both set in the app; with its −50 °C and 1000 per °C the values wrap above 15.535 °C.", encodingSrc: "EXIF:IFD0 BitsPerSample; pixel values", params: null, checks: [], band };
+      D("ThermalTIFF16", band.kind, band.kind + ", " + rng + "; scale to temperature not stated" + (band.wrap ? "; values probably wrapped (overflow)" : ""), ["EXIF:IFD0:BitsPerSample", "pixel values"]);
+      if (band.wrap) result.warnings.push({ code: "thermal-wrap", text: "16-bit thermal values sit at both ends of the range with the middle empty: the converter probably overflowed (values above the top of its scale start again from 0); these are not usable as temperatures", offset: null });
+    }
+    const lost = ["UTCAtExposure", "ImageSource", "AltitudeType", "RtkFlag", "LRFStatus"].filter(k => V(k, DJI) == null);
+    if (lost.length && (V("GpsLatitude", DJI) != null || V("GPSLatitude", DJI) != null)) D("ConversionLostXMP", lost.length, "XMP drone-dji without " + lost.join(", ") + " (dropped by the converter)", ["XMP:drone-dji"]);
+  }
+  /* radiometric TIFFs written by the camera itself, with a stated or documented scale:
+     FLIR Vue Pro R "TLinear" (XMP Camera:TlinearGain: kelvin = value x gain); MicaSense Altum / Altum-PT LWIR band (centikelvin, MicaSense documentation);
+     FLIR TIFF without TlinearGain: raw sensor counts, temperature only with the Planck constants of the camera (not in the TIFF) */
+  const tlg = toNum(V("TlinearGain", CAM)), lwir = S.band && (/^LWIR$/i.test(S.band.name) || (S.band.wl || 0) >= 7000);
+  if (!S.thermal && band && band.kind === "uint16" && /^(TIFF|BigTIFF)$/.test(result.file.type)) {
+    const k2c = (v, g) => v * g - 273.15, r2_ = x => num(rnd(x, 2));
+    let sc = null; if (/^FLIR/i.test(S.make) && isNum(tlg) && tlg > 0) sc = { g: tlg, kind: "radiometric TIFF (FLIR TLinear)", how: "kelvin = value x " + num(tlg) + " (XMP Camera:TlinearGain)", src: "XMP:Camera:TlinearGain" };
+    else if (/micasense/i.test(S.make) && lwir) sc = { g: 0.01, kind: "radiometric TIFF (MicaSense LWIR)", how: "kelvin = value / 100 (MicaSense: LWIR band in centikelvin)", src: "MicaSense documentation" };
+    if (sc) { const tr = [k2c(band.min, sc.g), k2c(band.max, sc.g), band.mean != null ? k2c(band.mean, sc.g) : null];
+      S.thermal = { kind: sc.kind, encoding: "TIFF uint16, one band; " + sc.how + ". The file does not store the measurement settings (emissivity, distance, humidity, reflected temperature) behind these values.", encodingSrc: sc.src, params: null, checks: [], band, tempRange: tr };
+      D("TemperatureRange", [rnd(tr[0], 2), rnd(tr[1], 2)], r2_(tr[0]) + " … " + r2_(tr[1]) + " °C" + (tr[2] != null ? " (mean " + r2_(tr[2]) + ")" : ""), ["pixel values", sc.src], sc.how); }
+    else if (/^FLIR/i.test(S.make) && (lwir || /vue pro r|xt2|duo pro r/i.test(String(S.model || "")))) {
+      S.thermal = { kind: "thermal TIFF, 16-bit raw counts (FLIR)", encoding: "TIFF uint16, one band, raw sensor counts (no TlinearGain in the file); converting them to temperature needs the Planck constants of the camera, which this TIFF does not hold (the radiometric JPEG of the same camera does).", encodingSrc: "EXIF:IFD0:Make; no XMP Camera:TlinearGain", params: null, checks: [], band };
+      D("ThermalTIFF16", band.kind, band.kind + ", " + num(band.min) + " … " + num(band.max) + "; raw counts, Planck constants not in the file", ["EXIF:IFD0:BitsPerSample", "pixel values"]); }
+  }
+  /* ImageJ re-saves (Workswell WIRIS radiometric TIFF in a published data set): the camera's metadata are gone */
+  if (/^(TIFF|BigTIFF)$/.test(result.file.type) && /^ImageJ=/.test(desc0)) { const ij = /ImageJ=([^\n]*)/.exec(desc0)[1].trim(); D("ImageJ", ij, "saved by ImageJ " + ij + (S.make ? "" : "; no camera make, model, time or position left in the file"), ["EXIF:IFD0:ImageDescription"], "ImageJ writes its own description (and IJMetadata) and keeps no EXIF or XMP of the original"); }
+  if (band && !S.thermal && band.kind) D("BandStatistics", band.kind, band.kind + ", min " + num(rnd(band.min, 3)) + ", max " + num(rnd(band.max, 3)) + (band.mean != null ? ", mean " + num(rnd(band.mean, 3)) : ""), ["pixel values"]);
+  else if (band && S.thermal && S.thermal.kind === "ThermoTIFF") { S.thermal.band = band; D("TemperatureRange", [band.min, band.max], num(rnd(band.min, 2)) + " … " + num(rnd(band.max, 2)) + " °C" + (band.mean != null ? " (mean " + num(rnd(band.mean, 2)) + ")" : ""), ["pixel values"]); }
+  /* EXIF tags written into the GPS IFD (ThermoConverter): CreateDate, FocalLength, BodySerialNumber and others with IDs outside the GPS table */
+  { const g = result.groups.find(x => x.id === "EXIF:GPS"), odd = g ? g.tags.filter(t => /^Tag 0x([89a-f][0-9a-f]{3})$/i.test(t.name)) : [];
+    if (odd.length) result.warnings.push({ code: "gps-ifd", text: "EXIF tags in the GPS IFD (" + odd.map(t => t.name.replace("Tag ", "")).join(", ") + "): the writing program put Exif tags there; readers that expect GPS tags ignore them", offset: null }); }
+  if (S.thermal && S.thermal.kind !== "ThermoTIFF" && !S.thermal.band) D("RadiometricJPEG", S.thermal.kind, S.thermal.kind + (S.thermal.params ? " (measurement parameters read; temperatures not computed)" : " (temperatures not computed; use the vendor SDK)"), ["JPEG APP segments"]);
+  /* laser rangefinder (DJI XMP): status Normal with distance 0 = no measurement */
+  const lrfS = V("LRFStatus", DJI), lrfD = toNum(V("LRFTargetDistance", DJI));
+  if (lrfS != null || isNum(lrfD)) {
+    S.lrf = { status: lrfS != null ? String(lrfS) : null, distance: isNum(lrfD) ? lrfD : null, lat: n2("LRFTargetLat", DJI), lon: n2("LRFTargetLon", DJI), alt: n2("LRFTargetAlt", DJI), absAlt: n2("LRFTargetAbsAlt", DJI) };
+    S.lrf.measured = /^normal$/i.test(S.lrf.status || "") && S.lrf.distance > 0;
+    D("LaserRangefinder", S.lrf.measured ? rnd(S.lrf.distance, 3) : null, S.lrf.measured ? num(rnd(S.lrf.distance, 3)) + " m" : "not measured (status " + (S.lrf.status || "?") + ", distance " + (S.lrf.distance != null ? num(S.lrf.distance) : "?") + ")", ["XMP:drone-dji:LRFStatus", "XMP:drone-dji:LRFTargetDistance"], "a zero distance or a status other than Normal means no measurement");
+  }
+  /* measurement parameters: limits and agreement with the flight */
+  const TP = S.thermal && (S.thermal.params || (S.thermal.thermotiff && S.thermal.thermotiff.params));
+  if (TP) {
+    const chk = [], e = TP.emissivity, dd = TP.object_distance_m, rh = TP.relative_humidity_pct, dji = /^DJI|ThermoTIFF/.test(S.thermal.kind);
+    if (e != null && !(e > 0 && e <= 1)) chk.push(["emissivity", "outside 0-1"]);
+    else if (e === 1) chk.push(["emissivity", "1.00: blackbody (brightness) temperature, no emissivity correction"]);
+    if (dd != null && dji && (dd < 1 || dd > 25)) chk.push(["object_distance_m", "outside 1-25 m (DJI Thermal SDK; ThermoTIFF does not trust the correction above 25 m)"]);
+    if (rh != null && !(rh >= 0 && rh <= 100)) chk.push(["relative_humidity_pct", "outside 0-100 %"]);
+    else if (rh != null && dji && rh < 20) chk.push(["relative_humidity_pct", "below 20 % (DJI Thermal SDK accepts 20-100 %)"]);
+    if (e != null && dji && e > 0 && e < 0.1) chk.push(["emissivity", "below 0.10 (DJI Thermal SDK accepts 0.10-1.00)"]);
+    const rt = TP.reflected_temperature_c;
+    if (rt != null && dji && (rt < -40 || rt > 500)) chk.push(["reflected_temperature_c", "outside -40 to 500 °C (DJI Thermal SDK)"]);
+    const hRef = S.lrf && S.lrf.measured ? S.lrf.distance : S.altRel != null && S.altRel > 0 ? S.altRel : null;
+    if (dd != null && hRef != null && S.thermal.kind !== "ThermoTIFF") { const want = dji ? Math.min(hRef, 25) : hRef; if (Math.abs(dd - want) > Math.max(2, 0.2 * want)) chk.push(["object_distance_m", num(dd) + " m set in the camera; " + (S.lrf && S.lrf.measured ? "laser rangefinder " : "height above take-off ") + num(rnd(hRef, 1)) + " m" + (dji && hRef > 25 ? " (SDK limit 25 m)" : "")]); }
+    S.thermal.checks = chk;
+    D("ThermalParamsCheck", chk.length ? chk.length : 0, chk.length ? chk.map(c => c[0] + ": " + c[1]).join("; ") : "within limits", [TP === S.thermal.params ? S.thermal.params.src : "EXIF:IFD0:ImageDescription"], "emissivity 0-1, humidity 0-100 %; DJI Thermal SDK: emissivity 0.10-1.00, distance 1-25 m, humidity 20-100 %, reflected -40 to 500 °C; distance compared with the laser rangefinder or the height above take-off");
+  }
+  S.sensorType = S.thermal || (S.band && (/^LWIR$/i.test(S.band.name) || (S.band.wl || 0) >= 7000)) ? "thermal_LWIR" : S.band && !(/,/.test(S.band.name) && (S.channels === 3 || result.file.type === "JPEG")) ? "multispectral" : (S.channels === 3 || result.file.type === "JPEG" || result.file.type === "HEIC") ? "RGB" : null;
   /* JPEG quality */
   if (info.dqt && info.dqt[0]) { const q = jpegQuality(info.dqt[0]); if (q) { S.jpegQuality = q; D("JPEGQualityEstimate", q.quality, String(q.quality) + (q.spread > 0.15 ? " (non-IJG table, rough)" : ""), ["DQT table 0"], "IJG scaling of the T.81 Annex K luminance table: S = mean(100 Q/Qstd); q = (200 - S)/2 for S <= 100, else 5000/S"); } }
   /* GeoTIFF */
@@ -2071,7 +2338,8 @@ function imageLog(result) {
   R("band_wavelength_nm", S.band && S.band.wl != null ? S.band.wl : "", S.band && S.band.wlSrc === "XMP:drone-dji:BandFreq" ? "derived" : "file", S.band ? S.band.wlSrc || "" : "", S.band ? "" : "na");
   if (S.irradiance) R("irradiance_dls", S.irradiance.value, S.irradiance.unit && S.irradiance.raw !== S.irradiance.value ? "derived" : "file", S.irradiance.src, S.irradiance.unit ? "" : "unit-unknown");
   else R("irradiance_dls", "", "missing", "", S.band ? "" : "na");
-  R("fpa_temp_c", "", "missing", "", S.thermal ? (S.sensorTempInvalid ? "invalid" : "sdk") : "na"); R("shutter_flag", "", "missing", "", S.thermal ? "sdk" : "na");
+  if (S.thermal && S.sensorTemp != null) R("fpa_temp_c", S.sensorTemp, "file", "XMP:Camera:SensorTemperature");
+  else R("fpa_temp_c", "", "missing", "", S.thermal ? (S.sensorTempInvalid ? "invalid" : /^DJI|^ThermoTIFF/.test(S.thermal.kind) ? "not-written" : "sdk") : "na"); R("shutter_flag", "", "missing", "", S.thermal ? "sdk" : "na");
   const aux = [[S.make, S.model].filter(Boolean).join(" "), S.software].filter(Boolean).join("; ");
   R("aux", aux, "file", "EXIF:IFD0:Make, Model, Software");
   return out;
@@ -2084,7 +2352,7 @@ function toExiftoolJSON(results, o) {
     const obj = { SourceFile: r.file.name };
     for (const g of r.groups) for (const t of g.tags) {
       if (g.id === "Derived" && !o.derived) continue;
-      const k = (o.g1 ? g.id.replace(/^XMP:/, "XMP-").replace(/^EXIF:/, "").replace(/^MakerNotes:/, "") : g0(g.id)) + ":" + t.name;
+      const k = (o.g1 ? g.id.replace(/^XMP:/, "XMP-").replace(/^EXIF:/, "").replace(/^MakerNotes:/, "").replace(/^APP\d+:/, "") : g0(g.id)) + ":" + t.name;
       if (k in obj) continue;
       let v = o.raw ? t.value : t.display;
       if (t.binary) v = "(Binary data " + t.binary.length + " bytes)";

@@ -23,7 +23,7 @@ function fmtA(v, sig) { /* automatic decimals for a few significant digits */
   if (a === 0) return "0"; const d = Math.max(0, Math.min(8, sig - 1 - Math.floor(Math.log10(a))));
   return fmt(Number(v.toFixed(d)), d);
 }
-const dec = s => { const x = String(s).replace(/(^|[\s(;,=])-(?=\d)/g, "$1−"); return L === "cs" ? (/\d\.\d/.test(x) ? x.replace(/(\d), (?=[−+]?\d)/g, "$1; ") : x).replace(/(^|[^\d.,])(\d+)\.(\d+)(?![\d.])/g, "$1$2,$3") : x; };
+const dec = s => { const x = String(s).replace(/(^|[\s(;,=])-(?=\d)/g, "$1−"); return L === "cs" ? (/\d\.\d/.test(x) ? x.replace(/(\d), (?=[−+]?\d)/g, "$1; ") : x).replace(/(^|[^\d.,vV])(\d+)\.(\d+)(?![\d.])/g, "$1$2,$3") : x; };
 function fmtExp(tm) { if (!tm) return "–"; if (tm < 0.25001) return "1/" + fmt(Math.round(1 / tm), 0, false) + " s"; return fmt(tm, tm < 10 ? 1 : 0) + " s"; }
 function fmtTime(iso, ms) { /* ISO 8601 -> readable, decimal comma in cs */
   if (!iso) return "–"; const m = /^(\d{4}-\d\d-\d\d)T(\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)?$/.exec(iso);
@@ -38,7 +38,8 @@ const chip = (cls, icon, txt) => '<span class="chip ' + cls + '"><i aria-hidden=
 const ST_ICON = { file: "✓", derived: "ƒ", log: "⇄", missing: "!", na: "–", notapp: "·" };
 const stChip = s => chip("s-" + s, ST_ICON[s], t("st_" + s));
 // derived values that rest on an assumption (flat ground at take-off height, nadir view, one image for a batch, a guess from tags) are shown as estimates
-const EST_NOTE = /^(nAgl|nDist|nGsd|nGeo|nOneImage|nGnssMode|nSensorType|nWx)$/, isEst = r => r.st === "derived" && EST_NOTE.test(r.note || "");
+// a position from the log interpolated to the exposure time (nInterp) is an estimate as well
+const EST_NOTE = /^(nAgl|nDist|nGsd|nGeo|nOneImage|nGnssMode|nSensorType|nWx|nInterp)$/, isEst = r => (r.st === "derived" || r.st === "log") && EST_NOTE.test(r.note || "");
 const stChipR = r => isEst(r) ? chip("s-derived", "≈", t("st_estimate")) : stChip(r.st);
 const cssv = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
@@ -479,9 +480,10 @@ function cardGnss(e) {
 function cardRad(e) {
   const S = e.res.summary;
   if (S.thermal) {
-    const p = S.thermal.parts || {};
-    return '<article class="card"><h3>' + esc(t("cThermal")) + "</h3>" + kv([[t("kKind"), esc(S.thermal.kind)], p.app3 ? ["APP3 ThermalData", fmtBytes(p.app3)] : null, p.app4 ? ["APP4 ThermalParams", fmtBytes(p.app4)] : null, p.app5 ? ["APP5 ThermalCalibration", fmtBytes(p.app5)] : null, p.flir ? ["APP1 FLIR", String(p.flir)] : null]) +
-      '<p class="callout w">' + t("thermalNote") + "</p></article>";
+    const p = S.thermal.parts || {}, bd = S.thermal.band, k = S.thermal.kind || "";
+    const note = k === "ThermoTIFF" ? "thermalNoteTt" : /^temperature TIFF/.test(k) ? "thermalNoteConv" : /^radiometric TIFF/.test(k) ? "thermalNoteCam" : /raw counts/.test(k) ? "thermalNoteRaw" : /^thermal TIFF, 16-bit/.test(k) ? (bd && bd.wrap ? "thermalNoteWrap" : "thermalNote16") : "thermalNote", tr = S.thermal.tempRange;
+    return '<article class="card"><h3>' + esc(t("cThermal")) + "</h3>" + kv([[t("kKind"), esc(S.thermal.kind)], bd ? [t("kValues"), esc(dec(String(+bd.min.toFixed(3)) + " … " + String(+bd.max.toFixed(3)) + (bd.mean != null ? " (" + t("kMean") + " " + (+bd.mean.toFixed(3)) + ")" : "")) + (bd.kind === "float32" ? "" : " (" + bd.kind + ")"))] : null, tr ? [t("kTempRange"), esc(dec((+tr[0].toFixed(2)) + " … " + (+tr[1].toFixed(2)) + " °C" + (tr[2] != null ? " (" + t("kMean") + " " + (+tr[2].toFixed(2)) + ")" : "")))] : null, p.app3 ? ["APP3 ThermalData", fmtBytes(p.app3)] : null, p.app4 ? ["APP4 ThermalParams", fmtBytes(p.app4)] : null, p.app5 ? ["APP5 ThermalCalibration", fmtBytes(p.app5)] : null, p.flir ? ["APP1 FLIR", String(p.flir)] : null]) +
+      '<p class="callout' + (note === "thermalNoteTt" ? "" : " w") + '">' + t(note) + "</p></article>";
   }
   if (!S.band && !S.irradiance) return "";
   const b = S.band || {}, ir = S.irradiance;
@@ -617,7 +619,7 @@ function oslRules(e, B) {
   if (S.software) F("sensor.firmware", S.software, "EXIF:IFD0:Software", "nFirmware");
   if (S.make || S.model) F("sensor.sensor_model", [S.make, S.model].filter(Boolean).join(" "), "EXIF:IFD0:Make, Model");
   if (S.serial) F("sensor.sensor_serial", S.serial, S.serialSrc);
-  if (S.sensorType) D("sensor.sensor_type", S.sensorType, S.thermal ? "JPEG APP3–APP5" : S.band ? S.band.src : "File:FileType, ColorComponents", "nSensorType");
+  if (S.sensorType) D("sensor.sensor_type", S.sensorType, S.thermal ? ({ "DJI R-JPEG": "JPEG APP3–APP5 (DJI)", "FLIR radiometric JPEG": "JPEG APP1 FLIR (FFF)", ThermoTIFF: "EXIF:IFD0:Software, ImageDescription (ThermoTIFF)" })[S.thermal.kind] || S.thermal.kind : S.band ? S.band.src : "File:FileType, ColorComponents", "nSensorType");
   if (S.sensorPxW) F("sensor.image_size", [S.sensorPxW, S.sensorPxH], tv(e, "ExifImageWidth") != null ? "EXIF:ExifIFD:ExifImageWidth, ExifImageHeight" : "ImageWidth, ImageHeight");
   if (S.bitDepth) F("sensor.bit_depth", S.bitDepth, "BitsPerSample");
   if (S.hfov) D("sensor.field_of_view", [+S.hfov.toFixed(2), +S.vfov.toFixed(2)], "Derived:FieldOfView", "nFov");
@@ -651,7 +653,24 @@ function oslRules(e, B) {
     if (S.dlsAttitude) (/rad/.test(S.dlsAttitude.src) ? D : F)("multispectral.dls_attitude", [S.dlsAttitude.roll, S.dlsAttitude.pitch, S.dlsAttitude.yaw].map(x => +x.toFixed(2)), S.dlsAttitude.src);
     const em = tv(e, "ExposureMode", /^EXIF:/); if (em != null && isFinite(+em)) F("multispectral.exposure_mode", +em === 1 ? "fixed" : "auto", "EXIF:ExifIFD:ExposureMode", "nExpMode");
   }
-  if (th) { X("thermal.fpa_temperature", "", "nSdk"); X("thermal.capture_measurement_params", "", "nApp4"); }
+  if (th) {
+    const T0 = S.thermal || {}, P0 = T0.params, TT = T0.thermotiff;
+    if (S.sensorTemp != null) F("thermal.fpa_temperature", S.sensorTemp, "XMP:Camera:SensorTemperature", "nFpaXmp"); else X("thermal.fpa_temperature", "", /^radiometric TIFF|raw counts/.test(T0.kind || "") ? "nFpaCamTiff" : /^DJI|^ThermoTIFF|^(temperature|thermal) TIFF/.test(T0.kind || "") ? "nFpaDji" : "nSdk");
+    if (P0) {
+      const p = {}; for (const [k, v] of Object.entries(P0)) if (k !== "src" && v != null) p[k] = v;
+      F("thermal.capture_measurement_params", p, P0.src, "nCamSet");
+      if (P0.emissivity != null) D("reference.emissivity_setting", P0.emissivity, P0.src, "nEmisCam");
+    } else X("thermal.capture_measurement_params", "", TT ? "nTtCap" : /^radiometric TIFF|raw counts/.test(T0.kind || "") ? "nCamTiffCap" : /^(temperature|thermal) TIFF/.test(T0.kind || "") ? "nConvCap" : "nApp4");
+    if (T0.encoding) D("thermal.image_encoding", T0.encoding, T0.encodingSrc, TT ? "nEncTt" : "nEnc");
+    if (T0.planck) { const q = T0.planck; F("thermal.planck_constants", { R1: q.R1, B: q.B, F: q.F, O: q.O, R2: q.R2 }, q.src + ": PlanckR1, B, F, O, R2", "nPlanck"); }
+    if (S.band && S.band.wl > 3000 && S.band.fwhm) D("thermal.spectral_range", [+((S.band.wl - S.band.fwhm / 2) / 1000).toFixed(2), +((S.band.wl + S.band.fwhm / 2) / 1000).toFixed(2)], "XMP:Camera:CentralWavelength, WavelengthFWHM", "nSpecRange");
+    if (TT) {
+      const p = {}; for (const [k, v] of Object.entries(TT.params)) if (v != null) p[k] = v;
+      F("processing.thermal_settings", Object.assign({ method: "DJI Thermal SDK, raw values to temperature (degrees Celsius)" }, p, TT.source ? { source_image: TT.source } : {}), "EXIF:IFD0:ImageDescription", "nTtSet");
+      F("processing.atmospheric_model", "DJI Thermal SDK built-in correction (method not published; inputs: object distance, relative humidity, ambient and reflected temperature)", "EXIF:IFD0:ImageDescription", "nTtAtm");
+      F("processing.software", [{ name: "ThermoTIFF", version: TT.version || "" }, { name: "DJI Thermal SDK", version: TT.sdk_api ? "API " + TT.sdk_api : "" }], "EXIF:IFD0:Software, ImageDescription", "nTtSw");
+    }
+  }
   /* mission (from all loaded files) */
   const multi = B.n > 1 ? "nBatch" : "";
   if (B.t0) { D("mission.start_utc", B.t0, multi ? t("srcBatch", B.n) : S.utcSrc, multi); D("mission.end_utc", B.t1, multi ? t("srcBatch", B.n) : S.utcSrc, multi || "nOneImage"); }
@@ -666,7 +685,8 @@ function oslRules(e, B) {
   if (B.oblique != null) D("mission.oblique_images", B.oblique ? [true, +B.tiltMax.toFixed(1)] : false, "XMP:drone-dji:GimbalPitchDegree", multi ? "nOblique" : "nOneImage");
   /* environment */
   if (S.sun) { D("environment.solar_zenith", +(90 - S.sun.elevation).toFixed(2), "Derived:SunElevation (NOAA)", "nSun"); D("environment.solar_azimuth", +S.sun.azimuth.toFixed(2), "Derived:SunAzimuth (NOAA)", "nSun"); }
-  if (S.altRel != null && S.gimbal && S.gimbal.pitch != null && S.gimbal.pitch < -80) D("environment.sensor_target_distance", S.altRel, "XMP:drone-dji:RelativeAltitude", "nDist");
+  if (S.lrf && S.lrf.measured) F("environment.sensor_target_distance", +S.lrf.distance.toFixed(3), "XMP:drone-dji:LRFTargetDistance", "nLrf");
+  else if (S.altRel != null && S.gimbal && S.gimbal.pitch != null && S.gimbal.pitch < -80) D("environment.sensor_target_distance", S.altRel, "XMP:drone-dji:RelativeAltitude", S.lrf ? "nDistNoLrf" : "nDist");
   const amb = [["AmbientTemperature", "environment.air_temperature"], ["Humidity", "environment.relative_humidity"], ["Pressure", "environment.air_pressure"]];
   for (const [tg, k] of amb) { const v = tv(e, tg, /^EXIF:/); if (v != null) F(k, num(v), "EXIF:ExifIFD:" + tg, "nAmb"); }
   const W = wxFor(); if (W) { for (const [k, v] of Object.entries(W.vals)) if (v != null && !R["environment." + k]) D("environment." + k, v, k === "cloud_cover" ? W.src + ", in %" : W.src, "nWx"); if (!R["environment.weather_source"]) D("environment.weather_source", W.srcLong, W.src, "nWx"); }
@@ -729,7 +749,7 @@ function mergeFlight(e, rows) {
     if (x) { r.img = have(r) ? r.val : null; r.imgSrc = r.img != null ? r.src : null; r.cmp = r.img != null ? OSLFlight.agree(r.field, r.val, x.val, im) : null;
       // heights: a difference is only judged when the image says its height is ellipsoidal; otherwise the number is shown, not a verdict
       if (r.cmp && r.field === "alt_ellipsoid_m" && r.note !== "ellipsoid-sensefly") { r.cmpDiff = +r.img - +x.val; r.cmp = "not_comparable"; }
-      r.st = "log"; r.val = typeof x.val === "number" ? String(x.val) : x.val; r.src = x.src; r.note = ""; continue; }
+      r.st = "log"; r.val = typeof x.val === "number" ? String(x.val) : x.val; r.src = x.src; r.note = x.note || ""; continue; }
     if (r.block === "image_log" && im && r.field === "alt_ellipsoid_m" && im.cols._hNote) r.logNote = im.cols._hNote;
     if (m && (!have(r) || LOG_FIRST.test(key))) { r.img = have(r) ? r.val : null; r.imgSrc = r.img != null ? r.src : null; r.cmp = r.img != null && key === "mission.gnss_mode" ? (String(r.img) === String(m.val) ? "same" : "differ") : null; r.st = "log"; r.val = m.val; r.src = m.src; r.note = m.note; if (m.log) r.log = m.log; continue; }
     if (geo[key] != null && !have(r) && !(m && m.note && /^nPlan/.test(m.note))) { r.st = "derived"; r.val = geo[key]; r.src = gsrc; r.note = "nGeo"; }
@@ -777,7 +797,7 @@ function logCallout(rows) {
 }
 function exportBox() {
   const F = batchFiles(); if (!F.length) return "";
-  return '<h3 class="sub" id="exportH">' + esc(t("expH")) + '</h3><p class="note small">' + esc(t("expIntro", F.length, flightState().logs.length)) + '</p><div class="toolbar"><button class="btn primary" id="x-rep">' + esc(t("expRep")) + '</button><button class="btn" id="x-mj">' + esc(t("expMj")) + '</button><button class="btn" id="x-pv">' + esc(t("expPv")) + '</button><button class="btn" id="x-il">' + esc(t("expIl")) + '</button><button class="btn" id="x-cam">' + esc(t("expCam")) + '</button><button class="btn" id="x-p4d">' + esc(t("expP4d")) + '</button><button class="btn" id="x-odm">' + esc(t("expOdm")) + '</button><button class="btn" id="x-gj">' + esc(t("expGj")) + '</button></div><p class="note small">' + t("expNote") + t("pvNote") + "</p>";
+  return '<h3 class="sub" id="exportH">' + esc(t("expH")) + '</h3><p class="note small">' + esc(t("expIntro", F.length, flightState().logs.length)) + '</p><div class="toolbar"><button class="btn primary" id="x-rep">' + esc(t("expRep")) + '</button><button class="btn" id="x-mj">' + esc(t("expMj")) + '</button><button class="btn" id="x-pv">' + esc(t("expPv")) + '</button><button class="btn" id="x-il">' + esc(t("expIl")) + '</button><button class="btn" id="x-cam">' + esc(t("expCam")) + '</button><button class="btn" id="x-p4d">' + esc(t("expP4d")) + '</button><button class="btn" id="x-odm">' + esc(t("expOdm")) + '</button><button class="btn" id="x-gj">' + esc(t("expGj")) + '</button><button class="btn" id="x-fp">' + esc(t("expFp")) + '</button></div><p class="note small">' + t("expNote") + t("pvNote") + "</p>";
 }
 const B_n = () => batchFiles().length;
 
@@ -881,7 +901,7 @@ function renderBatch() {
     '<div class="legend">' + ["fixed", "int", "float", "single", "none"].map(k => '<span><span aria-hidden="true" style="color:var(--' + RTK_ST[k][0] + ')">' + RTK_ST[k][1] + "</span> " + esc(t("rtk_" + k)) + "</span>").join("") + '<span><span class="sw" style="background:var(--accent-soft);border:1px solid var(--accent)"></span>' + esc(t("fpLegend")) + "</span></div>" +
     '<h3 class="sub">' + esc(t("chkH")) + '</h3><ul class="checks">' + ch.map(c => "<li>" + (c.ok ? chip("s-file", "✓", t("ok")) : chip("s-missing", "!", t("check"))) + "<span>" + esc(t(c.key)) + (c.det ? "<small>" + esc(dec(c.det)) + "</small>" : "") + "</span></li>").join("") + "</ul>" +
     '<div class="tw"><table class="bt"><thead><tr><th>#</th><th>' + esc(t("thFile")) + "</th><th>" + esc(t("thTime")) + "</th><th>" + esc(t("thLatLon")) + "</th><th>" + esc(t("thAlt")) + "</th><th>RTK</th><th>" + esc(t("thExp")) + "</th><th>" + esc(t("thGimbal")) + "</th>" + (showSer ? "<th>" + esc(t("thSerial")) + "</th>" : "") + "</tr></thead><tbody>" + rows + "</tbody></table></div>" + (oneDay && days.size ? '<p class="note small">' + esc(t("thDate")) + ": " + esc([...days][0]) + "</p>" : "") +
-    '<p class="note small">' + esc(t("batchStar")) + '</p><div class="toolbar"><button class="btn" id="x-il">' + esc(t("expIl")) + '</button><button class="btn" id="x-mj">' + esc(t("expMj")) + '</button><button class="btn" id="x-jall">' + esc(t("expJsonAll")) + '</button></div><p class="note small">' + t("xNote") + "</p>";
+    '<p class="note small">' + esc(t("batchStar")) + '</p><div class="toolbar"><button class="btn" id="x-il">' + esc(t("expIl")) + '</button><button class="btn" id="x-mj">' + esc(t("expMj")) + '</button><button class="btn" id="x-jall">' + esc(t("expJsonAll")) + '</button><button class="btn" id="x-fp">' + esc(t("expFp")) + '</button></div><p class="note small">' + t("xNote") + "</p>";
   drawTrack(); drawAlt();
 }
 
@@ -893,7 +913,7 @@ function download(name, text, mime) {
 function ilRow(f) {
   const row = {}; for (const x of M.imageLog(f.res)) row[x.column] = x.value;
   const im = flightState().O.images[f.name];
-  if (im) { for (const [c, x] of Object.entries(im.cols)) if (c[0] !== "_") row[c] = String(x.val); row.aux = [row.aux, "timestamp, position, RTK and sigma from " + im.log + " #" + im.n].filter(Boolean).join("; "); row._log = im.log; }
+  if (im) { for (const [c, x] of Object.entries(im.cols)) if (c[0] !== "_") row[c] = String(x.val); row.aux = [row.aux, "timestamp, position, RTK and sigma from " + im.log + " #" + im.n + (im.cols.lat_deg && im.cols.lat_deg.note === "nInterp" ? " (position interpolated from the trajectory, an estimate)" : "")].filter(Boolean).join("; "); row._log = im.log; }
   return row;
 }
 function imageLogCSV(F) { const cols = M.IMAGE_LOG_COLUMNS, lines = [cols.join(",")]; for (const f of F) { const row = ilRow(f); lines.push(cols.map(c => M.csvCell(row[c] == null ? "" : row[c])).join(",")); } return lines.join("\r\n") + "\r\n"; }
@@ -928,6 +948,34 @@ function geojson(F) {
       if (poly) { const ring = poly.map(q => [r6(lon + q[0] / k), r6(lat + q[1] / 111320)]); ring.push(ring[0]); feats.push({ type: "Feature", geometry: { type: "Polygon", coordinates: [ring] }, properties: { kind: "footprint", image: f.name, gsd_cm: S.gsd ? +(S.gsd * 100).toFixed(2) : null, note: "nadir, flat ground at take-off elevation" } }); } } }
   return JSON.stringify({ type: "FeatureCollection", name: "openskylab_exposures", features: feats }) + "\n";
 }
+// footprints.geojson: the ground outline of every image with position, height above ground, sensor size and camera angles.
+// Each image corner is a ray from the camera (yaw from north to the top of the image, tilt 0 = nadir, roll), cut with flat ground
+// at the take-off level (height above ground = relative altitude or the height set by hand). Images that see the horizon are left out.
+function footprintsGeo(F) {
+  const feats = [], skip = { noHeight: 0, noAngles: 0, noSensor: 0, horizon: 0 }, rad = Math.PI / 180, bb = [Infinity, Infinity, -Infinity, -Infinity];
+  const r6 = v => +(+v).toFixed(8), r2 = v => v == null || !isFinite(v) ? null : +(+v).toFixed(2);
+  for (const { f, r } of cameraRows(F)) {
+    const S = f.res.summary, a = ang(r), H = S.gsdHeight, w = S.sensorW, h = S.sensorH, fl = S.focal;
+    if (!(isFinite(H) && H > 0)) { skip.noHeight++; continue; } if (!a) { skip.noAngles++; continue; } if (!(w > 0 && h > 0 && fl > 0)) { skip.noSensor++; continue; }
+    const psi = a.yaw * rad, tl = a.pitch * rad, rho = (a.roll || 0) * rad;
+    const hd = [Math.sin(psi), Math.cos(psi), 0], rt = [Math.cos(psi), -Math.sin(psi), 0];
+    let v = [Math.sin(tl) * hd[0], Math.sin(tl) * hd[1], -Math.cos(tl)], u = [Math.cos(tl) * hd[0], Math.cos(tl) * hd[1], Math.sin(tl)];
+    const rr = rt.map((x, i) => Math.cos(rho) * x - Math.sin(rho) * u[i]), uu = rt.map((x, i) => Math.sin(rho) * x + Math.cos(rho) * u[i]);
+    const ring = []; let bad = false;
+    for (const [i, j] of [[-1, 1], [1, 1], [1, -1], [-1, -1]]) { const D = [0, 1, 2].map(k => fl * v[k] + i * w / 2 * rr[k] + j * h / 2 * uu[k]), n = Math.hypot(...D);
+      if (D[2] > -0.1 * n) { bad = true; break; } const t = H / -D[2]; ring.push([t * D[0], t * D[1]]); }   /* a corner less than ~6° below the horizon: no usable outline */
+    if (bad) { skip.horizon++; continue; }
+    let area = 0; for (let k = 0; k < 4; k++) { const p = ring[k], q = ring[(k + 1) % 4]; area += p[0] * q[1] - q[0] * p[1]; } area = Math.abs(area) / 2;
+    const lat = +r.lat_deg, lon = +r.lon_deg, kx = 111320 * Math.cos(lat * rad), ll = ring.map(p => [r6(lon + p[0] / kx), r6(lat + p[1] / 111320)]); ll.push(ll[0]);
+    for (const [x, y] of ll) { bb[0] = Math.min(bb[0], x); bb[1] = Math.min(bb[1], y); bb[2] = Math.max(bb[2], x); bb[3] = Math.max(bb[3], y); }
+    feats.push({ type: "Feature", geometry: { type: "Polygon", coordinates: [ll] }, properties: { image: f.name, time_utc: r.timestamp_utc || null, sensor_type: S.sensorType || null, band: S.band ? S.band.name : null,
+      lat_deg: r6(lat), lon_deg: r6(lon), height_above_ground_m: r2(H), height_source: S.gsdHeightSrc || null, yaw_deg: a.yaw, tilt_from_nadir_deg: a.pitch, roll_deg: a.roll || 0,
+      sensor_mm: [r2(w), r2(h)], focal_mm: r2(fl), gsd_centre_cm: S.pixelPitch ? r2(S.pixelPitch * 1e-4 * H / Math.cos(tl) / (fl * 1e-3)) : null, area_m2: Math.round(area) } }); }
+  const out = { type: "FeatureCollection", name: "openskylab_footprints", features: feats };
+  if (feats.length) out.bbox = bb.map(r6);
+  out.properties = { generator: READER.name + " " + READER.version, assumption: "flat ground at the take-off level; pinhole camera without distortion; camera angles from the gimbal (SfM convention)", images: feats.length, skipped: skip };
+  return JSON.stringify(out) + "\n";
+}
 function odmGeo(F) {
   const lines = ["EPSG:4326"];
   for (const { f, r } of cameraRows(F)) { const z = r.alt_ellipsoid_m, sx = r.sigma_x_m, sy = r.sigma_y_m, sz = r.sigma_z_m, acc = z !== "" && sx !== "" && sy !== "" && sz !== "" && [sx, sy, sz].every(v => v != null);
@@ -935,7 +983,7 @@ function odmGeo(F) {
   return lines.join("\n") + "\n";
 }
 // metadata.json and, beside it, where each value came from (provenance.json); one pass so the two always agree
-const READER = { name: "OpenSkyLab metadata reader", version: "1.4.0", url: "https://openskylab.space/reader" };
+const READER = { name: "OpenSkyLab metadata reader", version: "1.5.0", url: "https://openskylab.space/reader" };
 function metaBuild(F) {
   // slots to fill in: "" for free text, [] for lists; numbers, enumerations and objects are left out until known, so that the draft never carries a value of the wrong type
   const empty = blk => { const o = {}; for (const r of OSL_STD.rows) if (r[0] === blk) { if (/^array/.test(r[7])) o[r[1]] = []; else if (r[7] === "string" && !/ \| /.test(r[6])) o[r[1]] = ""; } return o; };
@@ -961,6 +1009,7 @@ function metaBuild(F) {
   const PR = OSLFlight.procRecord((st.logs || []).filter(l => l.L).map(l => l.L));
   if (PR.length) {
     const SRCS = { p4d: { software: "software/projectVersion", steps: "options: steps switched on and their settings", photogrammetry_settings: "options/initial, cameras/rig", adjustment_quality: "inputs: images (enabled, accuracyXY/Z), gcps; options/ortho/meanResolution", output_crs: "inputs/coordinateSystems/output" },
+      thermotiff: { software: "software (processing_record.json) or dji_api_version (conversion_log.csv)", steps: "the conversion run: parameters, image counts", thermal_settings: "parameters of the conversion (distance, humidity, emissivity, reflection, ambient) and their source", atmospheric_model: "DJI Thermal SDK, the converter ThermoTIFF uses", photogrammetry_settings: "not applicable", adjustment_quality: "not applicable" },
       metashape: { software: "meta Info/LastSavedSoftwareVersion", steps: "meta <Step>/… of the chunk", photogrammetry_settings: "settings accuracy_*, meta AlignCameras, OptimizeCameras", adjustment_quality: "cameras (transform), markers (reference enabled, frame projections), meta OptimizeCameras/sigma0", output_crs: "chunk reference" } };
     out.processing = PR.map((r, i) => { for (const k of Object.keys(r.processing)) fields.push({ path: "processing[" + i + "]." + k, pr: { log: r.log, source: r.log + ": " + (k === "workflow_id" ? "assigned by the reader, one per project" : (SRCS[r.source] || {})[k] || k) } }); return r.processing; });
     const prods = PR.flatMap(r => r.products.map(p => ({ p, log: r.log })));
@@ -1017,14 +1066,14 @@ async function provenanceJSON(F) {
     const im = FS.O.images[f.name];
     for (const x of M.imageLog(f.res)) {
       if (x.column === "aux") continue;
-      const c = cols[x.column] || (cols[x.column] = { image: 0, derived: 0, flight_log: 0, empty: 0, sources: new Set() });
-      if (im && im.cols[x.column]) { c.flight_log++; c.sources.add(im.log); }
+      const c = cols[x.column] || (cols[x.column] = { image: 0, derived: 0, flight_log: 0, flight_log_interpolated: 0, empty: 0, sources: new Set() });
+      if (im && im.cols[x.column]) { c.flight_log++; if (im.cols[x.column].note === "nInterp") c.flight_log_interpolated++; c.sources.add(im.log); }
       else if (x.status === "file") { c.image++; if (x.source) c.sources.add(x.source); }
       else if (x.status === "derived") { c.derived++; if (x.source) c.sources.add(x.source); }
       else c.empty++;
     }
   }
-  const ilCols = Object.fromEntries(Object.entries(cols).map(([k, c]) => [k, Object.assign(Object.fromEntries(["image", "derived", "flight_log", "empty"].filter(n => c[n]).map(n => [n, c[n]])), c.sources.size ? { sources: [...c.sources] } : {})]));
+  const ilCols = Object.fromEntries(Object.entries(cols).map(([k, c]) => [k, Object.assign(Object.fromEntries(["image", "derived", "flight_log", "flight_log_interpolated", "empty"].filter(n => c[n]).map(n => [n, c[n]])), c.sources.size ? { sources: [...c.sources] } : {})]));
   const mj = metadataJSON(F), il = imageLogCSV(F), now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const reads = inputs.map(x => x.read_utc).filter(Boolean).sort();
   const collections = [];
@@ -1038,11 +1087,14 @@ async function provenanceJSON(F) {
       if (!agents.some(a => a.id === id)) agents.push({ id, type: "software", name: sw.name, version: sw.version || "unknown" }); return id; });
     const base = prodIx; prodIx += r.products.length;
     // the loaded images the project lists (by file name); the step used them, not necessarily only them
-    const inProj = new Set(r.images), mine = F.filter(f => inProj.has(f.name.replace(/\.[^.]*$/, "").toLowerCase())), used = mine.length && mine.length === F.length && allImg === "images" ? ["images"] : mine.map(f => imgId.get(f));
+    // ThermoTIFF: the loaded TIFFs are the outputs of the conversion, the R-JPEGs its inputs (same file name, other extension)
+    const outImg = f => r.source === "thermotiff" && /\.tiff?$/i.test(f.name);
+    const inProj = new Set(r.images), mineAll = F.filter(f => inProj.has(f.name.replace(/\.[^.]*$/, "").toLowerCase())), mine = mineAll.filter(f => !outImg(f)), made = mineAll.filter(outImg).map(f => imgId.get(f));
+    const used = mine.length && mine.length === F.length && allImg === "images" ? ["images"] : mine.map(f => imgId.get(f));
     for (const s of r.steps) {
       const gen = r.made.map((o, k) => o === s.order ? "metadata.json#products[" + (base + k) + "]" : null).filter(Boolean);
       const a = { id: "activity:" + r.wf.toLowerCase() + "-" + s.order, type: "processing", order: s.order, name: s.name, agent: swAgents.length === 1 ? swAgents[0] : swAgents, workflow_id: r.wf,
-        used, generated: gen, recorded_in: logId.get(r.log),
+        used, generated: s.order === 1 ? gen.concat(made) : gen, recorded_in: r.logs.length > 1 ? r.logs.map(n => logId.get(n)) : logId.get(r.log),
         parameters: Object.assign({}, s.parameters, s.duration_s != null ? { duration_s: s.duration_s } : {}, s.memory_bytes != null ? { memory_bytes: s.memory_bytes } : {}, s.software_version ? { software_version: s.software_version } : {}) };
       acts.push(a);
     }
@@ -1112,6 +1164,7 @@ function bind() {
     else if (b.id === "x-odm") download("geo.txt", odmGeo(batchFiles()), "text/plain;charset=utf-8");
     else if (b.id === "x-p4d") download("pix4d_geolocation.csv", pix4dCSV(batchFiles()).text, "text/csv;charset=utf-8");
     else if (b.id === "x-gj") download("exposures.geojson", geojson(batchFiles()), "application/geo+json");
+    else if (b.id === "x-fp") download("footprints.geojson", footprintsGeo(batchFiles()), "application/geo+json");
     else if (b.id === "x-rep") download("flight_report.html", reportHTML(), "text/html;charset=utf-8");
     else if (b.id === "x-mj") download("metadata.json", metadataJSON(batchFiles()), "application/json");
     else if (b.id === "x-pv") { b.disabled = true; provenanceJSON(batchFiles()).then(s => download("provenance.json", s, "application/json")).finally(() => { b.disabled = false; }); }

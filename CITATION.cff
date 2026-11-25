@@ -9,8 +9,8 @@ authors:
     given-names: Jan
     orcid: "https://orcid.org/0000-0002-3505-6755"
     affiliation: "Czech University of Life Sciences Prague"
-version: "1.4.0"
-date-released: "2026-11-19"
+version: "1.5.0"
+date-released: "2026-11-25"
 doi: "10.5281/zenodo.24373002"
 identifiers:
   - type: doi
