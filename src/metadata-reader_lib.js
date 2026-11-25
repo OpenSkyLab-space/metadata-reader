@@ -1109,6 +1109,51 @@ function flirFFF(ctx) {
   ctx.info.flirFFF = out;
 }
 
+/* ---------------------------------------------------------------- TIFF LZW (TIFF 6.0 section 13, MSB-first codes, early change) */
+function lzwDecode(d, max) {
+  const out = new Uint8Array(max); let o = 0, bit = 0, w = 9, prev = -1; const nbits = d.length * 8;
+  let tab = []; const reset = () => { tab = []; for (let i = 0; i < 256; i++) tab.push(Uint8Array.of(i)); tab.push(null, null); w = 9; };
+  reset();
+  while (bit + w <= nbits && o < max) {
+    const b0 = bit >> 3, v = ((d[b0] << 16) | ((d[b0 + 1] || 0) << 8) | (d[b0 + 2] || 0)) >>> 0, code = (v >>> (24 - (bit & 7) - w)) & ((1 << w) - 1); bit += w;
+    if (code === 256) { reset(); prev = -1; continue; } if (code === 257) break;
+    let e;
+    if (prev < 0) e = tab[code];
+    else if (code < tab.length) { e = tab[code]; const p = tab[prev], n = new Uint8Array(p.length + 1); n.set(p); n[p.length] = e[0]; tab.push(n); }
+    else { const p = tab[prev]; e = new Uint8Array(p.length + 1); e.set(p); e[p.length] = p[0]; tab.push(e); }
+    if (!e) break;
+    out.set(e.subarray(0, Math.min(e.length, max - o)), o); o += e.length; prev = code;
+    if (tab.length + 1 >= (1 << w) && w < 12) w++;
+  }
+  return out.subarray(0, Math.min(o, max));
+}
+/* statistics of a single-band 16-bit integer or 32-bit float TIFF (thermal images converted to TIFF); strips only, at most 64 Mpx */
+async function bandStats(ctx) {
+  const R = ctx.raster; if (!R || R.tiled || R.samplesPerPixel !== 1 || !R.offsets || !R.offsets.length || !R.complete) return null;
+  const bits = Array.isArray(R.bitsPerSample) ? R.bitsPerSample[0] : R.bitsPerSample, sf = R.sampleFormat;
+  const kind = bits === 16 && sf !== 3 ? (sf === 2 ? "int16" : "uint16") : bits === 32 && sf === 3 ? "float32" : null;
+  if (!kind || !(R.compression === 1 || R.compression === 5 || R.compression === 8 || R.compression === 32946) || !(R.predictor === 1 || (R.predictor === 2 && kind !== "float32"))) return null;
+  const W = R.width, H = R.height, bpp = bits / 8; if (!W || !H || W * H > 64e6) return null;
+  const buf = new Uint8Array(W * H * bpp); let o = 0;
+  for (let k = 0; k < R.offsets.length && o < buf.length; k++) {
+    let d = await ctx.src.read(R.offsets[k], R.byteCounts[k]);
+    if (R.compression === 8 || R.compression === 32946) { d = await inflate(d); if (!d) return null; }
+    else if (R.compression === 5) d = lzwDecode(d, Math.min(buf.length - o, (R.rowsPerStrip || H) * W * bpp));
+    buf.set(d.subarray(0, Math.min(d.length, buf.length - o)), o); o += d.length;
+  }
+  if (o < buf.length) return null;
+  const dv = new DataView(buf.buffer), le = R.littleEndian, n = W * H; let mn = Infinity, mx = -Infinity, sum = 0, nan = 0; const hist = new Array(16).fill(0);
+  let prevRow = 0;
+  for (let i = 0; i < n; i++) {
+    let v = kind === "float32" ? dv.getFloat32(i * 4, le) : kind === "int16" ? dv.getInt16(i * 2, le) : dv.getUint16(i * 2, le);
+    if (R.predictor === 2) { if (i % W) { v = (v + prevRow) & 0xffff; if (kind === "int16" && v > 32767) v -= 65536; dv.setUint16(i * 2, v & 0xffff, le); } prevRow = v & 0xffff; }
+    if (!isFinite(v)) { nan++; continue; }
+    if (v < mn) mn = v; if (v > mx) mx = v; sum += v; if (kind === "uint16") hist[v >> 12]++;
+  }
+  const st = { kind, width: W, height: H, min: mn, max: mx, mean: n - nan ? sum / (n - nan) : null, nan };
+  if (kind === "uint16") { st.hist = hist; const f = a => a.reduce((x, y) => x + y, 0) / n; st.wrap = f(hist.slice(0, 2)) > 0.02 && f(hist.slice(14)) > 0.02 && f(hist.slice(5, 11)) < 0.005; }
+  return st;
+}
 /* ---------------------------------------------------------------- zlib inflate via DecompressionStream */
 async function inflate(b) {
   if (typeof G.DecompressionStream !== "function") return null;
@@ -1887,6 +1932,7 @@ async function parse(input, fileName, opts) {
   if (oldFile) { fg.tags.push(...oldFile.tags); result.groups.splice(result.groups.indexOf(oldFile), 1); }
   result.groups.unshift(fg);
   if (ext && type !== "unknown") { const extType = ({ jpg: "JPEG", jpeg: "JPEG", jpe: "JPEG", tif: "TIFF", tiff: "TIFF", png: "PNG", webp: "WEBP", heic: "HEIC", heif: "HEIF", avif: "AVIF", mp4: "MP4", mov: "MOV", dng: "DNG", cr2: "CR2", cr3: "CR3" })[ext]; if (extType && extType !== type && !(extType === "TIFF" && /DNG|BigTIFF|NEF|ARW/.test(type)) && !(extType === "HEIC" && type === "HEIF") && !(extType === "MP4" && type === "MOV") && !(extType === "MOV" && type === "MP4")) result.warnings.push({ code: "ext-mismatch", text: "extension ." + ext + " but content is " + type, offset: 0 }); }
+  if (/^(TIFF|BigTIFF)$/.test(type)) { try { const st = await bandStats(ctx); if (st) ctx.info.band = st; } catch (e) { /* pixel statistics are optional */ } }
   try { derive(result, opts, ctx.pendingComposite); } catch (e) { result.warnings.push({ code: "derive", text: e.message, offset: null }); }
   return result;
 }
@@ -2143,7 +2189,29 @@ function derive(result, opts, pending) {
     S.thermal.params = null; /* the TIFF holds the parameters used in the conversion, not those set at capture */
     D("TemperatureTIFF", "ThermoTIFF", "degrees Celsius, float32; ThermoTIFF " + (S.thermal.thermotiff.version || "?") + ", DJI Thermal SDK API " + (S.thermal.thermotiff.sdk_api || "?"), ["EXIF:IFD0:Software", "EXIF:IFD0:ImageDescription"]);
   }
-  if (S.thermal && S.thermal.kind !== "ThermoTIFF") D("RadiometricJPEG", S.thermal.kind, S.thermal.kind + (S.thermal.params ? " (measurement parameters read; temperatures not computed)" : " (temperatures not computed; use the vendor SDK)"), ["JPEG APP segments"]);
+  /* thermal TIFFs from converters that do not name themselves (checked: DJI Image Processor 1.7.5 by Miro Rava, float32 LZW; ThermoConverter 1.8 by VantageUAV,
+     uint16 Deflate). Both copy Software (camera firmware) and ImageDescription (palette name) from the R-JPEG, and store no measurement parameters. */
+  const band = info.band, dSrc = String(V("ImageSource", DJI) || "");
+  if (!S.thermal && band && /^(TIFF|BigTIFF)$/.test(result.file.type) && /^DJI/i.test(S.make) && (/infrared/i.test(dSrc) || /^(WhiteHot|BlackHot|Arctic|Ironbow\d?|Fulgurite|Hotiron|HotIron|Medical|Rainbow\d?|Tint|GreenHot|RedHot|Lava|Rain)$/i.test(desc0.trim()) || /_T(_tiff)?\.tiff?$/i.test(result.file.name))) {
+    const r2_ = x => x == null ? "?" : num(rnd(x, 2)), rng = r2_(band.min) + " … " + r2_(band.max) + (band.mean != null ? " (mean " + r2_(band.mean) + ")" : "");
+    const cel = band.kind === "float32" && band.min > -100 && band.max < 2000, copied = /^\d+(\.\d+){2,}$/.test(String(sw0).trim()) ? " Software (" + sw0 + ") and ImageDescription are copied from the camera." : "";
+    if (band.kind === "float32") {
+      S.thermal = { kind: "temperature TIFF (converter not named)", encoding: "TIFF float32, one band, values " + rng + (cel ? ", in the range of degrees Celsius" : ", unit not stated") + "; converted from a DJI R-JPEG by a program that does not name itself." + copied + " The measurement parameters used are not stored.", encodingSrc: "EXIF:IFD0 BitsPerSample, SampleFormat; pixel values", params: null, checks: [], band };
+      D("TemperatureTIFF", "float32", "float32, " + rng + (cel ? " (degrees Celsius, probably)" : "") + "; converter and its parameters not stated", ["EXIF:IFD0:SampleFormat", "pixel values"]);
+    } else {
+      S.thermal = { kind: "thermal TIFF, 16-bit (scale not stated)", encoding: "TIFF " + band.kind + ", one band, values " + rng + "; the scale from values to temperature is not stored." + copied + " ThermoConverter (VantageUAV) writes (T − minimum temperature) × factor, both set in the app; with its −50 °C and 1000 per °C the values wrap above 15.535 °C.", encodingSrc: "EXIF:IFD0 BitsPerSample; pixel values", params: null, checks: [], band };
+      D("ThermalTIFF16", band.kind, band.kind + ", " + rng + "; scale to temperature not stated" + (band.wrap ? "; values probably wrapped (overflow)" : ""), ["EXIF:IFD0:BitsPerSample", "pixel values"]);
+      if (band.wrap) result.warnings.push({ code: "thermal-wrap", text: "16-bit thermal values sit at both ends of the range with the middle empty: the converter probably overflowed (values above the top of its scale start again from 0); these are not usable as temperatures", offset: null });
+    }
+    const lost = ["UTCAtExposure", "ImageSource", "AltitudeType", "RtkFlag", "LRFStatus"].filter(k => V(k, DJI) == null);
+    if (lost.length && (V("GpsLatitude", DJI) != null || V("GPSLatitude", DJI) != null)) D("ConversionLostXMP", lost.length, "XMP drone-dji without " + lost.join(", ") + " (dropped by the converter)", ["XMP:drone-dji"]);
+  }
+  if (band && !S.thermal && band.kind) D("BandStatistics", band.kind, band.kind + ", min " + num(rnd(band.min, 3)) + ", max " + num(rnd(band.max, 3)) + (band.mean != null ? ", mean " + num(rnd(band.mean, 3)) : ""), ["pixel values"]);
+  else if (band && S.thermal && S.thermal.kind === "ThermoTIFF") { S.thermal.band = band; D("TemperatureRange", [band.min, band.max], num(rnd(band.min, 2)) + " … " + num(rnd(band.max, 2)) + " °C" + (band.mean != null ? " (mean " + num(rnd(band.mean, 2)) + ")" : ""), ["pixel values"]); }
+  /* EXIF tags written into the GPS IFD (ThermoConverter): CreateDate, FocalLength, BodySerialNumber and others with IDs outside the GPS table */
+  { const g = result.groups.find(x => x.id === "EXIF:GPS"), odd = g ? g.tags.filter(t => /^Tag 0x([89a-f][0-9a-f]{3})$/i.test(t.name)) : [];
+    if (odd.length) result.warnings.push({ code: "gps-ifd", text: "EXIF tags in the GPS IFD (" + odd.map(t => t.name.replace("Tag ", "")).join(", ") + "): the writing program put Exif tags there; readers that expect GPS tags ignore them", offset: null }); }
+  if (S.thermal && S.thermal.kind !== "ThermoTIFF" && !S.thermal.band) D("RadiometricJPEG", S.thermal.kind, S.thermal.kind + (S.thermal.params ? " (measurement parameters read; temperatures not computed)" : " (temperatures not computed; use the vendor SDK)"), ["JPEG APP segments"]);
   /* laser rangefinder (DJI XMP): status Normal with distance 0 = no measurement */
   const lrfS = V("LRFStatus", DJI), lrfD = toNum(V("LRFTargetDistance", DJI));
   if (lrfS != null || isNum(lrfD)) {

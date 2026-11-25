@@ -2,7 +2,7 @@
 // All files are built here from scratch: the structure follows the vendors, every value is synthetic.
 // Usage: node test/field_regressions_test.js
 "use strict";
-const path = require("path");
+const path = require("path"), zlib = require("zlib");
 const M = require(path.join(__dirname, "..", "src", "metadata-reader_lib.js"));
 
 /* ---- minimal JPEG / TIFF builders (little-endian TIFF, ASCII and SHORT/LONG/RATIONAL tags) */
@@ -128,6 +128,23 @@ function djiMpfGapJpeg() {
   const end = head.length + mpfSeg(0, 0).length + tail.length, len1 = end + gap.length;
   return Buffer.concat([head, mpfSeg(len1, len1 - base), tail, gap, preview]);
 }
+/* single-band thermal TIFF with pixel data (converters that do not name themselves; values synthetic): 64 x 64, one strip at the end of the file */
+function lzwLiteral(bytes) { // valid TIFF LZW of literal codes only, Clear every 200 codes so that codes stay 9 bits wide
+  const codes = [256]; bytes.forEach((x, i) => { if (i && i % 200 === 0) codes.push(256); codes.push(x); }); codes.push(257);
+  const out = Buffer.alloc(Math.ceil(codes.length * 9 / 8) + 2); let bit = 0;
+  for (const c of codes) { for (let k = 8; k >= 0; k--) { if ((c >> k) & 1) out[bit >> 3] |= 0x80 >> (bit & 7); bit++; } }
+  return out;
+}
+function thermalTiff(kind, pixels, opts) {
+  const W = 64, H = 64, bits = kind === "float32" ? 32 : 16, raw = Buffer.alloc(W * H * bits / 8);
+  for (let i = 0; i < W * H; i++) { if (kind === "float32") raw.writeFloatLE(pixels(i), i * 4); else raw.writeUInt16LE(pixels(i), i * 2); }
+  const data = opts.comp === 8 ? zlib.deflateSync(raw) : opts.comp === 5 ? lzwLiteral(raw) : raw;
+  const ifd = off => [[0x100, 3, [W]], [0x101, 3, [H]], [0x102, 3, [bits]], [0x103, 3, [opts.comp]], [0x106, 3, [1]], [0x10e, 2, "Arctic"], [0x10f, 2, "DJI"], [0x110, 2, "ExampleT"],
+    [0x111, 4, [off]], [0x115, 3, [1]], [0x116, 3, [H]], [0x117, 4, [data.length]], [0x131, 2, "11.06.01.10"]].concat(kind === "float32" ? [[0x153, 3, [3]]] : []);
+  const gps = opts.gpsOdd ? gpsBlock(50, 14, 300).concat([[0x9004, 2, "2030:06:01 12:00:00"]]) : gpsBlock(50, 14, 300);
+  const len = tiffBlock(ifd(0), [dto("2030:06:01 12:00:00")], gps).length;
+  return Buffer.concat([tiffBlock(ifd(len), [dto("2030:06:01 12:00:00")], gps), data]);
+}
 const CASES = [
   ["dls2_irradiance.tif", () => tiffBlock([[0x10f, 2, "MicaSense"], [0x110, 2, "RedEdge-P"]], [dto("2030:06:01 10:00:00")], null,
     { xmp: xmpPacket({ Camera: CAMNS, DLS: DLSNS }, { "Camera:BandName": "Blue", "Camera:CentralWavelength": "475", "Camera:Irradiance": "50.5", "DLS:HorizontalIrradiance": "48.0", "DLS:SpectralIrradiance": "50.5" }) }),
@@ -181,6 +198,14 @@ const CASES = [
       && r.structure.some(x => x.segment === "zero padding before MPF image" && x.length === 37) && r.structure.some(x => /^MPF image 2/.test(x.segment))],
   ["dji_mpf_gap.jpg", djiMpfGapJpeg,
     r => !r.warnings.some(w => w.code === "trailer") && r.structure.some(x => x.segment === "data after EOI within MPF image 1" && x.length === 51) && r.structure.some(x => /^MPF image 2/.test(x.segment))],
+  ["thermal_uint16_wrapped_T_tiff.TIFF", () => thermalTiff("uint16", i => i % 2 ? 2000 + (i % 4000) : 62000 + (i % 3000), { comp: 8, gpsOdd: true }),
+    r => r.summary.sensorType === "thermal_LWIR" && /16-bit \(scale not stated\)/.test(r.summary.thermal.kind) && r.summary.thermal.band.wrap === true
+      && r.warnings.some(w => w.code === "thermal-wrap") && r.warnings.some(w => w.code === "gps-ifd" && /0x9004/.test(w.text))],
+  ["thermal_uint16_plain_T.tif", () => thermalTiff("uint16", i => 29000 + (i % 3000), { comp: 1 }),
+    r => r.summary.thermal && r.summary.thermal.band.wrap === false && r.summary.thermal.band.min === 29000 && !r.warnings.some(w => w.code === "thermal-wrap" || w.code === "gps-ifd")],
+  ["thermal_float_lzw_T.tiff", () => thermalTiff("float32", i => 10 + (i % 300) / 10, { comp: 5 }),
+    r => r.summary.thermal && r.summary.thermal.kind === "temperature TIFF (converter not named)" && Math.abs(r.summary.thermal.band.max - 39.9) < 1e-4 && r.summary.thermal.band.min === 10
+      && /degrees Celsius/.test(r.summary.thermal.encoding) && /copied from the camera/.test(r.summary.thermal.encoding)],
   ["gps_whole_seconds.tif", () => tiffBlock([[0x10f, 2, "MicaSense"], [0x110, 2, "RedEdge-P"]], [dto("2030:06:01 12:00:00"), [0x9291, 2, "408"]],
     gpsBlock(50, 14, 400).concat([[7, 5, [[11, 1], [0, 1], [0, 1]]], [29, 2, "2030:06:01"]])),
     r => r.summary.tz === 60 && r.summary.clockOffset === 0 && r.summary.utc === "2030-06-01T11:00:00.000Z"],

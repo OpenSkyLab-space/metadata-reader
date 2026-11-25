@@ -1483,6 +1483,51 @@ function flirFFF(ctx) {
   ctx.info.flirFFF = out;
 }
 
+/* ---------------------------------------------------------------- TIFF LZW (TIFF 6.0 section 13, MSB-first codes, early change) */
+function lzwDecode(d, max) {
+  const out = new Uint8Array(max); let o = 0, bit = 0, w = 9, prev = -1; const nbits = d.length * 8;
+  let tab = []; const reset = () => { tab = []; for (let i = 0; i < 256; i++) tab.push(Uint8Array.of(i)); tab.push(null, null); w = 9; };
+  reset();
+  while (bit + w <= nbits && o < max) {
+    const b0 = bit >> 3, v = ((d[b0] << 16) | ((d[b0 + 1] || 0) << 8) | (d[b0 + 2] || 0)) >>> 0, code = (v >>> (24 - (bit & 7) - w)) & ((1 << w) - 1); bit += w;
+    if (code === 256) { reset(); prev = -1; continue; } if (code === 257) break;
+    let e;
+    if (prev < 0) e = tab[code];
+    else if (code < tab.length) { e = tab[code]; const p = tab[prev], n = new Uint8Array(p.length + 1); n.set(p); n[p.length] = e[0]; tab.push(n); }
+    else { const p = tab[prev]; e = new Uint8Array(p.length + 1); e.set(p); e[p.length] = p[0]; tab.push(e); }
+    if (!e) break;
+    out.set(e.subarray(0, Math.min(e.length, max - o)), o); o += e.length; prev = code;
+    if (tab.length + 1 >= (1 << w) && w < 12) w++;
+  }
+  return out.subarray(0, Math.min(o, max));
+}
+/* statistics of a single-band 16-bit integer or 32-bit float TIFF (thermal images converted to TIFF); strips only, at most 64 Mpx */
+async function bandStats(ctx) {
+  const R = ctx.raster; if (!R || R.tiled || R.samplesPerPixel !== 1 || !R.offsets || !R.offsets.length || !R.complete) return null;
+  const bits = Array.isArray(R.bitsPerSample) ? R.bitsPerSample[0] : R.bitsPerSample, sf = R.sampleFormat;
+  const kind = bits === 16 && sf !== 3 ? (sf === 2 ? "int16" : "uint16") : bits === 32 && sf === 3 ? "float32" : null;
+  if (!kind || !(R.compression === 1 || R.compression === 5 || R.compression === 8 || R.compression === 32946) || !(R.predictor === 1 || (R.predictor === 2 && kind !== "float32"))) return null;
+  const W = R.width, H = R.height, bpp = bits / 8; if (!W || !H || W * H > 64e6) return null;
+  const buf = new Uint8Array(W * H * bpp); let o = 0;
+  for (let k = 0; k < R.offsets.length && o < buf.length; k++) {
+    let d = await ctx.src.read(R.offsets[k], R.byteCounts[k]);
+    if (R.compression === 8 || R.compression === 32946) { d = await inflate(d); if (!d) return null; }
+    else if (R.compression === 5) d = lzwDecode(d, Math.min(buf.length - o, (R.rowsPerStrip || H) * W * bpp));
+    buf.set(d.subarray(0, Math.min(d.length, buf.length - o)), o); o += d.length;
+  }
+  if (o < buf.length) return null;
+  const dv = new DataView(buf.buffer), le = R.littleEndian, n = W * H; let mn = Infinity, mx = -Infinity, sum = 0, nan = 0; const hist = new Array(16).fill(0);
+  let prevRow = 0;
+  for (let i = 0; i < n; i++) {
+    let v = kind === "float32" ? dv.getFloat32(i * 4, le) : kind === "int16" ? dv.getInt16(i * 2, le) : dv.getUint16(i * 2, le);
+    if (R.predictor === 2) { if (i % W) { v = (v + prevRow) & 0xffff; if (kind === "int16" && v > 32767) v -= 65536; dv.setUint16(i * 2, v & 0xffff, le); } prevRow = v & 0xffff; }
+    if (!isFinite(v)) { nan++; continue; }
+    if (v < mn) mn = v; if (v > mx) mx = v; sum += v; if (kind === "uint16") hist[v >> 12]++;
+  }
+  const st = { kind, width: W, height: H, min: mn, max: mx, mean: n - nan ? sum / (n - nan) : null, nan };
+  if (kind === "uint16") { st.hist = hist; const f = a => a.reduce((x, y) => x + y, 0) / n; st.wrap = f(hist.slice(0, 2)) > 0.02 && f(hist.slice(14)) > 0.02 && f(hist.slice(5, 11)) < 0.005; }
+  return st;
+}
 /* ---------------------------------------------------------------- zlib inflate via DecompressionStream */
 async function inflate(b) {
   if (typeof G.DecompressionStream !== "function") return null;
@@ -2261,6 +2306,7 @@ async function parse(input, fileName, opts) {
   if (oldFile) { fg.tags.push(...oldFile.tags); result.groups.splice(result.groups.indexOf(oldFile), 1); }
   result.groups.unshift(fg);
   if (ext && type !== "unknown") { const extType = ({ jpg: "JPEG", jpeg: "JPEG", jpe: "JPEG", tif: "TIFF", tiff: "TIFF", png: "PNG", webp: "WEBP", heic: "HEIC", heif: "HEIF", avif: "AVIF", mp4: "MP4", mov: "MOV", dng: "DNG", cr2: "CR2", cr3: "CR3" })[ext]; if (extType && extType !== type && !(extType === "TIFF" && /DNG|BigTIFF|NEF|ARW/.test(type)) && !(extType === "HEIC" && type === "HEIF") && !(extType === "MP4" && type === "MOV") && !(extType === "MOV" && type === "MP4")) result.warnings.push({ code: "ext-mismatch", text: "extension ." + ext + " but content is " + type, offset: 0 }); }
+  if (/^(TIFF|BigTIFF)$/.test(type)) { try { const st = await bandStats(ctx); if (st) ctx.info.band = st; } catch (e) { /* pixel statistics are optional */ } }
   try { derive(result, opts, ctx.pendingComposite); } catch (e) { result.warnings.push({ code: "derive", text: e.message, offset: null }); }
   return result;
 }
@@ -2517,7 +2563,29 @@ function derive(result, opts, pending) {
     S.thermal.params = null; /* the TIFF holds the parameters used in the conversion, not those set at capture */
     D("TemperatureTIFF", "ThermoTIFF", "degrees Celsius, float32; ThermoTIFF " + (S.thermal.thermotiff.version || "?") + ", DJI Thermal SDK API " + (S.thermal.thermotiff.sdk_api || "?"), ["EXIF:IFD0:Software", "EXIF:IFD0:ImageDescription"]);
   }
-  if (S.thermal && S.thermal.kind !== "ThermoTIFF") D("RadiometricJPEG", S.thermal.kind, S.thermal.kind + (S.thermal.params ? " (measurement parameters read; temperatures not computed)" : " (temperatures not computed; use the vendor SDK)"), ["JPEG APP segments"]);
+  /* thermal TIFFs from converters that do not name themselves (checked: DJI Image Processor 1.7.5 by Miro Rava, float32 LZW; ThermoConverter 1.8 by VantageUAV,
+     uint16 Deflate). Both copy Software (camera firmware) and ImageDescription (palette name) from the R-JPEG, and store no measurement parameters. */
+  const band = info.band, dSrc = String(V("ImageSource", DJI) || "");
+  if (!S.thermal && band && /^(TIFF|BigTIFF)$/.test(result.file.type) && /^DJI/i.test(S.make) && (/infrared/i.test(dSrc) || /^(WhiteHot|BlackHot|Arctic|Ironbow\d?|Fulgurite|Hotiron|HotIron|Medical|Rainbow\d?|Tint|GreenHot|RedHot|Lava|Rain)$/i.test(desc0.trim()) || /_T(_tiff)?\.tiff?$/i.test(result.file.name))) {
+    const r2_ = x => x == null ? "?" : num(rnd(x, 2)), rng = r2_(band.min) + " … " + r2_(band.max) + (band.mean != null ? " (mean " + r2_(band.mean) + ")" : "");
+    const cel = band.kind === "float32" && band.min > -100 && band.max < 2000, copied = /^\d+(\.\d+){2,}$/.test(String(sw0).trim()) ? " Software (" + sw0 + ") and ImageDescription are copied from the camera." : "";
+    if (band.kind === "float32") {
+      S.thermal = { kind: "temperature TIFF (converter not named)", encoding: "TIFF float32, one band, values " + rng + (cel ? ", in the range of degrees Celsius" : ", unit not stated") + "; converted from a DJI R-JPEG by a program that does not name itself." + copied + " The measurement parameters used are not stored.", encodingSrc: "EXIF:IFD0 BitsPerSample, SampleFormat; pixel values", params: null, checks: [], band };
+      D("TemperatureTIFF", "float32", "float32, " + rng + (cel ? " (degrees Celsius, probably)" : "") + "; converter and its parameters not stated", ["EXIF:IFD0:SampleFormat", "pixel values"]);
+    } else {
+      S.thermal = { kind: "thermal TIFF, 16-bit (scale not stated)", encoding: "TIFF " + band.kind + ", one band, values " + rng + "; the scale from values to temperature is not stored." + copied + " ThermoConverter (VantageUAV) writes (T − minimum temperature) × factor, both set in the app; with its −50 °C and 1000 per °C the values wrap above 15.535 °C.", encodingSrc: "EXIF:IFD0 BitsPerSample; pixel values", params: null, checks: [], band };
+      D("ThermalTIFF16", band.kind, band.kind + ", " + rng + "; scale to temperature not stated" + (band.wrap ? "; values probably wrapped (overflow)" : ""), ["EXIF:IFD0:BitsPerSample", "pixel values"]);
+      if (band.wrap) result.warnings.push({ code: "thermal-wrap", text: "16-bit thermal values sit at both ends of the range with the middle empty: the converter probably overflowed (values above the top of its scale start again from 0); these are not usable as temperatures", offset: null });
+    }
+    const lost = ["UTCAtExposure", "ImageSource", "AltitudeType", "RtkFlag", "LRFStatus"].filter(k => V(k, DJI) == null);
+    if (lost.length && (V("GpsLatitude", DJI) != null || V("GPSLatitude", DJI) != null)) D("ConversionLostXMP", lost.length, "XMP drone-dji without " + lost.join(", ") + " (dropped by the converter)", ["XMP:drone-dji"]);
+  }
+  if (band && !S.thermal && band.kind) D("BandStatistics", band.kind, band.kind + ", min " + num(rnd(band.min, 3)) + ", max " + num(rnd(band.max, 3)) + (band.mean != null ? ", mean " + num(rnd(band.mean, 3)) : ""), ["pixel values"]);
+  else if (band && S.thermal && S.thermal.kind === "ThermoTIFF") { S.thermal.band = band; D("TemperatureRange", [band.min, band.max], num(rnd(band.min, 2)) + " … " + num(rnd(band.max, 2)) + " °C" + (band.mean != null ? " (mean " + num(rnd(band.mean, 2)) + ")" : ""), ["pixel values"]); }
+  /* EXIF tags written into the GPS IFD (ThermoConverter): CreateDate, FocalLength, BodySerialNumber and others with IDs outside the GPS table */
+  { const g = result.groups.find(x => x.id === "EXIF:GPS"), odd = g ? g.tags.filter(t => /^Tag 0x([89a-f][0-9a-f]{3})$/i.test(t.name)) : [];
+    if (odd.length) result.warnings.push({ code: "gps-ifd", text: "EXIF tags in the GPS IFD (" + odd.map(t => t.name.replace("Tag ", "")).join(", ") + "): the writing program put Exif tags there; readers that expect GPS tags ignore them", offset: null }); }
+  if (S.thermal && S.thermal.kind !== "ThermoTIFF" && !S.thermal.band) D("RadiometricJPEG", S.thermal.kind, S.thermal.kind + (S.thermal.params ? " (measurement parameters read; temperatures not computed)" : " (temperatures not computed; use the vendor SDK)"), ["JPEG APP segments"]);
   /* laser rangefinder (DJI XMP): status Normal with distance 0 = no measurement */
   const lrfS = V("LRFStatus", DJI), lrfD = toNum(V("LRFTargetDistance", DJI));
   if (lrfS != null || isNum(lrfD)) {
@@ -5197,7 +5265,11 @@ cs: {
   rtkMean_int: "Celočíselné řešení nižší kvality (L1 nebo wide-lane, centimetry až decimetry): horší než fixní řešení. Souřadnice snímku zpracujte s nižší vahou a použijte vlícovací body.",
   rtkMean_float: "Plovoucí řešení (decimetry až metr): souřadnice snímku zpracujte s nižší vahou nebo let opakujte; vlícovací body jsou potřeba.",
   rtkMean_single: "Samostatné GNSS (metry): pro přesné mapování potřebujete vlícovací body.", rtkMean_none: "Bez řešení polohy: souřadnice snímku nelze použít.", rtkMean_rtk: "GpsStatus hlásí RTK, ale soubor neuvádí, zda šlo o fixní řešení. Ověřte v letovém záznamu.", rtkMean_other: "Neznámý příznak; ověřte v dokumentaci výrobce.",
-  cThermal: "Termální data", kKind: "Druh", thermalNote: "Soubor je radiometrický JPEG. Teploty jsou zakódované v segmentech APP výrobce a čtečka je nepřevádí; použijte <a href=\"https://www.dji.com/downloads/softwares/dji-thermal-sdk\" target=\"_blank\" rel=\"noopener\">DJI Thermal SDK</a> s emisivitou, vzdáleností a vlhkostí odpovídající měření.",
+  cThermal: "Termální data", kKind: "Druh", kValues: "Hodnoty pixelů", kMean: "průměr",
+  thermalNoteTt: "Soubor obsahuje teploty ve °C převedené programem ThermoTIFF přes DJI Thermal SDK. Parametry převodu jsou v popisu souboru a v conversion_log.csv.",
+  thermalNoteConv: "Soubor obsahuje teploty (float32, rozsah odpovídá °C) převedené z R-JPEG programem, který se v souboru neuvádí: Software a ImageDescription jsou zkopírované z kamery. Parametry převodu (emisivita, vzdálenost, vlhkost, odražená teplota) v souboru nejsou; zapište je do metadat zpracování ručně, nebo převádějte programem, který je ukládá (ThermoTIFF).",
+  thermalNote16: "16bitový termální TIFF bez uvedeného měřítka: převod hodnot na teplotu soubor neuvádí. ThermoConverter (VantageUAV) ukládá (T − minimální teplota) × faktor, obojí podle nastavení aplikace.",
+  thermalNoteWrap: "Hodnoty jsou na obou koncích rozsahu a střed je prázdný: převodník přetekl (nad horní mezí své škály začal znovu od 0). Jako teploty jsou nepoužitelné. ThermoConverter s nastavením −50 °C a 1000 na °C přeteče nad 15,535 °C.", thermalNote: "Soubor je radiometrický JPEG. Teploty jsou zakódované v segmentech APP výrobce a čtečka je nepřevádí; použijte <a href=\"https://www.dji.com/downloads/softwares/dji-thermal-sdk\" target=\"_blank\" rel=\"noopener\">DJI Thermal SDK</a> s emisivitou, vzdáleností a vlhkostí odpovídající měření.",
   cRad: "Radiometrie", kBand: "Pásmo", kWl: "Vlnová délka", kIrr: "Ozáření z čidla (DLS)", unitUnknown: "(jednotka neuvedena)", irrRaw: v => "v souboru " + v, kGain: "Zesílení snímače", kBlack: "Úroveň černé", kVig: "Vinětace (koeficienty)", kDlsAtt: "Náklon čidla DLS (klonění / klopení / kurz)",
   irrDjiNote: "DJI uvádí Irradiance jako hodnotu slunečního čidla po vlastní kompenzaci, bez jednotky. Do irradiance_dls ji zapište s poznámkou, nebo ji převeďte podle postupu výrobce.",
   irrMsNote: "Camera:Irradiance je ve W·m⁻²·nm⁻¹; pro specifikaci OpenSkyLab je převedeno na µW·cm⁻²·nm⁻¹ (× 100).",
@@ -5233,7 +5305,7 @@ cs: {
     nWx: "model Open-Meteo pro buňku sítě, ne měření na místě; vlastní záznam má přednost",
     nGnssMode: "RTK podle RtkFlag; PPK se ze snímku poznat nedá", nSun: "NOAA, z času UTC a polohy snímku", nDist: "≈ RelativeAltitude pro kolmý snímek nad rovinou", nAmb: "Exif 2.31: AmbientTemperature, Humidity, Pressure",
     nBbox: "Západ, jih, východ, sever ve WGS 84", nInterval: "Interval ISO 8601 v UTC", nProdGsd: "Velikost pixelu ortofota v cm", nSha: "Kontrolní součet tohoto souboru", nSoftware: "Software z EXIF; verzi doplňte",
-    nNotMs: "Senzor není multispektrální", nNotTh: "Senzor není termální", nNotEnv: "Modul prostředí a reference se vyžaduje u multispektrálních a termálních dat", nOblique: "Šikmé snímky: odklon gimbalu od nadiru větší než 15° aspoň u jednoho snímku; v závorce největší odklon (°)", nExpMode: "EXIF ExposureMode: 1 (ruční) = fixed, jinak auto", nApp4: "Parametry měření v souboru nejsou, nebo jejich uložení čtečka nezná (DJI APP4: ThermalParams2 a 3 čte, ThermalParams ze ZH20T jen zobrazí, škála není popsaná)", nCamSet: "Nastavení kamery při snímání, ne měření: okolní teplota a vlhkost se proto nepřebírají do environment.*. Teplotu z nich počítá SDK výrobce", nEmisCam: "Emisivita nastavená v kameře. Pokud referenční přístroj počítal s jinou, zapište jeho hodnotu", nFpaDji: "DJI R-JPEG (např. M3T) teplotu kamery ani senzoru nezapisuje; v souboru jsou jen parametry měření. Hodnotu nelze doplnit ze snímku", nFpaXmp: "XMP Camera:SensorTemperature (Pix4D), °C", nEnc: "Odvozeno ze struktury souboru: kde jsou surové hodnoty a čím se převádějí na teplotu", nEncTt: "TIFF z ThermoTIFF: teploty ve °C už spočítané DJI Thermal SDK", nPlanck: "FLIR: T = B / ln(R1 / (R2 · (S + O)) + F); jiný tvar než K1, K2 ve specifikaci, význam stejný", nSpecRange: "CentralWavelength ± FWHM/2 (XMP Camera, nm → µm); nominální pásmo, ne změřená spektrální odezva", nTtSet: "Parametry, se kterými ThermoTIFF převedl snímek (ImageDescription). Zda jsou z kamery, nebo zadané uživatelem, TIFF neříká: viz conversion_log.csv nebo záznam zpracování", nTtAtm: "Korekci počítá DJI Thermal SDK; postup DJI nezveřejňuje", nTtCap: "TIFF z ThermoTIFF parametry nastavené v kameře nenese (jsou v APP4 původního R-JPEG). Parametry převodu jsou v processing.thermal_settings", nTtSw: "Software a ImageDescription v TIFF", nLrf: "Laserový dálkoměr (DJI LRFTargetDistance), stav Normal", nDistNoLrf: "≈ RelativeAltitude pro kolmý snímek nad rovinou; laserový dálkoměr neměřil (vzdálenost 0)",
+    nNotMs: "Senzor není multispektrální", nNotTh: "Senzor není termální", nNotEnv: "Modul prostředí a reference se vyžaduje u multispektrálních a termálních dat", nOblique: "Šikmé snímky: odklon gimbalu od nadiru větší než 15° aspoň u jednoho snímku; v závorce největší odklon (°)", nExpMode: "EXIF ExposureMode: 1 (ruční) = fixed, jinak auto", nApp4: "Parametry měření v souboru nejsou, nebo jejich uložení čtečka nezná (DJI APP4: ThermalParams2 a 3 čte, ThermalParams ze ZH20T jen zobrazí, škála není popsaná)", nCamSet: "Nastavení kamery při snímání, ne měření: okolní teplota a vlhkost se proto nepřebírají do environment.*. Teplotu z nich počítá SDK výrobce", nEmisCam: "Emisivita nastavená v kameře. Pokud referenční přístroj počítal s jinou, zapište jeho hodnotu", nFpaDji: "DJI R-JPEG (např. M3T) teplotu kamery ani senzoru nezapisuje; v souboru jsou jen parametry měření. Hodnotu nelze doplnit ze snímku", nFpaXmp: "XMP Camera:SensorTemperature (Pix4D), °C", nEnc: "Odvozeno ze struktury souboru: kde jsou surové hodnoty a čím se převádějí na teplotu", nEncTt: "TIFF z ThermoTIFF: teploty ve °C už spočítané DJI Thermal SDK", nPlanck: "FLIR: T = B / ln(R1 / (R2 · (S + O)) + F); jiný tvar než K1, K2 ve specifikaci, význam stejný", nSpecRange: "CentralWavelength ± FWHM/2 (XMP Camera, nm → µm); nominální pásmo, ne změřená spektrální odezva", nTtSet: "Parametry, se kterými ThermoTIFF převedl snímek (ImageDescription). Zda jsou z kamery, nebo zadané uživatelem, TIFF neříká: viz conversion_log.csv nebo záznam zpracování", nTtAtm: "Korekci počítá DJI Thermal SDK; postup DJI nezveřejňuje", nConvCap: "Převodník parametry nastavené v kameře (APP4 původního R-JPEG) nezachoval a své parametry převodu neuložil; vezměte je z R-JPEG a z nastavení převodu", nTtCap: "TIFF z ThermoTIFF parametry nastavené v kameře nenese (jsou v APP4 původního R-JPEG). Parametry převodu jsou v processing.thermal_settings", nTtSw: "Software a ImageDescription v TIFF", nLrf: "Laserový dálkoměr (DJI LRFTargetDistance), stav Normal", nDistNoLrf: "≈ RelativeAltitude pro kolmý snímek nad rovinou; laserový dálkoměr neměřil (vzdálenost 0)",
     "il_manual": "Zadá uživatel (identifikátor v datové sadě)", "il_no-tz": "Místní čas bez časového pásma: UTC doplňte z letového záznamu", "il_check-datum": "DJI AbsoluteAltitude: podle modelu elipsoidická nebo nadmořská výška, ověřte pro svůj dron",
     "il_sea-level": "Exif 3.0 Ref 2/3: výška vůči hladině moře, ne elipsoidu", "il_gps-alt": "EXIF GPSAltitude: oficiálně nad mořem, mnoho dronů ale zapisuje elipsoidickou výšku", "il_rel-takeoff": "Výška nad místem vzletu",
     "il_rtk-unknown": "GpsStatus = RTK bez rozlišení fixed/float", "il_rtk-int": "RtkFlag 48–49: celočíselné řešení nižší kvality (hodnota int)", "il_clock-suspect": "Hodiny kamery zřejmě nebyly nastavené: čas vezměte z letového záznamu", "il_ellipsoid-sensefly": "senseFly: GPSAltitude je výška nad elipsoidem, i když Ref uvádí hladinu moře (ověřeno proti geoinfo a KML z eMotion)", "il_invalid": "Senzor uvádí neplatnou hodnotu", "il_log": "Doplňte z letového záznamu", "il_sigma-axes": "Osa x = východ (RtkStdLon), y = sever (RtkStdLat); specifikace osy výslovně nedefinuje",
@@ -5373,7 +5445,11 @@ en: {
   rtkMean_int: "Lower-grade integer solution (L1 or wide-lane, centimetres to decimetres): weaker than a fixed solution. Give the image positions lower weight and use ground control points.",
   rtkMean_float: "Float solution (decimetres to a metre): give the image positions lower weight or repeat the flight; ground control points are needed.",
   rtkMean_single: "Standalone GNSS (metres): accurate mapping needs ground control points.", rtkMean_none: "No position solution: the image coordinates are unusable.", rtkMean_rtk: "GpsStatus reports RTK but the file does not say whether the solution was fixed. Check the flight log.", rtkMean_other: "Unknown flag; check the vendor documentation.",
-  cThermal: "Thermal data", kKind: "Kind", thermalNote: "The file is a radiometric JPEG. Temperatures are encoded in vendor APP segments and the reader does not convert them; use the <a href=\"https://www.dji.com/downloads/softwares/dji-thermal-sdk\" target=\"_blank\" rel=\"noopener\">DJI Thermal SDK</a> with emissivity, distance and humidity matching the measurement.",
+  cThermal: "Thermal data", kKind: "Kind", kValues: "Pixel values", kMean: "mean",
+  thermalNoteTt: "The file holds temperatures in °C converted by ThermoTIFF with the DJI Thermal SDK. The conversion parameters are in the file description and in conversion_log.csv.",
+  thermalNoteConv: "The file holds temperatures (float32, range consistent with °C) converted from an R-JPEG by a program that does not name itself: Software and ImageDescription are copied from the camera. The conversion parameters (emissivity, distance, humidity, reflected temperature) are not in the file; record them in the processing metadata by hand, or convert with a program that stores them (ThermoTIFF).",
+  thermalNote16: "16-bit thermal TIFF without a stated scale: the file does not say how values convert to temperature. ThermoConverter (VantageUAV) stores (T − minimum temperature) × factor, both set in the app.",
+  thermalNoteWrap: "The values sit at both ends of the range with the middle empty: the converter overflowed (above the top of its scale it started again from 0). They are not usable as temperatures. ThermoConverter set to −50 °C and 1000 per °C overflows above 15.535 °C.", thermalNote: "The file is a radiometric JPEG. Temperatures are encoded in vendor APP segments and the reader does not convert them; use the <a href=\"https://www.dji.com/downloads/softwares/dji-thermal-sdk\" target=\"_blank\" rel=\"noopener\">DJI Thermal SDK</a> with emissivity, distance and humidity matching the measurement.",
   cRad: "Radiometry", kBand: "Band", kWl: "Wavelength", kIrr: "Sensor irradiance (DLS)", unitUnknown: "(unit not stated)", irrRaw: v => "in file " + v, kGain: "Sensor gain", kBlack: "Black level", kVig: "Vignetting (coefficients)", kDlsAtt: "DLS attitude (roll / pitch / yaw)",
   irrDjiNote: "DJI gives Irradiance as the sun-sensor value after its own compensation, without a unit. Record it in irradiance_dls with a note, or convert it following the vendor's procedure.",
   irrMsNote: "Camera:Irradiance is in W·m⁻²·nm⁻¹; for the OpenSkyLab specification it is converted to µW·cm⁻²·nm⁻¹ (× 100).",
@@ -5409,7 +5485,7 @@ en: {
     nWx: "Open-Meteo model value for a grid cell, not measured on site; a field record takes precedence",
     nGnssMode: "RTK from RtkFlag; PPK cannot be recognised from an image", nSun: "NOAA, from UTC time and image position", nDist: "≈ RelativeAltitude for a nadir image over flat ground", nAmb: "Exif 2.31: AmbientTemperature, Humidity, Pressure",
     nBbox: "West, south, east, north in WGS 84", nInterval: "ISO 8601 interval in UTC", nProdGsd: "Orthomosaic pixel size in cm", nSha: "Checksum of this file", nSoftware: "Software from EXIF; add the version",
-    nNotMs: "The sensor is not multispectral", nNotTh: "The sensor is not thermal", nNotEnv: "The environment and reference module is required for multispectral and thermal data", nOblique: "Oblique images: gimbal more than 15° off nadir in at least one image; the value gives the largest tilt (°)", nExpMode: "EXIF ExposureMode: 1 (manual) = fixed, otherwise auto", nApp4: "The file has no measurement parameters, or stores them in a way the reader does not know (DJI APP4: ThermalParams2 and 3 are read; ThermalParams from the ZH20T is only shown, its scale is not documented)", nCamSet: "Camera settings at capture, not measurements: the ambient temperature and humidity are therefore not copied to environment.*. The vendor SDK computes temperature from them", nEmisCam: "Emissivity set in the camera. If the reference instrument used another value, enter that value", nFpaDji: "DJI R-JPEG (e.g. M3T) does not record the camera or sensor temperature; the file holds only the measurement parameters. The value cannot be taken from the image", nFpaXmp: "XMP Camera:SensorTemperature (Pix4D), °C", nEnc: "Derived from the file structure: where the raw values are and what converts them to temperature", nEncTt: "TIFF from ThermoTIFF: temperatures in °C already computed by the DJI Thermal SDK", nPlanck: "FLIR: T = B / ln(R1 / (R2 · (S + O)) + F); a different form from K1, K2 in the specification, same role", nSpecRange: "CentralWavelength ± FWHM/2 (XMP Camera, nm → µm); nominal band, not a measured spectral response", nTtSet: "Parameters ThermoTIFF used for the conversion (ImageDescription). The TIFF does not say whether they came from the camera or were set by the user: see conversion_log.csv or the processing record", nTtAtm: "The DJI Thermal SDK applies the correction; DJI does not publish the method", nTtCap: "A ThermoTIFF TIFF does not carry the parameters set in the camera (they are in APP4 of the original R-JPEG). The conversion parameters are in processing.thermal_settings", nTtSw: "Software and ImageDescription of the TIFF", nLrf: "Laser rangefinder (DJI LRFTargetDistance), status Normal", nDistNoLrf: "≈ RelativeAltitude for a nadir image over flat ground; the laser rangefinder did not measure (distance 0)",
+    nNotMs: "The sensor is not multispectral", nNotTh: "The sensor is not thermal", nNotEnv: "The environment and reference module is required for multispectral and thermal data", nOblique: "Oblique images: gimbal more than 15° off nadir in at least one image; the value gives the largest tilt (°)", nExpMode: "EXIF ExposureMode: 1 (manual) = fixed, otherwise auto", nApp4: "The file has no measurement parameters, or stores them in a way the reader does not know (DJI APP4: ThermalParams2 and 3 are read; ThermalParams from the ZH20T is only shown, its scale is not documented)", nCamSet: "Camera settings at capture, not measurements: the ambient temperature and humidity are therefore not copied to environment.*. The vendor SDK computes temperature from them", nEmisCam: "Emissivity set in the camera. If the reference instrument used another value, enter that value", nFpaDji: "DJI R-JPEG (e.g. M3T) does not record the camera or sensor temperature; the file holds only the measurement parameters. The value cannot be taken from the image", nFpaXmp: "XMP Camera:SensorTemperature (Pix4D), °C", nEnc: "Derived from the file structure: where the raw values are and what converts them to temperature", nEncTt: "TIFF from ThermoTIFF: temperatures in °C already computed by the DJI Thermal SDK", nPlanck: "FLIR: T = B / ln(R1 / (R2 · (S + O)) + F); a different form from K1, K2 in the specification, same role", nSpecRange: "CentralWavelength ± FWHM/2 (XMP Camera, nm → µm); nominal band, not a measured spectral response", nTtSet: "Parameters ThermoTIFF used for the conversion (ImageDescription). The TIFF does not say whether they came from the camera or were set by the user: see conversion_log.csv or the processing record", nTtAtm: "The DJI Thermal SDK applies the correction; DJI does not publish the method", nConvCap: "The converter kept neither the parameters set in the camera (APP4 of the original R-JPEG) nor its own conversion parameters; take them from the R-JPEG and from the conversion settings", nTtCap: "A ThermoTIFF TIFF does not carry the parameters set in the camera (they are in APP4 of the original R-JPEG). The conversion parameters are in processing.thermal_settings", nTtSw: "Software and ImageDescription of the TIFF", nLrf: "Laser rangefinder (DJI LRFTargetDistance), status Normal", nDistNoLrf: "≈ RelativeAltitude for a nadir image over flat ground; the laser rangefinder did not measure (distance 0)",
     "il_manual": "Entered by the user (identifier within the dataset)", "il_no-tz": "Local time without a time zone: take UTC from the flight log", "il_check-datum": "DJI AbsoluteAltitude: ellipsoidal or above sea level depending on the model; check for your drone",
     "il_sea-level": "Exif 3.0 Ref 2/3: height relative to sea level, not the ellipsoid", "il_gps-alt": "EXIF GPSAltitude: officially above sea level, but many drones write ellipsoidal height", "il_rel-takeoff": "Height above the take-off point",
     "il_rtk-unknown": "GpsStatus = RTK without fixed/float", "il_rtk-int": "RtkFlag 48–49: lower-grade integer solution (value int)", "il_clock-suspect": "The camera clock was probably not set: take the time from the flight log", "il_ellipsoid-sensefly": "senseFly: GPSAltitude is ellipsoidal height although Ref says sea level (checked against eMotion geoinfo and KML)", "il_invalid": "The sensor reports an invalid value", "il_log": "Fill in from the flight log", "il_sigma-axes": "Axis x = east (RtkStdLon), y = north (RtkStdLat); the specification does not define the axes explicitly",
@@ -6362,9 +6438,10 @@ function cardGnss(e) {
 function cardRad(e) {
   const S = e.res.summary;
   if (S.thermal) {
-    const p = S.thermal.parts || {};
-    return '<article class="card"><h3>' + esc(t("cThermal")) + "</h3>" + kv([[t("kKind"), esc(S.thermal.kind)], p.app3 ? ["APP3 ThermalData", fmtBytes(p.app3)] : null, p.app4 ? ["APP4 ThermalParams", fmtBytes(p.app4)] : null, p.app5 ? ["APP5 ThermalCalibration", fmtBytes(p.app5)] : null, p.flir ? ["APP1 FLIR", String(p.flir)] : null]) +
-      '<p class="callout w">' + t("thermalNote") + "</p></article>";
+    const p = S.thermal.parts || {}, bd = S.thermal.band, k = S.thermal.kind || "";
+    const note = k === "ThermoTIFF" ? "thermalNoteTt" : /^temperature TIFF/.test(k) ? "thermalNoteConv" : /^thermal TIFF, 16-bit/.test(k) ? (bd && bd.wrap ? "thermalNoteWrap" : "thermalNote16") : "thermalNote";
+    return '<article class="card"><h3>' + esc(t("cThermal")) + "</h3>" + kv([[t("kKind"), esc(S.thermal.kind)], bd ? [t("kValues"), esc(dec(String(+bd.min.toFixed(3)) + " … " + String(+bd.max.toFixed(3)) + (bd.mean != null ? " (" + t("kMean") + " " + (+bd.mean.toFixed(3)) + ")" : "")) + (bd.kind === "float32" ? "" : " (" + bd.kind + ")"))] : null, p.app3 ? ["APP3 ThermalData", fmtBytes(p.app3)] : null, p.app4 ? ["APP4 ThermalParams", fmtBytes(p.app4)] : null, p.app5 ? ["APP5 ThermalCalibration", fmtBytes(p.app5)] : null, p.flir ? ["APP1 FLIR", String(p.flir)] : null]) +
+      '<p class="callout' + (note === "thermalNoteTt" ? "" : " w") + '">' + t(note) + "</p></article>";
   }
   if (!S.band && !S.irradiance) return "";
   const b = S.band || {}, ir = S.irradiance;
@@ -6536,12 +6613,12 @@ function oslRules(e, B) {
   }
   if (th) {
     const T0 = S.thermal || {}, P0 = T0.params, TT = T0.thermotiff;
-    if (S.sensorTemp != null) F("thermal.fpa_temperature", S.sensorTemp, "XMP:Camera:SensorTemperature", "nFpaXmp"); else X("thermal.fpa_temperature", "", /^DJI|^ThermoTIFF/.test(T0.kind || "") ? "nFpaDji" : "nSdk");
+    if (S.sensorTemp != null) F("thermal.fpa_temperature", S.sensorTemp, "XMP:Camera:SensorTemperature", "nFpaXmp"); else X("thermal.fpa_temperature", "", /^DJI|^ThermoTIFF|^(temperature|thermal) TIFF/.test(T0.kind || "") ? "nFpaDji" : "nSdk");
     if (P0) {
       const p = {}; for (const [k, v] of Object.entries(P0)) if (k !== "src" && v != null) p[k] = v;
       F("thermal.capture_measurement_params", p, P0.src, "nCamSet");
       if (P0.emissivity != null) D("reference.emissivity_setting", P0.emissivity, P0.src, "nEmisCam");
-    } else X("thermal.capture_measurement_params", "", TT ? "nTtCap" : "nApp4");
+    } else X("thermal.capture_measurement_params", "", TT ? "nTtCap" : /^(temperature|thermal) TIFF/.test(T0.kind || "") ? "nConvCap" : "nApp4");
     if (T0.encoding) D("thermal.image_encoding", T0.encoding, T0.encodingSrc, TT ? "nEncTt" : "nEnc");
     if (T0.planck) { const q = T0.planck; F("thermal.planck_constants", { R1: q.R1, B: q.B, F: q.F, O: q.O, R2: q.R2 }, q.src + ": PlanckR1, B, F, O, R2", "nPlanck"); }
     if (S.band && S.band.wl > 3000 && S.band.fwhm) D("thermal.spectral_range", [+((S.band.wl - S.band.fwhm / 2) / 1000).toFixed(2), +((S.band.wl + S.band.fwhm / 2) / 1000).toFixed(2)], "XMP:Camera:CentralWavelength, WavelengthFWHM", "nSpecRange");
