@@ -797,7 +797,7 @@ function logCallout(rows) {
 }
 function exportBox() {
   const F = batchFiles(); if (!F.length) return "";
-  return '<h3 class="sub" id="exportH">' + esc(t("expH")) + '</h3><p class="note small">' + esc(t("expIntro", F.length, flightState().logs.length)) + '</p><div class="toolbar"><button class="btn primary" id="x-rep">' + esc(t("expRep")) + '</button><button class="btn" id="x-mj">' + esc(t("expMj")) + '</button><button class="btn" id="x-pv">' + esc(t("expPv")) + '</button><button class="btn" id="x-il">' + esc(t("expIl")) + '</button><button class="btn" id="x-cam">' + esc(t("expCam")) + '</button><button class="btn" id="x-p4d">' + esc(t("expP4d")) + '</button><button class="btn" id="x-odm">' + esc(t("expOdm")) + '</button><button class="btn" id="x-gj">' + esc(t("expGj")) + '</button></div><p class="note small">' + t("expNote") + t("pvNote") + "</p>";
+  return '<h3 class="sub" id="exportH">' + esc(t("expH")) + '</h3><p class="note small">' + esc(t("expIntro", F.length, flightState().logs.length)) + '</p><div class="toolbar"><button class="btn primary" id="x-rep">' + esc(t("expRep")) + '</button><button class="btn" id="x-mj">' + esc(t("expMj")) + '</button><button class="btn" id="x-pv">' + esc(t("expPv")) + '</button><button class="btn" id="x-il">' + esc(t("expIl")) + '</button><button class="btn" id="x-cam">' + esc(t("expCam")) + '</button><button class="btn" id="x-p4d">' + esc(t("expP4d")) + '</button><button class="btn" id="x-odm">' + esc(t("expOdm")) + '</button><button class="btn" id="x-gj">' + esc(t("expGj")) + '</button><button class="btn" id="x-fp">' + esc(t("expFp")) + '</button></div><p class="note small">' + t("expNote") + t("pvNote") + "</p>";
 }
 const B_n = () => batchFiles().length;
 
@@ -901,7 +901,7 @@ function renderBatch() {
     '<div class="legend">' + ["fixed", "int", "float", "single", "none"].map(k => '<span><span aria-hidden="true" style="color:var(--' + RTK_ST[k][0] + ')">' + RTK_ST[k][1] + "</span> " + esc(t("rtk_" + k)) + "</span>").join("") + '<span><span class="sw" style="background:var(--accent-soft);border:1px solid var(--accent)"></span>' + esc(t("fpLegend")) + "</span></div>" +
     '<h3 class="sub">' + esc(t("chkH")) + '</h3><ul class="checks">' + ch.map(c => "<li>" + (c.ok ? chip("s-file", "✓", t("ok")) : chip("s-missing", "!", t("check"))) + "<span>" + esc(t(c.key)) + (c.det ? "<small>" + esc(dec(c.det)) + "</small>" : "") + "</span></li>").join("") + "</ul>" +
     '<div class="tw"><table class="bt"><thead><tr><th>#</th><th>' + esc(t("thFile")) + "</th><th>" + esc(t("thTime")) + "</th><th>" + esc(t("thLatLon")) + "</th><th>" + esc(t("thAlt")) + "</th><th>RTK</th><th>" + esc(t("thExp")) + "</th><th>" + esc(t("thGimbal")) + "</th>" + (showSer ? "<th>" + esc(t("thSerial")) + "</th>" : "") + "</tr></thead><tbody>" + rows + "</tbody></table></div>" + (oneDay && days.size ? '<p class="note small">' + esc(t("thDate")) + ": " + esc([...days][0]) + "</p>" : "") +
-    '<p class="note small">' + esc(t("batchStar")) + '</p><div class="toolbar"><button class="btn" id="x-il">' + esc(t("expIl")) + '</button><button class="btn" id="x-mj">' + esc(t("expMj")) + '</button><button class="btn" id="x-jall">' + esc(t("expJsonAll")) + '</button></div><p class="note small">' + t("xNote") + "</p>";
+    '<p class="note small">' + esc(t("batchStar")) + '</p><div class="toolbar"><button class="btn" id="x-il">' + esc(t("expIl")) + '</button><button class="btn" id="x-mj">' + esc(t("expMj")) + '</button><button class="btn" id="x-jall">' + esc(t("expJsonAll")) + '</button><button class="btn" id="x-fp">' + esc(t("expFp")) + '</button></div><p class="note small">' + t("xNote") + "</p>";
   drawTrack(); drawAlt();
 }
 
@@ -947,6 +947,34 @@ function geojson(F) {
     if (S.footprint && a && Math.abs(a.pitch) <= 5) { const lat = +r.lat_deg, lon = +r.lon_deg, k = 111320 * Math.cos(lat * Math.PI / 180), poly = footprintPoly(S, 0, 0);
       if (poly) { const ring = poly.map(q => [r6(lon + q[0] / k), r6(lat + q[1] / 111320)]); ring.push(ring[0]); feats.push({ type: "Feature", geometry: { type: "Polygon", coordinates: [ring] }, properties: { kind: "footprint", image: f.name, gsd_cm: S.gsd ? +(S.gsd * 100).toFixed(2) : null, note: "nadir, flat ground at take-off elevation" } }); } } }
   return JSON.stringify({ type: "FeatureCollection", name: "openskylab_exposures", features: feats }) + "\n";
+}
+// footprints.geojson: the ground outline of every image with position, height above ground, sensor size and camera angles.
+// Each image corner is a ray from the camera (yaw from north to the top of the image, tilt 0 = nadir, roll), cut with flat ground
+// at the take-off level (height above ground = relative altitude or the height set by hand). Images that see the horizon are left out.
+function footprintsGeo(F) {
+  const feats = [], skip = { noHeight: 0, noAngles: 0, noSensor: 0, horizon: 0 }, rad = Math.PI / 180, bb = [Infinity, Infinity, -Infinity, -Infinity];
+  const r6 = v => +(+v).toFixed(8), r2 = v => v == null || !isFinite(v) ? null : +(+v).toFixed(2);
+  for (const { f, r } of cameraRows(F)) {
+    const S = f.res.summary, a = ang(r), H = S.gsdHeight, w = S.sensorW, h = S.sensorH, fl = S.focal;
+    if (!(isFinite(H) && H > 0)) { skip.noHeight++; continue; } if (!a) { skip.noAngles++; continue; } if (!(w > 0 && h > 0 && fl > 0)) { skip.noSensor++; continue; }
+    const psi = a.yaw * rad, tl = a.pitch * rad, rho = (a.roll || 0) * rad;
+    const hd = [Math.sin(psi), Math.cos(psi), 0], rt = [Math.cos(psi), -Math.sin(psi), 0];
+    let v = [Math.sin(tl) * hd[0], Math.sin(tl) * hd[1], -Math.cos(tl)], u = [Math.cos(tl) * hd[0], Math.cos(tl) * hd[1], Math.sin(tl)];
+    const rr = rt.map((x, i) => Math.cos(rho) * x - Math.sin(rho) * u[i]), uu = rt.map((x, i) => Math.sin(rho) * x + Math.cos(rho) * u[i]);
+    const ring = []; let bad = false;
+    for (const [i, j] of [[-1, 1], [1, 1], [1, -1], [-1, -1]]) { const D = [0, 1, 2].map(k => fl * v[k] + i * w / 2 * rr[k] + j * h / 2 * uu[k]), n = Math.hypot(...D);
+      if (D[2] > -0.1 * n) { bad = true; break; } const t = H / -D[2]; ring.push([t * D[0], t * D[1]]); }   /* a corner less than ~6° below the horizon: no usable outline */
+    if (bad) { skip.horizon++; continue; }
+    let area = 0; for (let k = 0; k < 4; k++) { const p = ring[k], q = ring[(k + 1) % 4]; area += p[0] * q[1] - q[0] * p[1]; } area = Math.abs(area) / 2;
+    const lat = +r.lat_deg, lon = +r.lon_deg, kx = 111320 * Math.cos(lat * rad), ll = ring.map(p => [r6(lon + p[0] / kx), r6(lat + p[1] / 111320)]); ll.push(ll[0]);
+    for (const [x, y] of ll) { bb[0] = Math.min(bb[0], x); bb[1] = Math.min(bb[1], y); bb[2] = Math.max(bb[2], x); bb[3] = Math.max(bb[3], y); }
+    feats.push({ type: "Feature", geometry: { type: "Polygon", coordinates: [ll] }, properties: { image: f.name, time_utc: r.timestamp_utc || null, sensor_type: S.sensorType || null, band: S.band ? S.band.name : null,
+      lat_deg: r6(lat), lon_deg: r6(lon), height_above_ground_m: r2(H), height_source: S.gsdHeightSrc || null, yaw_deg: a.yaw, tilt_from_nadir_deg: a.pitch, roll_deg: a.roll || 0,
+      sensor_mm: [r2(w), r2(h)], focal_mm: r2(fl), gsd_centre_cm: S.pixelPitch ? r2(S.pixelPitch * 1e-4 * H / Math.cos(tl) / (fl * 1e-3)) : null, area_m2: Math.round(area) } }); }
+  const out = { type: "FeatureCollection", name: "openskylab_footprints", features: feats };
+  if (feats.length) out.bbox = bb.map(r6);
+  out.properties = { generator: READER.name + " " + READER.version, assumption: "flat ground at the take-off level; pinhole camera without distortion; camera angles from the gimbal (SfM convention)", images: feats.length, skipped: skip };
+  return JSON.stringify(out) + "\n";
 }
 function odmGeo(F) {
   const lines = ["EPSG:4326"];
@@ -1136,6 +1164,7 @@ function bind() {
     else if (b.id === "x-odm") download("geo.txt", odmGeo(batchFiles()), "text/plain;charset=utf-8");
     else if (b.id === "x-p4d") download("pix4d_geolocation.csv", pix4dCSV(batchFiles()).text, "text/csv;charset=utf-8");
     else if (b.id === "x-gj") download("exposures.geojson", geojson(batchFiles()), "application/geo+json");
+    else if (b.id === "x-fp") download("footprints.geojson", footprintsGeo(batchFiles()), "application/geo+json");
     else if (b.id === "x-rep") download("flight_report.html", reportHTML(), "text/html;charset=utf-8");
     else if (b.id === "x-mj") download("metadata.json", metadataJSON(batchFiles()), "application/json");
     else if (b.id === "x-pv") { b.disabled = true; provenanceJSON(batchFiles()).then(s => download("provenance.json", s, "application/json")).finally(() => { b.disabled = false; }); }
