@@ -175,6 +175,8 @@ const CASES = [
       && r.groups.some(g => g.id === "APP4:DJI" && g.tags.some(t => t.name === "ThermalParamsPrefix" && t.value === "iirp")) && M.imageLog(r).find(c => c.column === "fpa_temp_c").note === "not-written"; }],
   ["dji_rjpeg_params3.jpg", () => djiThermalJpeg(djiApp4v3({ rh: 70, dist: 12.5, e: 0.9, refl: 23.4 }), { "drone-dji:LRFStatus": "Normal", "drone-dji:LRFTargetDistance": "61.250" }),
     r => { const P = r.summary.thermal.params; return P.relative_humidity_pct === 70 && P.object_distance_m === 12.5 && P.emissivity === 0.9 && Math.abs(P.reflected_temperature_c - 23.4) < 1e-9 && P.ambient_temperature_c == null && r.summary.lrf.measured === true && r.summary.lrf.distance === 61.25; }],
+  ["dji_rjpeg_params_sdk_limits.jpg", () => djiThermalJpeg(djiApp4v3({ rh: 10, dist: 12, e: 0.05, refl: 600 }), {}),
+    r => { const C = r.summary.thermal.checks.map(c => c[0]); return C.includes("relative_humidity_pct") && C.includes("emissivity") && C.includes("reflected_temperature_c"); }],
   ["flir_fff.jpg", flirJpeg,
     r => { const T = r.summary.thermal, P = T && T.params; return T.kind === "FLIR radiometric JPEG" && P.emissivity === 0.97 && P.object_distance_m === 30 && P.reflected_temperature_c === 15 && P.atmospheric_temperature_c === 18 && P.relative_humidity_pct === 60
       && T.planck.B === 1400 && T.planck.O === -500 && T.planck.R2 === 0.5 && T.range[0] === -25 && T.range[1] === 150 && /4 x 2/.test(T.encoding)

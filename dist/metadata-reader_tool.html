@@ -2583,10 +2583,14 @@ function derive(result, opts, pending) {
     else if (e === 1) chk.push(["emissivity", "1.00: blackbody (brightness) temperature, no emissivity correction"]);
     if (dd != null && dji && (dd < 1 || dd > 25)) chk.push(["object_distance_m", "outside 1-25 m (DJI Thermal SDK; ThermoTIFF does not trust the correction above 25 m)"]);
     if (rh != null && !(rh >= 0 && rh <= 100)) chk.push(["relative_humidity_pct", "outside 0-100 %"]);
+    else if (rh != null && dji && rh < 20) chk.push(["relative_humidity_pct", "below 20 % (DJI Thermal SDK accepts 20-100 %)"]);
+    if (e != null && dji && e > 0 && e < 0.1) chk.push(["emissivity", "below 0.10 (DJI Thermal SDK accepts 0.10-1.00)"]);
+    const rt = TP.reflected_temperature_c;
+    if (rt != null && dji && (rt < -40 || rt > 500)) chk.push(["reflected_temperature_c", "outside -40 to 500 °C (DJI Thermal SDK)"]);
     const hRef = S.lrf && S.lrf.measured ? S.lrf.distance : S.altRel != null && S.altRel > 0 ? S.altRel : null;
     if (dd != null && hRef != null && S.thermal.kind !== "ThermoTIFF") { const want = dji ? Math.min(hRef, 25) : hRef; if (Math.abs(dd - want) > Math.max(2, 0.2 * want)) chk.push(["object_distance_m", num(dd) + " m set in the camera; " + (S.lrf && S.lrf.measured ? "laser rangefinder " : "height above take-off ") + num(rnd(hRef, 1)) + " m" + (dji && hRef > 25 ? " (SDK limit 25 m)" : "")]); }
     S.thermal.checks = chk;
-    D("ThermalParamsCheck", chk.length ? chk.length : 0, chk.length ? chk.map(c => c[0] + ": " + c[1]).join("; ") : "within limits", [TP === S.thermal.params ? S.thermal.params.src : "EXIF:IFD0:ImageDescription"], "emissivity 0-1, DJI distance 1-25 m, humidity 0-100 %, distance compared with the laser rangefinder or the height above take-off");
+    D("ThermalParamsCheck", chk.length ? chk.length : 0, chk.length ? chk.map(c => c[0] + ": " + c[1]).join("; ") : "within limits", [TP === S.thermal.params ? S.thermal.params.src : "EXIF:IFD0:ImageDescription"], "emissivity 0-1, humidity 0-100 %; DJI Thermal SDK: emissivity 0.10-1.00, distance 1-25 m, humidity 20-100 %, reflected -40 to 500 °C; distance compared with the laser rangefinder or the height above take-off");
   }
   S.sensorType = S.thermal ? "thermal_LWIR" : S.band ? "multispectral" : (S.channels === 3 || result.file.type === "JPEG" || result.file.type === "HEIC") ? "RGB" : null;
   /* JPEG quality */
