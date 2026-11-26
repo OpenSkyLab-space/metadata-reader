@@ -50,3 +50,48 @@ references:
     url: "https://openskylab.space/metadata.html"
     authors:
       - name: OpenSkyLab
+  - type: software
+    title: "ExifTool"
+    url: "https://exiftool.org/"
+    authors:
+      - family-names: Harvey
+        given-names: Phil
+    notes: "Tag names and value labels; no code included."
+  - type: database
+    title: "EPSG Geodetic Parameter Dataset"
+    url: "https://epsg.org/"
+    authors:
+      - name: "International Association of Oil & Gas Producers (IOGP)"
+    notes: "Names of coordinate reference systems, © IOGP."
+  - type: generic
+    title: "IPTC NewsCodes: Digital Source Type"
+    url: "https://cv.iptc.org/newscodes/digitalsourcetype/"
+    license: CC-BY-4.0
+    authors:
+      - name: "International Press Telecommunications Council (IPTC)"
+  - type: software
+    title: "ArduPilot"
+    url: "https://ardupilot.org/"
+    authors:
+      - name: "ArduPilot project"
+    notes: "GNU GPL version 3. DataFlash log format and flight mode names; no code included."
+  - type: software
+    title: "PX4 Autopilot"
+    url: "https://px4.io/"
+    license: BSD-3-Clause
+    authors:
+      - name: "PX4 Development Team"
+    notes: "ULog format and navigation state names; no code included."
+  - type: standard
+    title: "MAVLink"
+    url: "https://mavlink.io/en/"
+    license: MIT
+    authors:
+      - name: "MAVLink project"
+  - type: software
+    title: "dji-log-parser"
+    url: "https://github.com/lvauvillier/dji-log-parser"
+    license: MIT
+    authors:
+      - alias: lvauvillier
+    notes: "DJI FlightRecord layout; no code included."

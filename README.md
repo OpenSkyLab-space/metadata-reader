@@ -38,6 +38,9 @@ Cite the version you used; `CITATION.cff` gives the details (GitHub shows them u
 - The specification table (`src/metadata-reader_osl.js`) is taken from the OpenSkyLab metadata specification v0.3, licensed CC BY 4.0 (`LICENSES/CC-BY-4.0.txt`).
 - Embedded fonts: Atkinson Hyperlegible, Familjen Grotesk and JetBrains Mono, SIL OFL 1.1 (`LICENSES/`).
 - Weather values fetched on request come from [Open-Meteo.com](https://open-meteo.com/) (CC BY 4.0).
+- Names of coordinate reference systems: [EPSG Geodetic Parameter Dataset](https://epsg.org/), © IOGP ([terms of use](https://epsg.org/terms-of-use.html)).
+- Digital source type labels: [IPTC NewsCodes](https://cv.iptc.org/newscodes/digitalsourcetype/), © IPTC, CC BY 4.0.
+- Everything else taken from other projects (names, enumerations, file layouts, algorithms) and its licence is listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). The reader contains no code from these projects.
 
 ## Acknowledgements and notes
 

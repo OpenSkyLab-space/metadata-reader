@@ -1,5 +1,5 @@
 /*OSL-META-READER-START*/
-/* OSLMeta 1.0.0 - image metadata reader (OpenSkyLab). Pure JavaScript, no dependencies.
+/* OSLMeta 1.1.0 - image metadata reader (OpenSkyLab). Pure JavaScript, no dependencies.
    OSLMeta.parse(input, fileName, opts) -> Promise<Result>
      input: ArrayBuffer | TypedArray | Blob/File (files over 64 MB are read by byte ranges only)
      opts:  { height: flight height in m for GSD (default drone-dji:RelativeAltitude), xml: "auto"|"builtin", maxWhole: bytes }
@@ -146,7 +146,7 @@ const GEOKEY = { 1: "GeoTiffVersion", 1024: "GTModelType", 1025: "GTRasterType",
   4096: "VerticalCSType", 4097: "VerticalCitation", 4098: "VerticalDatum", 4099: "VerticalUnits" };
 /* GeoTIFF 1.1 (OGC 19-008r4) key names for the renamed keys */
 const GEOKEY11 = { 2048: "GeodeticCRSGeoKey", 2050: "GeodeticDatumGeoKey", 3072: "ProjectedCRSGeoKey", 3074: "ProjectionGeoKey", 4096: "VerticalGeoKey" };
-/* EPSG names (EPSG Geodetic Parameter Dataset) for codes common in Central European drone work */
+/* EPSG names for codes common in Central European drone work. Source: EPSG Geodetic Parameter Dataset, © IOGP, https://epsg.org/ (terms of use: https://epsg.org/terms-of-use.html) */
 const EPSG = { 4326: "WGS 84", 4258: "ETRS89", 4979: "WGS 84 (3D)", 4937: "ETRS89 (3D)", 3857: "WGS 84 / Pseudo-Mercator", 5514: "S-JTSK / Krovak East North",
   2065: "S-JTSK (Ferro) / Krovak", 4156: "S-JTSK", 32633: "WGS 84 / UTM zone 33N", 32634: "WGS 84 / UTM zone 34N", 32632: "WGS 84 / UTM zone 32N",
   25833: "ETRS89 / UTM zone 33N", 25834: "ETRS89 / UTM zone 34N", 25832: "ETRS89 / UTM zone 32N", 3035: "ETRS89-extended / LAEA Europe", 5705: "Baltic 1977 height",

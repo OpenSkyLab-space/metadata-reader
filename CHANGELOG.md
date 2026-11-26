@@ -4,6 +4,12 @@ All notable changes are recorded here. The format follows [Keep a Changelog](htt
 The reader has its own version numbers (SemVer); a release `vX.Y.Z` is the reader version `X.Y.Z`.
 Each entry names the versions of the parser (OSLMeta), the flight log module (OSLFlight) and the OpenSkyLab metadata specification it checks against.
 
+## [Unreleased]
+
+- Third-party sources: `THIRD_PARTY_NOTICES.md` lists what the reader takes from other projects (names, enumerations, file layouts, algorithms), under which licence, and states that no code from them is included. Linked from the README and from the sources at the bottom of the page.
+- EPSG names of coordinate reference systems are credited to the EPSG Geodetic Parameter Dataset, © IOGP, as its terms of use require; the IPTC Digital Source Type vocabulary is credited with its licence (CC BY 4.0). ArduPilot, PX4, MAVLink and dji-log-parser are added to the sources, and `CITATION.cff` lists them with ExifTool, EPSG and IPTC under `references`.
+- The page text named the parser as OSLMeta 1.0; it now says 1.1, the version released with 1.5.0.
+
 ## [1.5.0] - 2026-11-25
 
 Parser OSLMeta 1.1.0, flight log module OSLFlight 0.4.0, checks against the OpenSkyLab metadata specification v0.3.

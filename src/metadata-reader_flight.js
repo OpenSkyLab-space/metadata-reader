@@ -533,7 +533,7 @@ async function pULog(src, L, h) {
   if (badMsg) { fact(L, "fBadMessages", badMsg); L.notes.push("corrupt-messages"); }
   L.gnss = { fix: countBy(use, g => fixName(g.fix)) };
 }
-// vehicle_status.nav_state (PX4 msg/VehicleStatus.msg); only AUTO_MISSION counts as the automatic mission
+// vehicle_status.nav_state (PX4, BSD-3-Clause: names only, see THIRD_PARTY_NOTICES.md; msg/VehicleStatus.msg); only AUTO_MISSION counts as the automatic mission
 const PX4_NAV = { 0: "MANUAL", 1: "ALTCTL", 2: "POSCTL", 3: "AUTO_MISSION", 4: "AUTO_LOITER", 5: "AUTO_RTL", 6: "POSITION_SLOW", 10: "ACRO", 12: "DESCEND", 13: "TERMINATION", 14: "OFFBOARD", 15: "STAB", 17: "AUTO_TAKEOFF", 18: "AUTO_LAND", 19: "AUTO_FOLLOW_TARGET", 20: "AUTO_PRECLAND", 21: "ORBIT", 22: "AUTO_VTOL_TAKEOFF" };
 const fixName = f => ({ 0: "none", 1: "none", 2: "2D", 3: "single", 4: "dgnss", 5: "float", 6: "fixed", 8: "fixed" }[f] || "fix " + f);
 const relVer = v => typeof v === "number" ? [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255].join(".") : v;
@@ -1103,7 +1103,7 @@ async function pEncrypted(src, L, h) {
 const DF_T = { b: [1, "getInt8"], B: [1, "getUint8"], M: [1, "getUint8"], h: [2, "getInt16"], H: [2, "getUint16"], i: [4, "getInt32"], I: [4, "getUint32"], f: [4, "getFloat32"], d: [8, "getFloat64"],
   c: [2, "getInt16", 0.01], C: [2, "getUint16", 0.01], e: [4, "getInt32", 0.01], E: [4, "getUint32", 0.01], L: [4, "getInt32", 1e-7], q: [8, "i64"], Q: [8, "u64"], n: [4, "s"], N: [16, "s"], Z: [64, "s"], a: [64, "x"] };
 const AP_WANT = /^(GPS|GPS2|GPA|CAM|TRIG|MSG|VER|PARM|VIBE|MODE|ERR)$/;
-// flight modes by vehicle (ArduCopter/ArduPlane/Rover mode.h); AUTO is the mission mode. ERR subsystems: AP_Logger.h LogErrorSubsystem
+// flight modes by vehicle (ArduPilot, GPL-3.0: names only, see THIRD_PARTY_NOTICES.md; ArduCopter/ArduPlane/Rover mode.h); AUTO is the mission mode. ERR subsystems: AP_Logger.h LogErrorSubsystem
 const AP_MODES = {
   copter: { 0: "STABILIZE", 1: "ACRO", 2: "ALT_HOLD", 3: "AUTO", 4: "GUIDED", 5: "LOITER", 6: "RTL", 7: "CIRCLE", 9: "LAND", 11: "DRIFT", 13: "SPORT", 14: "FLIP", 15: "AUTOTUNE", 16: "POSHOLD", 17: "BRAKE", 18: "THROW", 19: "AVOID_ADSB", 20: "GUIDED_NOGPS", 21: "SMART_RTL", 22: "FLOWHOLD", 23: "FOLLOW", 24: "ZIGZAG", 25: "SYSTEMID", 26: "AUTOROTATE", 27: "AUTO_RTL", 28: "TURTLE" },
   plane: { 0: "MANUAL", 1: "CIRCLE", 2: "STABILIZE", 3: "TRAINING", 4: "ACRO", 5: "FBWA", 6: "FBWB", 7: "CRUISE", 8: "AUTOTUNE", 10: "AUTO", 11: "RTL", 12: "LOITER", 13: "TAKEOFF", 14: "AVOID_ADSB", 15: "GUIDED", 16: "INITIALISING", 17: "QSTABILIZE", 18: "QHOVER", 19: "QLOITER", 20: "QLAND", 21: "QRTL", 22: "QAUTOTUNE", 23: "QACRO", 24: "THERMAL", 25: "LOITER_ALT_QLAND", 26: "AUTOLAND", 27: "GLIDE" },
