@@ -17,6 +17,9 @@ identifiers:
     value: "10.5281/zenodo.24373002"
     description: "Concept DOI: all versions"
   - type: doi
+    value: "10.5281/zenodo.24549365"
+    description: "Version 1.5.0"
+  - type: doi
     value: "10.5281/zenodo.24373003"
     description: "Version 1.4.0"
 url: "https://openskylab.space/reader"

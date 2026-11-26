@@ -30,7 +30,7 @@ The specification table `src/metadata-reader_osl.js` is generated from the files
 
 ## How to cite
 
-Cite the version you used; `CITATION.cff` gives the details (GitHub shows them under "Cite this repository"). Each release is archived on Zenodo with its own DOI: all versions [10.5281/zenodo.24373002](https://doi.org/10.5281/zenodo.24373002), version 1.4.0 [10.5281/zenodo.24373003](https://doi.org/10.5281/zenodo.24373003).
+Cite the version you used; `CITATION.cff` gives the details (GitHub shows them under "Cite this repository"). Each release is archived on Zenodo with its own DOI: all versions [10.5281/zenodo.24373002](https://doi.org/10.5281/zenodo.24373002), version 1.5.0 [10.5281/zenodo.24549365](https://doi.org/10.5281/zenodo.24549365), version 1.4.0 [10.5281/zenodo.24373003](https://doi.org/10.5281/zenodo.24373003).
 
 ## Licence
 
